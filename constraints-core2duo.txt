@@ -1,0 +1,2 @@
+# kuzhomesrv Core2Duo E6750: no AVX/SSE4.x. numpy 2.4.x wheel crashes with SIGILL.
+numpy==1.26.4
