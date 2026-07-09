@@ -3952,7 +3952,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if self._restart_requested:
             msg = "Внимание! Для активации новых функций и/или обслуживания система перезапустила ассистента. Вы можете продолжать работу."
         else:
-            msg = "Внимание! Система обслуживания шлюза выключается."
+            msg = "♻️ Система ассистента выключается для технических работ."
 
         notified: set[tuple[str, str, Optional[str]]] = set()
         for session_key in active:
