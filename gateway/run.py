@@ -6810,69 +6810,60 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "plugin discovery failed at gateway startup", exc_info=True,
             )
 
-        # Register the generic relay adapter when a connector relay URL is
-        # configured (GATEWAY_RELAY_URL / gateway.relay_url). No URL -> no-op, so
-        # direct/single-tenant deployments are unaffected. When configured, the
-        # adapter dials the connector over a WebSocket, negotiates its capability
-        # descriptor at handshake, and bridges inbound/outbound like any platform.
-        try:
-            from gateway.relay import (
-                register_relay_adapter,
-                relay_url,
-                self_provision_relay,
-                send_relay_policy,
-            )
+        if _isolated_gateway_smoke_mode():
+            logger.warning("ISOLATED_SMOKE: relay registration is hard-disabled")
+        else:
+            # Register the generic relay adapter when a connector relay URL is
+            # configured (GATEWAY_RELAY_URL / gateway.relay_url). No URL -> no-op, so
+            # direct/single-tenant deployments are unaffected. When configured, the
+            # adapter dials the connector over a WebSocket, negotiates its capability
+            # descriptor at handshake, and bridges inbound/outbound like any platform.
+            try:
+                from gateway.relay import (
+                    register_relay_adapter,
+                    relay_url,
+                    self_provision_relay,
+                    send_relay_policy,
+                )
 
-            # Boot-time relay self-provision: resolve the agent's NAS token ->
-            # POST /relay/provision -> set GATEWAY_RELAY_* in os.environ BEFORE
-            # registration reads them. No-op when relay is unconfigured, a secret
-            # is already pinned, or no NAS token resolves (self-hosted, unenrolled).
-            # Never raises.
-            self_provision_relay()
+                # Boot-time relay self-provision: resolve the agent's NAS token ->
+                # POST /relay/provision -> set GATEWAY_RELAY_* in os.environ BEFORE
+                # registration reads them. No-op when relay is unconfigured, a secret
+                # is already pinned, or no NAS token resolves (self-hosted, unenrolled).
+                # Never raises.
+                self_provision_relay()
 
-            if register_relay_adapter():
-                logger.info("relay adapter registered (connector at %s)", relay_url())
-                # Declare this gateway's relevance policy (mention-gating /
-                # free-response / allow-bots) to the connector so the SAME
-                # behavior governs relay delivery (Phase 6 Unit ζ). Runs after
-                # the secret is resolved; never raises, never blocks boot.
-                send_relay_policy()
-        except Exception:
-            logger.warning(
-                "relay adapter registration failed at gateway startup", exc_info=True,
-            )
+                if register_relay_adapter():
+                    logger.info("relay adapter registered (connector at %s)", relay_url())
+                    # Declare this gateway's relevance policy (mention-gating /
+                    # free-response / allow-bots) to the connector so the SAME
+                    # behavior governs relay delivery (Phase 6 Unit ζ). Runs after
+                    # the secret is resolved; never raises, never blocks boot.
+                    send_relay_policy()
+            except Exception:
+                logger.warning(
+                    "relay adapter registration failed at gateway startup", exc_info=True,
+                )
 
-        # Register declarative shell hooks from cli-config.yaml.  Gateway
-        # has no TTY, so consent has to come from one of the three opt-in
-        # channels (--accept-hooks on launch, HERMES_ACCEPT_HOOKS env var,
-        # or hooks_auto_accept: true in config.yaml).  We pass
-        # accept_hooks=False here and let register_from_config resolve
-        # the effective value from env + config itself — the CLI-side
-        # registration already honored --accept-hooks, and re-reading
-        # hooks_auto_accept here would just duplicate that lookup.
-        # Failures are logged but must never block gateway startup.
-        try:
-            from hermes_cli.config import load_config
-            from agent.shell_hooks import register_from_config
-            register_from_config(load_config(), accept_hooks=False)
-        except Exception:
-            logger.debug(
-                "shell-hook registration failed at gateway startup",
-                exc_info=True,
-            )
-
-        # Discover and load event hooks
-        self.hooks.discover_and_load()
-
-        
-        # Recover background processes from checkpoint (crash recovery)
-        try:
-            from tools.process_registry import process_registry
-            recovered = process_registry.recover_from_checkpoint()
-            if recovered:
-                logger.info("Recovered %s background process(es) from previous run", recovered)
-        except Exception as e:
-            logger.warning("Process checkpoint recovery: %s", e)
+        # Shell/event hooks and checkpoint recovery can execute local user
+        # actions; they are intentionally excluded from the isolated smoke.
+        if _isolated_gateway_smoke_mode():
+            logger.warning("ISOLATED_SMOKE: shell hooks, event hooks, and process recovery are hard-disabled")
+        else:
+            try:
+                from hermes_cli.config import load_config
+                from agent.shell_hooks import register_from_config
+                register_from_config(load_config(), accept_hooks=False)
+            except Exception:
+                logger.debug("shell-hook registration failed at gateway startup", exc_info=True)
+            self.hooks.discover_and_load()
+            try:
+                from tools.process_registry import process_registry
+                recovered = process_registry.recover_from_checkpoint()
+                if recovered:
+                    logger.info("Recovered %s background process(es) from previous run", recovered)
+            except Exception as e:
+                logger.warning("Process checkpoint recovery: %s", e)
 
         # Suspend sessions that were active when the gateway last exited.
         # This prevents stuck sessions from being blindly resumed on restart,
