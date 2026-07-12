@@ -1784,6 +1784,20 @@ from gateway.whatsapp_identity import (
 logger = logging.getLogger(__name__)
 
 
+def _isolated_gateway_smoke_mode() -> bool:
+    """Return whether a candidate-only isolated gateway smoke is explicitly armed.
+
+    This is deliberately opt-in and does not alter normal production startup.
+    When armed, gateway configuration/session/plugin initialization still runs,
+    but no platform adapter is connected and no cron/housekeeping worker starts.
+    It exists so upgrade operators can validate a copied Hermes home without
+    ever polling a real bot token or executing scheduled work.
+    """
+    return os.environ.get("HERMES_ISOLATED_GATEWAY_SMOKE", "").strip().lower() in {
+        "1", "true", "yes", "on"
+    }
+
+
 _OWN_POLICY_OPEN_ENV = {
     Platform.WECOM: ("WECOM_DM_POLICY", "WECOM_GROUP_POLICY", "WECOM_ALLOW_ALL_USERS"),
     Platform.WEIXIN: ("WEIXIN_DM_POLICY", "WEIXIN_GROUP_POLICY", "WEIXIN_ALLOW_ALL_USERS"),
@@ -6912,8 +6926,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         startup_nonretryable_errors: list[str] = []
         startup_retryable_errors: list[str] = []
         
-        # Initialize and connect each configured platform
+        # Initialize and connect each configured platform.  The explicit
+        # candidate smoke mode validates all prior startup wiring against a
+        # copied home while hard-disabling outbound adapters.
+        _isolated_smoke = _isolated_gateway_smoke_mode()
+        if _isolated_smoke:
+            logger.warning(
+                "ISOLATED_SMOKE: platform adapters are hard-disabled; no network polling will start"
+            )
         for platform, platform_config in self.config.platforms.items():
+            if _isolated_smoke:
+                continue
             if await self._abort_startup_if_shutdown_requested():
                 return True
             if not platform_config.enabled:
@@ -7043,7 +7066,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # profile's home + credential scope and stamp their inbound events with
         # the profile so the agent turn resolves correctly. No-op when off.
         try:
-            _secondary_connected = await self._start_secondary_profile_adapters()
+            if _isolated_smoke:
+                logger.warning("ISOLATED_SMOKE: secondary-profile adapters are hard-disabled")
+                _secondary_connected = 0
+            else:
+                _secondary_connected = await self._start_secondary_profile_adapters()
             connected_count += _secondary_connected
         except MultiplexConfigError as e:
             # Invalid multiplexer config — abort startup cleanly so the operator
@@ -20494,34 +20521,35 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         return True
     
     # Start the background cron scheduler via the resolved provider so
-    # scheduled jobs fire automatically. The built-in provider is the
-    # historical in-process 60s ticker; an external provider (e.g. chronos)
-    # may arm a schedule and return. Pass the event loop so cron delivery can
-    # use live adapters (E2EE support).
-    from cron.scheduler_provider import resolve_cron_scheduler
-    cron_stop = threading.Event()
-    cron_provider = resolve_cron_scheduler()
-    cron_thread = threading.Thread(
-        target=cron_provider.start,
-        args=(cron_stop,),
-        kwargs={"adapters": runner.adapters, "loop": asyncio.get_running_loop()},
-        daemon=True,
-        name="cron-scheduler",
-    )
-    cron_thread.start()
+    # scheduled jobs fire automatically. The isolated smoke must initialize
+    # the runner without spawning scheduler/housekeeping execution.
+    cron_stop = None
+    cron_provider = None
+    cron_thread = None
+    housekeeping_thread = None
+    if _isolated_gateway_smoke_mode():
+        logger.warning("ISOLATED_SMOKE: cron scheduler and housekeeping are hard-disabled")
+    else:
+        from cron.scheduler_provider import resolve_cron_scheduler
+        cron_stop = threading.Event()
+        cron_provider = resolve_cron_scheduler()
+        cron_thread = threading.Thread(
+            target=cron_provider.start,
+            args=(cron_stop,),
+            kwargs={"adapters": runner.adapters, "loop": asyncio.get_running_loop()},
+            daemon=True,
+            name="cron-scheduler",
+        )
+        cron_thread.start()
+        housekeeping_thread = threading.Thread(
+            target=_start_gateway_housekeeping,
+            args=(cron_stop,),
+            kwargs={"adapters": runner.adapters, "loop": asyncio.get_running_loop()},
+            daemon=True,
+            name="gateway-housekeeping",
+        )
+        housekeeping_thread.start()
 
-    # Gateway-only periodic housekeeping (channel dir, cache cleanup, paste
-    # sweep, curator) — runs independently of which cron provider is active.
-    # Shares cron_stop as the shutdown signal.
-    housekeeping_thread = threading.Thread(
-        target=_start_gateway_housekeeping,
-        args=(cron_stop,),
-        kwargs={"adapters": runner.adapters, "loop": asyncio.get_running_loop()},
-        daemon=True,
-        name="gateway-housekeeping",
-    )
-    housekeeping_thread.start()
-    
     # Wait for shutdown
     await runner.wait_for_shutdown()
 
@@ -20546,19 +20574,21 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     # so that delivery could never run — it timed out and the message was
     # silently dropped (#58818). Awaiting keeps the loop alive so the in-flight
     # delivery finishes before we tear down.
-    cron_stop.set()
-    try:
-        cron_provider.stop()
-    except Exception as e:
-        logger.debug("Cron provider stop() error: %s", e)
-    if not await _await_thread_exit(cron_thread, timeout=_CRON_SHUTDOWN_DRAIN_TIMEOUT):
-        logger.warning(
-            "Cron ticker did not exit within %.0fs of shutdown — an in-flight "
-            "delivery may have been dropped.", _CRON_SHUTDOWN_DRAIN_TIMEOUT,
-        )
-    await _await_thread_exit(
-        housekeeping_thread, timeout=_HOUSEKEEPING_SHUTDOWN_DRAIN_TIMEOUT
-    )
+    if cron_stop is not None and cron_provider is not None and cron_thread is not None:
+        cron_stop.set()
+        try:
+            cron_provider.stop()
+        except Exception as e:
+            logger.debug("Cron provider stop() error: %s", e)
+        if not await _await_thread_exit(cron_thread, timeout=_CRON_SHUTDOWN_DRAIN_TIMEOUT):
+            logger.warning(
+                "Cron ticker did not exit within %.0fs of shutdown — an in-flight "
+                "delivery may have been dropped.", _CRON_SHUTDOWN_DRAIN_TIMEOUT,
+            )
+        if housekeeping_thread is not None:
+            await _await_thread_exit(
+                housekeeping_thread, timeout=_HOUSEKEEPING_SHUTDOWN_DRAIN_TIMEOUT
+            )
 
     # Stop the planned-stop watcher (daemon=True so this is belt-and-suspenders).
     _planned_stop_watcher_stop.set()
