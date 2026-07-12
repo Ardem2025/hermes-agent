@@ -20464,12 +20464,15 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     atexit.register(remove_pid_file)
     atexit.register(release_gateway_runtime_lock)
 
-    try:
-        from hermes_cli.nous_auth_keepalive import start_nous_auth_keepalive
+    if _isolated_gateway_smoke_mode():
+        logger.warning("ISOLATED_SMOKE: auth keepalive and MCP discovery are hard-disabled")
+    else:
+        try:
+            from hermes_cli.nous_auth_keepalive import start_nous_auth_keepalive
 
-        start_nous_auth_keepalive()
-    except Exception as exc:
-        logger.debug("Nous auth keepalive did not start: %s", exc)
+            start_nous_auth_keepalive()
+        except Exception as exc:
+            logger.debug("Nous auth keepalive did not start: %s", exc)
 
     _ensure_windows_gateway_venv_imports()
 
@@ -20479,12 +20482,13 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     # internally; calling it from the loop thread would freeze platform
     # heartbeats (Discord shard, Telegram polling) until it returned.
     # See #16856.
-    try:
-        from tools.mcp_tool import discover_mcp_tools
-        _loop = asyncio.get_running_loop()
-        await _loop.run_in_executor(None, discover_mcp_tools)
-    except Exception as e:
-        logger.debug("MCP tool discovery failed: %s", e)
+    if not _isolated_gateway_smoke_mode():
+        try:
+            from tools.mcp_tool import discover_mcp_tools
+            _loop = asyncio.get_running_loop()
+            await _loop.run_in_executor(None, discover_mcp_tools)
+        except Exception as e:
+            logger.debug("MCP tool discovery failed: %s", e)
 
     # Start the gateway
     success = await runner.start()
