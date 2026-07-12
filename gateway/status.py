@@ -696,6 +696,30 @@ def acquire_gateway_runtime_lock() -> bool:
     return True
 
 
+def clear_isolated_smoke_runtime_metadata() -> bool:
+    """Clear only stale metadata in an explicitly isolated copied home.
+
+    This helper is intentionally inert unless the candidate smoke flag is set.
+    It never reads, signals, or replaces a PID.  A currently held lock means a
+    gateway owns this exact copied home, so cleanup is refused.  Otherwise the
+    copied PID/lock/status records are historical bytes from the live source
+    home and can be discarded before a foreground smoke claims its own lock.
+    """
+    enabled = os.environ.get("HERMES_ISOLATED_GATEWAY_SMOKE", "").strip().lower()
+    if enabled not in {"1", "true", "yes", "on"}:
+        return False
+    pid_path = _get_pid_path()
+    lock_path = _get_gateway_lock_path(pid_path)
+    if is_gateway_runtime_lock_active(lock_path):
+        return False
+    for path in (pid_path, lock_path, _get_runtime_status_path()):
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            return False
+    return True
+
+
 def release_gateway_runtime_lock() -> None:
     """Release the gateway runtime lock when owned by this process."""
     global _gateway_lock_handle

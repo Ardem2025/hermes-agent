@@ -89,3 +89,34 @@ def test_smoke_side_effect_guards_cover_adapters_scheduler_and_hooks():
     assert "ISOLATED_SMOKE: secondary-profile adapters are hard-disabled" in runner_source
     assert "ISOLATED_SMOKE: shell hooks, event hooks, and process recovery are hard-disabled" in runner_source
     assert "ISOLATED_SMOKE: cron scheduler and housekeeping are hard-disabled" in module_source
+
+
+def test_smoke_runtime_cleanup_is_opt_in_and_never_signals_a_pid(monkeypatch, tmp_path):
+    from gateway import status
+    import json
+    home = tmp_path / "copied-home" / ".hermes"
+    home.mkdir(parents=True)
+    for name in ("gateway.pid", "gateway.lock", "gateway_state.json"):
+        (home / name).write_text(json.dumps({"pid": 999999}), encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.delenv("HERMES_ISOLATED_GATEWAY_SMOKE", raising=False)
+    assert status.clear_isolated_smoke_runtime_metadata() is False
+    assert (home / "gateway.pid").exists()
+    monkeypatch.setenv("HERMES_ISOLATED_GATEWAY_SMOKE", "1")
+    monkeypatch.setattr(status, "is_gateway_runtime_lock_active", lambda path=None: False)
+    monkeypatch.setattr(status.os, "kill", lambda *args: (_ for _ in ()).throw(AssertionError("must not signal")))
+    assert status.clear_isolated_smoke_runtime_metadata() is True
+    assert not any((home / name).exists() for name in ("gateway.pid", "gateway.lock", "gateway_state.json"))
+
+
+def test_smoke_runtime_cleanup_refuses_a_held_copied_home_lock(monkeypatch, tmp_path):
+    from gateway import status
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    marker = home / "gateway.pid"
+    marker.write_text('{"pid": 123}', encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_ISOLATED_GATEWAY_SMOKE", "1")
+    monkeypatch.setattr(status, "is_gateway_runtime_lock_active", lambda path=None: True)
+    assert status.clear_isolated_smoke_runtime_metadata() is False
+    assert marker.exists()

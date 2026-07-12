@@ -20092,6 +20092,15 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         remove_pid_file,
         terminate_pid,
     )
+    # A copied home carries byte-for-byte PID/lock/status metadata from the
+    # live source home. Under the explicit isolated smoke flag only, discard
+    # those stale files before consulting the duplicate guard. The helper
+    # refuses an actively held copied-home lock and never signals any PID.
+    if _isolated_gateway_smoke_mode():
+        from gateway.status import clear_isolated_smoke_runtime_metadata
+        if not clear_isolated_smoke_runtime_metadata():
+            logger.error("ISOLATED_SMOKE: copied-home runtime lock is active; refusing startup")
+            return False
     existing_pid = get_running_pid()
     if existing_pid is not None and existing_pid != os.getpid():
         if replace:
