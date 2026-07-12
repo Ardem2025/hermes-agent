@@ -1690,6 +1690,53 @@ class APIServerAdapter(BasePlatformAdapter):
             logger.warning("Failed to load session history for %s: %s", session_id, exc)
             return []
 
+    def _build_telegram_binding_dict(self, chat_id: str, thread_id: str) -> dict:
+        """Build a client-safe Telegram DM-topic binding, including a usable link."""
+        payload = {"chat_id": str(chat_id), "thread_id": str(thread_id), "bot_username": None, "link": None}
+        bot_username = None
+        runner = getattr(self, "gateway_runner", None)
+        if runner is not None:
+            try:
+                from gateway.config import Platform
+                adapter = runner.adapters.get(Platform.TELEGRAM)
+                bot = getattr(adapter, "_bot", None)
+                bot_username = getattr(bot, "username", None)
+            except Exception:
+                bot_username = None
+        bot_username = (os.environ.get("TELEGRAM_BOT_USERNAME") or os.environ.get("BOT_USERNAME") or bot_username or "")
+        bot_username = str(bot_username).lstrip("@").lower() or None
+        payload["bot_username"] = bot_username
+        try:
+            numeric_chat_id = int(chat_id)
+            chat_text = str(chat_id)
+            if numeric_chat_id < 0:
+                stripped = chat_text[4:] if chat_text.startswith("-100") else chat_text
+                payload["link"] = f"https://t.me/c/{stripped}/{thread_id}" if thread_id else f"https://t.me/c/{stripped}"
+            elif thread_id:
+                # Telegram private-DM topic links require a bot deep link; if
+                # the public username is unavailable retain the client URI.
+                payload["link"] = (f"https://t.me/{bot_username}?start=topic_{thread_id}" if bot_username
+                                   else f"tg://openmessage?chat_id={chat_text}&message_thread_id={thread_id}")
+            elif bot_username:
+                payload["link"] = f"https://t.me/{bot_username}"
+        except (TypeError, ValueError):
+            pass
+        return payload
+
+    def _session_response_with_telegram_binding(self, session: Dict[str, Any]) -> Dict[str, Any]:
+        payload = self._session_response(session)
+        db = self._ensure_session_db()
+        if db is not None:
+            try:
+                binding = db.get_telegram_topic_binding_by_session(session_id=session.get("id"))
+                if binding:
+                    payload["telegram_binding"] = self._build_telegram_binding_dict(
+                        binding.get("chat_id"), binding.get("thread_id")
+                    )
+            except Exception:
+                logger.debug("Failed to load Telegram topic binding", exc_info=True)
+        return payload
+
     async def _handle_list_sessions(self, request: "web.Request") -> "web.Response":
         """GET /api/sessions — list persisted Hermes sessions."""
         auth_err = self._check_auth(request)
@@ -1713,7 +1760,7 @@ class APIServerAdapter(BasePlatformAdapter):
         )
         return web.json_response({
             "object": "list",
-            "data": [self._session_response(s) for s in sessions],
+            "data": [self._session_response_with_telegram_binding(s) for s in sessions],
             "limit": limit,
             "offset": offset,
             "has_more": len(sessions) == limit,
@@ -1765,7 +1812,7 @@ class APIServerAdapter(BasePlatformAdapter):
         session, err = self._get_existing_session_or_404(request.match_info["session_id"])
         if err:
             return err
-        return web.json_response({"object": "hermes.session", "session": self._session_response(session)})
+        return web.json_response({"object": "hermes.session", "session": self._session_response_with_telegram_binding(session)})
 
     async def _handle_patch_session(self, request: "web.Request") -> "web.Response":
         """PATCH /api/sessions/{session_id} — update client-safe session metadata."""
@@ -1793,7 +1840,7 @@ class APIServerAdapter(BasePlatformAdapter):
         if body.get("end_reason"):
             db.end_session(session_id, str(body["end_reason"]))
         session = db.get_session(session_id) or session
-        return web.json_response({"object": "hermes.session", "session": self._session_response(session)})
+        return web.json_response({"object": "hermes.session", "session": self._session_response_with_telegram_binding(session)})
 
     async def _handle_delete_session(self, request: "web.Request") -> "web.Response":
         """DELETE /api/sessions/{session_id}."""
