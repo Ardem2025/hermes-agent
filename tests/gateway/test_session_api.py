@@ -288,13 +288,45 @@ async def test_telegram_binding_uses_canonical_db_mapping_and_reports_backfill(a
         assert payload["bound"] is True
         assert payload["thread_id"] == "77"
         assert payload["link"] == "https://t.me/c/123/77"
-        assert payload["backfill"] == {"mode": "summary", "status": "completed", "sent": 2, "failed": 0}
+        assert payload["backfill"] == {"mode": "summary", "status": "completed", "sent": 1, "failed": 0, "skipped": 0}
         fetched = await cli.get(f"/api/sessions/{session_id}/telegram-binding")
         assert (await fetched.json())["bound"] is True
         deleted = await cli.delete(f"/api/sessions/{session_id}/telegram-binding")
         assert deleted.status == 200
         assert (await deleted.json())["deleted"] is True
     assert session_db.get_messages(session_id)[0]["content"] == "one"
+
+
+@pytest.mark.asyncio
+async def test_existing_telegram_binding_resyncs_clean_user_facing_transcript(adapter, session_db):
+    session_id = session_db.create_session("clean-bind-session", "api_server")
+    session_db.append_message(session_id, "system", "hidden instruction")
+    session_db.append_message(session_id, "user", "visible question")
+    session_db.append_message(session_id, "assistant", "")
+    session_db.append_message(session_id, "tool", '{"raw":"tool result"}')
+    session_db.append_message(session_id, "assistant", '{"result":"structured execution"}')
+    session_db.append_message(session_id, "assistant", "visible answer")
+
+    class Telegram:
+        async def create_handoff_thread(self, chat_id, name):
+            return "77"
+
+    adapter._telegram_runner_and_adapter = lambda: (None, Telegram())
+    forward = AsyncMock(return_value={"status": "sent"})
+    adapter._forward_to_telegram = forward
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        first = await cli.post(f"/api/sessions/{session_id}/telegram-binding", json={"chat_id": "-100123", "backfill": "none"})
+        assert first.status == 201
+        second = await cli.post(f"/api/sessions/{session_id}/telegram-binding", json={"backfill": "full"})
+        assert second.status == 200, await second.text()
+        payload = await second.json()
+        assert payload["backfill"] == {"mode": "full", "status": "completed", "sent": 2, "failed": 0, "skipped": 4}
+        messages = await cli.get(f"/api/sessions/{session_id}/messages")
+        assert [m["content"] for m in (await messages.json())["data"]] == ["visible question", "visible answer"]
+
+    assert forward.await_args_list[-2].args == (session_id, "user", "visible question")
+    assert forward.await_args_list[-1].args == (session_id, "assistant", "visible answer")
 
 
 @pytest.mark.asyncio

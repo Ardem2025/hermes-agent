@@ -1030,8 +1030,102 @@ class APIServerAdapter(BasePlatformAdapter):
             "thread_id": thread_id,
             "link": APIServerAdapter._telegram_topic_link(chat_id, thread_id) if chat_id and thread_id else None,
             "future_duplication": {"requires_request_opt_in": True, "request_field": "duplicate_to_telegram"},
-            "backfill": delivery or {"mode": "none", "status": "not_requested", "sent": 0, "failed": 0},
+            "backfill": delivery or {"mode": "none", "status": "not_requested", "sent": 0, "failed": 0, "skipped": 0},
         }
+
+    @staticmethod
+    def _user_facing_message_text(message: Dict[str, Any]) -> Optional[str]:
+        """Return safe transcript text, never a tool/reasoning implementation row."""
+        role = str(message.get("role") or "").strip().lower()
+        if role not in {"user", "assistant"}:
+            return None
+        if role == "assistant" and (
+            message.get("tool_calls") or message.get("tool_call_id") or message.get("tool_name")
+            or message.get("reasoning") or message.get("reasoning_content")
+        ):
+            return None
+        content = message.get("content")
+        if isinstance(content, list):
+            text = "\n".join(
+                str(part.get("text") or "").strip()
+                for part in content if isinstance(part, dict) and part.get("type") in {"text", "input_text"}
+            ).strip()
+        elif isinstance(content, str):
+            text = content.strip()
+        else:
+            return None
+        if not text:
+            return None
+        # Tool executions are commonly persisted as JSON strings. Do not leak
+        # those opaque implementation payloads into a user-facing Telegram topic.
+        if role == "assistant" and text[:1] in "[{":
+            try:
+                structured = json.loads(text)
+            except (TypeError, ValueError):
+                structured = None
+            if isinstance(structured, (dict, list)):
+                return None
+        return text
+
+    @classmethod
+    def _telegram_backfill_transcript(cls, messages: List[Dict[str, Any]]) -> tuple[List[Dict[str, str]], int]:
+        """Filter persisted rows to the final, user-facing conversation only."""
+        visible: List[Dict[str, str]] = []
+        skipped = 0
+        for message in messages:
+            text = cls._user_facing_message_text(message)
+            if text is None:
+                skipped += 1
+                continue
+            visible.append({"role": str(message.get("role")).lower(), "content": text})
+        return visible, skipped
+
+    @staticmethod
+    def _telegram_summary(messages: List[Dict[str, str]], *, max_chars: int = 3500) -> str:
+        """Make one compact, explicitly-labelled human transcript summary."""
+        lines = ["🧾 **Conversation summary**", ""]
+        used = sum(len(line) + 1 for line in lines)
+        for message in messages:
+            label = "User" if message["role"] == "user" else "Assistant"
+            compact = " ".join(message["content"].split())
+            remaining = max_chars - used - len(label) - 5
+            if remaining <= 0:
+                lines.append("… (earlier transcript omitted)")
+                break
+            if len(compact) > remaining:
+                compact = compact[:max(0, remaining - 1)].rstrip() + "…"
+            lines.append(f"**{label}:** {compact}")
+            used += len(lines[-1]) + 1
+        if len(lines) == 2:
+            lines.append("No user-facing messages yet.")
+        return "\n".join(lines)
+
+    async def _resync_telegram_backfill(self, session_id: str, mode: str) -> Dict[str, Any]:
+        """Deliver a bounded clean transcript to an already bound topic."""
+        delivery = {"mode": mode, "status": "not_requested" if mode == "none" else "completed", "sent": 0, "failed": 0, "skipped": 0}
+        if mode == "none":
+            return delivery
+        db = self._ensure_session_db()
+        raw_messages = db.get_messages(db.resolve_resume_session_id(session_id))
+        messages, skipped = self._telegram_backfill_transcript(raw_messages)
+        delivery["skipped"] = skipped
+        if mode == "summary":
+            outgoing = [{"role": "assistant", "content": self._telegram_summary(messages)}]
+        else:
+            outgoing = messages[-TELEGRAM_BACKFILL_LIMITS["full"]:]
+            delivery["skipped"] += max(0, len(messages) - len(outgoing))
+        for message in outgoing:
+            result = await self._forward_to_telegram(session_id, message["role"], message["content"])
+            if result.get("status") == "sent":
+                delivery["sent"] += 1
+            elif result.get("status") == "skipped":
+                delivery["skipped"] += 1
+            else:
+                delivery["failed"] += 1
+                delivery.setdefault("failures", []).append(result.get("error") or result.get("status"))
+        if delivery["failed"]:
+            delivery["status"] = "partial" if delivery["sent"] else "failed"
+        return delivery
 
     async def _forward_to_telegram(self, session_id: str, role: str, content: Any) -> Dict[str, Any]:
         """Forward an explicitly opted-in web turn to its bound Telegram topic."""
@@ -1425,6 +1519,21 @@ class APIServerAdapter(BasePlatformAdapter):
         )
         return {key: message.get(key) for key in safe_keys if key in message}
 
+    @classmethod
+    def _user_facing_message_response(cls, message: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """API/UI transcript projection: only non-empty final user/assistant text."""
+        text = cls._user_facing_message_text(message)
+        if text is None:
+            return None
+        return {
+            "id": message.get("id"),
+            "session_id": message.get("session_id"),
+            "role": str(message.get("role")).lower(),
+            "content": text,
+            "timestamp": message.get("timestamp"),
+            "finish_reason": message.get("finish_reason"),
+        }
+
     async def _read_json_body(self, request: "web.Request") -> tuple[Dict[str, Any], Optional["web.Response"]]:
         try:
             body = await request.json()
@@ -1582,10 +1691,11 @@ class APIServerAdapter(BasePlatformAdapter):
         db = self._ensure_session_db()
         resolved_id = db.resolve_resume_session_id(session_id)
         messages = db.get_messages(resolved_id)
+        visible = [self._user_facing_message_response(message) for message in messages]
         return web.json_response({
             "object": "list",
             "session_id": resolved_id,
-            "data": [self._message_response(m) for m in messages],
+            "data": [message for message in visible if message is not None],
         })
 
     async def _handle_fork_session(self, request: "web.Request") -> "web.Response":
@@ -1678,6 +1788,17 @@ class APIServerAdapter(BasePlatformAdapter):
         backfill = str(body.get("backfill") or "summary").lower()
         if backfill not in {"none", "summary", "full"}:
             return web.json_response(_openai_error("backfill must be one of none, summary, full", code="invalid_backfill"), status=400)
+        db = self._ensure_session_db()
+        existing = db.get_telegram_topic_binding_by_session(session_id=session_id)
+        # A repeat POST is a safe history re-sync: retain the canonical topic
+        # and do not create another Telegram forum topic.
+        if existing:
+            if chat_id and chat_id != str(existing.get("chat_id")):
+                return web.json_response(_openai_error("Session is already bound to another Telegram chat", code="telegram_binding_conflict"), status=409)
+            if thread_id and thread_id != str(existing.get("thread_id")):
+                return web.json_response(_openai_error("Session is already bound to another Telegram topic", code="telegram_binding_conflict"), status=409)
+            delivery = await self._resync_telegram_backfill(session_id, backfill)
+            return web.json_response(self._telegram_binding_response(session_id, existing, delivery=delivery))
         if not chat_id:
             return web.json_response(_openai_error("chat_id is required", code="missing_chat_id"), status=400)
         runner, telegram = self._telegram_runner_and_adapter()
@@ -1695,7 +1816,6 @@ class APIServerAdapter(BasePlatformAdapter):
         if not thread_id:
             return web.json_response(_openai_error("Telegram did not create a topic", code="telegram_topic_create_failed"), status=502)
 
-        db = self._ensure_session_db()
         try:
             # Mirror GatewayRunner's source -> key construction so inbound
             # Telegram messages resolve to this exact persisted session.
@@ -1710,18 +1830,7 @@ class APIServerAdapter(BasePlatformAdapter):
             logger.exception("Failed to persist Telegram binding for %s", session_id)
             return web.json_response(_openai_error("Failed to persist Telegram binding", code="telegram_binding_failed"), status=503)
 
-        delivery = {"mode": backfill, "status": "not_requested" if backfill == "none" else "completed", "sent": 0, "failed": 0}
-        if backfill != "none":
-            messages = db.get_messages(db.resolve_resume_session_id(session_id))[-TELEGRAM_BACKFILL_LIMITS[backfill]:]
-            for message in messages:
-                result = await self._forward_to_telegram(session_id, str(message.get("role") or "assistant"), message.get("content", ""))
-                if result.get("status") == "sent":
-                    delivery["sent"] += 1
-                elif result.get("status") != "skipped":
-                    delivery["failed"] += 1
-                    delivery.setdefault("failures", []).append(result.get("error") or result.get("status"))
-            if delivery["failed"]:
-                delivery["status"] = "partial" if delivery["sent"] else "failed"
+        delivery = await self._resync_telegram_backfill(session_id, backfill)
         return web.json_response(self._telegram_binding_response(session_id, binding, delivery=delivery), status=201)
 
     async def _handle_delete_telegram_binding(self, request: "web.Request") -> "web.Response":
