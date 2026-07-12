@@ -4576,6 +4576,18 @@ def _guard_supervised_gateway_conflict(force: bool = False) -> None:
     sys.exit(1)
 
 
+def _isolated_gateway_smoke_mode() -> bool:
+    """Whether an explicit candidate-only smoke may bypass the CLI preflight.
+
+    The runtime still takes its HERMES_HOME-scoped PID/lock before startup.
+    This exception is solely for copied-home validation: it must never select
+    ``--replace`` or signal an existing gateway.
+    """
+    return os.environ.get("HERMES_ISOLATED_GATEWAY_SMOKE", "").strip().lower() in {
+        "1", "true", "yes", "on"
+    }
+
+
 def _guard_existing_gateway_process_conflict(replace: bool = False) -> None:
     """Refuse duplicate foreground startup before importing gateway.run.
 
@@ -4587,7 +4599,10 @@ def _guard_existing_gateway_process_conflict(replace: bool = False) -> None:
     same user-facing contract while avoiding that startup work without scanning
     unrelated gateway processes from other HERMES_HOME roots.
     """
-    if replace or _running_under_gateway_supervisor():
+    # An isolated smoke is intentionally a copied-HERMES_HOME foreground
+    # validation.  Do not inspect or replace a live gateway here: start_gateway
+    # will independently claim its copied-home runtime lock before adapters.
+    if replace or _running_under_gateway_supervisor() or _isolated_gateway_smoke_mode():
         return
     try:
         from gateway.status import get_running_pid
