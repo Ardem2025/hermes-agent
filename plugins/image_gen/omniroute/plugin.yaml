@@ -1,0 +1,5 @@
+name: omniroute
+version: 1.0.0
+description: "OmniRoute image generation via Antigravity/Gemini. Routes through local OmniRoute gateway."
+author: test-assistant
+kind: backend
