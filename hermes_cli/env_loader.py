@@ -217,6 +217,18 @@ def _sanitize_env_file_if_needed(path: Path) -> None:
         pass  # best-effort — don't block gateway startup
 
 
+def _isolated_smoke_launcher_paths() -> dict[str, str]:
+    """Return launcher-owned runtime paths protected during isolated smoke.
+
+    Tenant .env files normally override shell values. An explicit isolated
+    gateway smoke is the sole exception: its launcher supplies private HOME,
+    HERMES_HOME, and XDG_STATE_HOME paths which must survive dotenv loading.
+    """
+    if os.environ.get("HERMES_ISOLATED_GATEWAY_SMOKE", "").strip().lower() not in {"1", "true", "yes", "on"}:
+        return {}
+    return {name: os.environ[name] for name in ("HOME", "HERMES_HOME", "XDG_STATE_HOME") if name in os.environ}
+
+
 def load_hermes_dotenv(
     *,
     hermes_home: str | os.PathLike | None = None,
@@ -230,6 +242,7 @@ def load_hermes_dotenv(
       the user env exists.
     - if no user env exists, the project `.env` also overrides stale shell vars.
     """
+    launcher_paths = _isolated_smoke_launcher_paths()
     loaded: list[Path] = []
 
     home_path = Path(hermes_home or os.getenv("HERMES_HOME", Path.home() / ".hermes"))
@@ -267,6 +280,9 @@ def load_hermes_dotenv(
     _apply_external_secret_sources(home_path)
     _apply_managed_env()
 
+    # Do this after every dotenv-like source, including managed scope. It is
+    # deliberately an opt-in smoke-only exception to normal override behavior.
+    os.environ.update(launcher_paths)
     return loaded
 
 

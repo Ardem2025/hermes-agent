@@ -103,3 +103,38 @@ def test_main_import_applies_user_env_over_shell_values(tmp_path, monkeypatch):
 
     assert os.getenv("OPENAI_BASE_URL") == "https://new.example/v1"
     assert os.getenv("HERMES_INFERENCE_PROVIDER") == "custom"
+
+
+def test_isolated_smoke_preserves_launcher_runtime_paths_in_subprocess(tmp_path):
+    """Copied tenant dotenv cannot retarget an explicitly isolated gateway."""
+    import subprocess
+    import textwrap
+
+    home = tmp_path / "copied-home"
+    hermes_home = home / ".hermes"
+    state_home = home / ".state"
+    hermes_home.mkdir(parents=True)
+    (hermes_home / ".env").write_text(
+        "HOME=/live/home\nHERMES_HOME=/live/hermes\nXDG_STATE_HOME=/live/state\n",
+        encoding="utf-8",
+    )
+    script = textwrap.dedent("""
+        import os
+        from hermes_cli.env_loader import load_hermes_dotenv
+        load_hermes_dotenv(hermes_home=os.environ["HERMES_HOME"])
+        print("|".join(os.environ[k] for k in ("HOME", "HERMES_HOME", "XDG_STATE_HOME")))
+    """)
+    base_env = os.environ | {
+        "HOME": str(home),
+        "HERMES_HOME": str(hermes_home),
+        "XDG_STATE_HOME": str(state_home),
+    }
+    smoke = subprocess.run(
+        [sys.executable, "-c", script], env=base_env | {"HERMES_ISOLATED_GATEWAY_SMOKE": "1"},
+        check=True, text=True, capture_output=True,
+    )
+    assert smoke.stdout.strip() == f"{home}|{hermes_home}|{state_home}"
+    normal = subprocess.run(
+        [sys.executable, "-c", script], env=base_env, check=True, text=True, capture_output=True,
+    )
+    assert normal.stdout.strip() == "/live/home|/live/hermes|/live/state"
