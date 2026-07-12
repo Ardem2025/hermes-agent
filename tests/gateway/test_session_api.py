@@ -41,6 +41,9 @@ def _create_session_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_get("/v1/capabilities", adapter._handle_capabilities)
     app.router.add_get("/api/sessions", adapter._handle_list_sessions)
     app.router.add_post("/api/sessions", adapter._handle_create_session)
+    app.router.add_get("/api/sessions/{session_id}/telegram-binding", adapter._handle_get_telegram_binding)
+    app.router.add_post("/api/sessions/{session_id}/telegram-binding", adapter._handle_post_telegram_binding)
+    app.router.add_delete("/api/sessions/{session_id}/telegram-binding", adapter._handle_delete_telegram_binding)
     app.router.add_get("/api/sessions/{session_id}", adapter._handle_get_session)
     app.router.add_patch("/api/sessions/{session_id}", adapter._handle_patch_session)
     app.router.add_delete("/api/sessions/{session_id}", adapter._handle_delete_session)
@@ -245,6 +248,53 @@ async def test_session_chat_loads_history_and_preserves_session_headers(auth_ada
         {"role": "user", "content": "earlier"},
         {"role": "assistant", "content": "prior answer"},
     ]
+
+
+@pytest.mark.asyncio
+async def test_session_chat_telegram_delivery_is_explicit_opt_in(adapter, session_db):
+    session_id = session_db.create_session("telegram-opt-in", "api_server")
+    app = _create_session_app(adapter)
+    run = AsyncMock(return_value=({"final_response": "answer", "session_id": session_id}, {}))
+    forward = AsyncMock(return_value={"status": "sent"})
+    with patch.object(adapter, "_run_agent", run), patch.object(adapter, "_forward_to_telegram", forward):
+        async with TestClient(TestServer(app)) as cli:
+            no_opt_in = await cli.post(f"/api/sessions/{session_id}/chat", json={"message": "private"})
+            assert no_opt_in.status == 200
+            assert forward.await_count == 0
+            opted_in = await cli.post(f"/api/sessions/{session_id}/chat", json={"message": "share", "duplicate_to_telegram": True})
+            assert opted_in.status == 200
+    assert forward.await_args_list[0].args == (session_id, "user", "share")
+    assert forward.await_args_list[1].args == (session_id, "assistant", "answer")
+
+
+@pytest.mark.asyncio
+async def test_telegram_binding_uses_canonical_db_mapping_and_reports_backfill(adapter, session_db):
+    session_id = session_db.create_session("bind-session", "api_server")
+    session_db.append_message(session_id, "user", "one")
+    session_db.append_message(session_id, "assistant", "two")
+
+    class Telegram:
+        async def create_handoff_thread(self, chat_id, name):
+            assert chat_id == "-100123"
+            return "77"
+
+    adapter._telegram_runner_and_adapter = lambda: (None, Telegram())
+    adapter._forward_to_telegram = AsyncMock(return_value={"status": "sent"})
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        created = await cli.post(f"/api/sessions/{session_id}/telegram-binding", json={"chat_id": "-100123", "backfill": "summary"})
+        assert created.status == 201, await created.text()
+        payload = await created.json()
+        assert payload["bound"] is True
+        assert payload["thread_id"] == "77"
+        assert payload["link"] == "https://t.me/c/123/77"
+        assert payload["backfill"] == {"mode": "summary", "status": "completed", "sent": 2, "failed": 0}
+        fetched = await cli.get(f"/api/sessions/{session_id}/telegram-binding")
+        assert (await fetched.json())["bound"] is True
+        deleted = await cli.delete(f"/api/sessions/{session_id}/telegram-binding")
+        assert deleted.status == 200
+        assert (await deleted.json())["deleted"] is True
+    assert session_db.get_messages(session_id)[0]["content"] == "one"
 
 
 @pytest.mark.asyncio

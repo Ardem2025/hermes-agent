@@ -4413,6 +4413,24 @@ class SessionDB:
             )
         self._execute_write(_do)
 
+    def unbind_telegram_topic(self, *, chat_id: str, thread_id: str) -> bool:
+        """Remove one Telegram topic binding without touching its session transcript."""
+        deleted = False
+
+        def _do(conn):
+            nonlocal deleted
+            try:
+                cursor = conn.execute(
+                    "DELETE FROM telegram_dm_topic_bindings WHERE chat_id = ? AND thread_id = ?",
+                    (str(chat_id), str(thread_id)),
+                )
+                deleted = cursor.rowcount > 0
+            except sqlite3.OperationalError:
+                deleted = False
+
+        self._execute_write(_do)
+        return deleted
+
     def is_telegram_session_linked_to_topic(self, *, session_id: str) -> bool:
         """Return True if a Hermes session is already bound to any Telegram DM topic.
 
