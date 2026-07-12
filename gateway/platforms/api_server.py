@@ -1029,7 +1029,14 @@ class APIServerAdapter(BasePlatformAdapter):
             "chat_id": chat_id,
             "thread_id": thread_id,
             "link": APIServerAdapter._telegram_topic_link(chat_id, thread_id) if chat_id and thread_id else None,
-            "future_duplication": {"requires_request_opt_in": True, "request_field": "duplicate_to_telegram"},
+            "delivery_enabled": bool(binding.get("delivery_enabled", True)) if bound else False,
+            "future_duplication": {
+                "persistent": True,
+                "enabled": bool(binding.get("delivery_enabled", True)) if bound else False,
+                "default": "binding_delivery_enabled",
+                "request_field": "duplicate_to_telegram",
+                "request_override": True,
+            },
             "backfill": delivery or {"mode": "none", "status": "not_requested", "sent": 0, "failed": 0, "skipped": 0},
         }
 
@@ -1127,8 +1134,20 @@ class APIServerAdapter(BasePlatformAdapter):
             delivery["status"] = "partial" if delivery["sent"] else "failed"
         return delivery
 
+    def _telegram_delivery_enabled(self, session_id: str) -> bool:
+        """Return the binding's durable delivery preference (unbound is off)."""
+        db = self._ensure_session_db()
+        if not db:
+            return False
+        try:
+            binding = db.get_telegram_topic_binding_by_session(session_id=session_id)
+        except Exception:
+            logger.debug("Failed to get Telegram delivery state for session %s", session_id, exc_info=True)
+            return False
+        return bool(binding and binding.get("delivery_enabled", True))
+
     async def _forward_to_telegram(self, session_id: str, role: str, content: Any) -> Dict[str, Any]:
-        """Forward an explicitly opted-in web turn to its bound Telegram topic."""
+        """Forward a web turn to its bound Telegram topic."""
         db = self._ensure_session_db()
         if not db:
             return {"status": "unavailable", "error": "session_db_unavailable"}
@@ -1779,15 +1798,19 @@ class APIServerAdapter(BasePlatformAdapter):
         body, err = await self._read_json_body(request)
         if err:
             return err
-        unknown = sorted(set(body) - {"chat_id", "thread_id", "topic_name", "user_id", "backfill"})
+        unknown = sorted(set(body) - {"chat_id", "thread_id", "topic_name", "user_id", "backfill", "delivery_enabled"})
         if unknown:
             return web.json_response(_openai_error(f"Unsupported binding fields: {', '.join(unknown)}", code="unsupported_binding_field"), status=400)
         chat_id = str(body.get("chat_id") or "").strip()
         thread_id = str(body.get("thread_id") or "").strip()
         topic_name = str(body.get("topic_name") or session.get("title") or f"Hermes {session_id[:24]}").strip()
+        backfill_provided = "backfill" in body
         backfill = str(body.get("backfill") or "summary").lower()
         if backfill not in {"none", "summary", "full"}:
             return web.json_response(_openai_error("backfill must be one of none, summary, full", code="invalid_backfill"), status=400)
+        if "delivery_enabled" in body and not isinstance(body["delivery_enabled"], bool):
+            return web.json_response(_openai_error("delivery_enabled must be a boolean", code="invalid_delivery_enabled"), status=400)
+        delivery_enabled = body.get("delivery_enabled", True)
         db = self._ensure_session_db()
         existing = db.get_telegram_topic_binding_by_session(session_id=session_id)
         # A repeat POST is a safe history re-sync: retain the canonical topic
@@ -1797,7 +1820,12 @@ class APIServerAdapter(BasePlatformAdapter):
                 return web.json_response(_openai_error("Session is already bound to another Telegram chat", code="telegram_binding_conflict"), status=409)
             if thread_id and thread_id != str(existing.get("thread_id")):
                 return web.json_response(_openai_error("Session is already bound to another Telegram topic", code="telegram_binding_conflict"), status=409)
-            delivery = await self._resync_telegram_backfill(session_id, backfill)
+            # Metadata updates neither create a topic nor resend history. A
+            # repeat POST only backfills when the caller explicitly requests it.
+            if "delivery_enabled" in body:
+                db.set_telegram_topic_delivery_enabled(session_id=session_id, delivery_enabled=delivery_enabled)
+                existing = db.get_telegram_topic_binding_by_session(session_id=session_id)
+            delivery = await self._resync_telegram_backfill(session_id, backfill) if backfill_provided else None
             return web.json_response(self._telegram_binding_response(session_id, existing, delivery=delivery))
         if not chat_id:
             return web.json_response(_openai_error("chat_id is required", code="missing_chat_id"), status=400)
@@ -1822,7 +1850,7 @@ class APIServerAdapter(BasePlatformAdapter):
             from gateway.session import SessionSource, build_session_key
             source = SessionSource(Platform.TELEGRAM, chat_id, chat_type="dm", user_id=str(body.get("user_id") or chat_id), thread_id=thread_id)
             session_key = runner._session_key_for_source(source) if runner and hasattr(runner, "_session_key_for_source") else build_session_key(source)
-            db.bind_telegram_topic(chat_id=chat_id, thread_id=thread_id, user_id=source.user_id or "", session_key=session_key, session_id=session_id, managed_mode="api")
+            db.bind_telegram_topic(chat_id=chat_id, thread_id=thread_id, user_id=source.user_id or "", session_key=session_key, session_id=session_id, managed_mode="api", delivery_enabled=delivery_enabled)
             binding = db.get_telegram_topic_binding_by_session(session_id=session_id)
         except ValueError as exc:
             return web.json_response(_openai_error(str(exc), code="telegram_binding_conflict"), status=409)
@@ -1872,7 +1900,9 @@ class APIServerAdapter(BasePlatformAdapter):
         user_message, err = _session_chat_user_message(body)
         if err is not None:
             return err
-        duplicate_to_telegram = _coerce_request_bool(body.get("duplicate_to_telegram"), default=False)
+        duplicate_to_telegram = _coerce_request_bool(
+            body.get("duplicate_to_telegram"), default=self._telegram_delivery_enabled(session_id)
+        )
         system_prompt = body.get("system_message") or body.get("instructions")
         if system_prompt is not None and not isinstance(system_prompt, str):
             return web.json_response(_openai_error("system_message must be a string", code="invalid_system_message"), status=400)
@@ -1921,7 +1951,9 @@ class APIServerAdapter(BasePlatformAdapter):
         user_message, err = _session_chat_user_message(body)
         if err is not None:
             return err
-        duplicate_to_telegram = _coerce_request_bool(body.get("duplicate_to_telegram"), default=False)
+        duplicate_to_telegram = _coerce_request_bool(
+            body.get("duplicate_to_telegram"), default=self._telegram_delivery_enabled(session_id)
+        )
         system_prompt = body.get("system_message") or body.get("instructions")
         if system_prompt is not None and not isinstance(system_prompt, str):
             return web.json_response(_openai_error("system_message must be a string", code="invalid_system_message"), status=400)
