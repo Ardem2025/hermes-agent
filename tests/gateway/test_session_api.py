@@ -259,12 +259,12 @@ async def test_session_chat_telegram_delivery_uses_persistent_binding_state(adap
     )
     app = _create_session_app(adapter)
     run = AsyncMock(return_value=({"final_response": "answer", "session_id": session_id}, {}))
-    forward = AsyncMock(return_value={"status": "sent"})
-    with patch.object(adapter, "_run_agent", run), patch.object(adapter, "_forward_to_telegram", forward):
+    sync = AsyncMock(return_value={"mode": "incremental", "status": "completed", "sent": 0, "failed": 0, "skipped": 0})
+    with patch.object(adapter, "_run_agent", run), patch.object(adapter, "_sync_telegram_history", sync):
         async with TestClient(TestServer(app)) as cli:
             disabled = await cli.post(f"/api/sessions/{session_id}/chat", json={"message": "private"})
             assert disabled.status == 200
-            assert forward.await_count == 0
+            assert sync.await_count == 0
             # The legacy field remains a per-request override for callers that
             # need one-off delivery while the durable preference is disabled.
             override = await cli.post(f"/api/sessions/{session_id}/chat", json={"message": "share", "duplicate_to_telegram": True})
@@ -272,9 +272,10 @@ async def test_session_chat_telegram_delivery_uses_persistent_binding_state(adap
             session_db.set_telegram_topic_delivery_enabled(session_id=session_id, delivery_enabled=True)
             enabled = await cli.post(f"/api/sessions/{session_id}/chat", json={"message": "automatic"})
             assert enabled.status == 200
-    assert [call.args for call in forward.await_args_list] == [
-        (session_id, "user", "share"), (session_id, "assistant", "answer"),
-        (session_id, "user", "automatic"), (session_id, "assistant", "answer"),
+    # Each delivered turn drains older pending rows before execution and then
+    # synchronizes the newly persisted user/assistant rows after completion.
+    assert [call.args for call in sync.await_args_list] == [
+        (session_id,), (session_id,), (session_id,), (session_id,),
     ]
 
 
@@ -304,7 +305,7 @@ async def test_telegram_binding_uses_canonical_db_mapping_and_reports_backfill(a
             "request_field": "duplicate_to_telegram", "request_override": True,
         }
         assert payload["link"] == "https://t.me/c/123/77"
-        assert payload["backfill"] == {"mode": "summary", "status": "completed", "sent": 1, "failed": 0, "skipped": 0}
+        assert payload["backfill"] == {"mode": "incremental", "status": "completed", "sent": 2, "failed": 0, "skipped": 0}
         fetched = await cli.get(f"/api/sessions/{session_id}/telegram-binding")
         assert (await fetched.json())["bound"] is True
         deleted = await cli.delete(f"/api/sessions/{session_id}/telegram-binding")
@@ -400,7 +401,7 @@ async def test_existing_v2_binding_migrates_before_delivery_toggle(adapter, sess
     binding = session_db.get_telegram_topic_binding_by_session(session_id=session_id)
     assert binding["thread_id"] == "77"
     assert binding["delivery_enabled"] == 0
-    assert session_db.get_meta("telegram_dm_topic_schema_version") == "3"
+    assert session_db.get_meta("telegram_dm_topic_schema_version") == "4"
 
 
 @pytest.mark.asyncio
@@ -422,17 +423,68 @@ async def test_existing_telegram_binding_resyncs_clean_user_facing_transcript(ad
     adapter._forward_to_telegram = forward
     app = _create_session_app(adapter)
     async with TestClient(TestServer(app)) as cli:
-        first = await cli.post(f"/api/sessions/{session_id}/telegram-binding", json={"chat_id": "-100123", "backfill": "none"})
+        first = await cli.post(f"/api/sessions/{session_id}/telegram-binding", json={"chat_id": "-100123", "delivery_enabled": False})
         assert first.status == 201
-        second = await cli.post(f"/api/sessions/{session_id}/telegram-binding", json={"backfill": "full"})
+        second = await cli.post(f"/api/sessions/{session_id}/telegram-binding", json={"delivery_enabled": True, "backfill": "full"})
         assert second.status == 200, await second.text()
         payload = await second.json()
-        assert payload["backfill"] == {"mode": "full", "status": "completed", "sent": 2, "failed": 0, "skipped": 4}
+        assert payload["backfill"] == {"mode": "incremental", "status": "completed", "sent": 2, "failed": 0, "skipped": 4}
         messages = await cli.get(f"/api/sessions/{session_id}/messages")
         assert [m["content"] for m in (await messages.json())["data"]] == ["visible question", "visible answer"]
 
-    assert forward.await_args_list[-2].args == (session_id, "user", "visible question")
-    assert forward.await_args_list[-1].args == (session_id, "assistant", "visible answer")
+    assert forward.await_args_list[-2].args[:2] == (session_id, "user")
+    assert "visible question" in forward.await_args_list[-2].args[2]
+    assert forward.await_args_list[-1].args[:2] == (session_id, "assistant")
+    assert "visible answer" in forward.await_args_list[-1].args[2]
+
+
+@pytest.mark.asyncio
+async def test_telegram_binding_incrementally_resumes_after_disable_and_failure(adapter, session_db):
+    session_id = session_db.create_session("incremental-binding", "api_server")
+    first_id = session_db.append_message(session_id, "user", "first")
+    hidden_id = session_db.append_message(session_id, "tool", "internal")
+    second_id = session_db.append_message(session_id, "assistant", "second")
+
+    class Telegram:
+        async def create_handoff_thread(self, chat_id, name):
+            return "77"
+
+    adapter._telegram_runner_and_adapter = lambda: (None, Telegram())
+    forward = AsyncMock(side_effect=[{"status": "sent"}, {"status": "failed", "error": "down"}])
+    adapter._forward_to_telegram = forward
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        # Disabled creation neither sends nor moves the checkpoint.
+        created = await cli.post(
+            f"/api/sessions/{session_id}/telegram-binding",
+            json={"chat_id": "-100123", "delivery_enabled": False},
+        )
+        assert created.status == 201
+        assert forward.await_count == 0
+
+        # Re-enable walks visible + safe skipped rows in order and stops on a
+        # send failure, leaving that failed message retryable.
+        resumed = await cli.post(f"/api/sessions/{session_id}/telegram-binding", json={"delivery_enabled": True})
+        assert resumed.status == 200
+        assert (await resumed.json())["backfill"]["status"] == "partial"
+        binding = session_db.get_telegram_topic_binding_by_session(session_id=session_id)
+        assert binding["last_synced_message_id"] == hidden_id
+
+        forward.side_effect = [{"status": "sent"}]
+        retried = await cli.post(f"/api/sessions/{session_id}/telegram-binding", json={"delivery_enabled": True})
+        assert retried.status == 200
+        assert (await retried.json())["backfill"]["sent"] == 1
+        binding = session_db.get_telegram_topic_binding_by_session(session_id=session_id)
+        assert binding["last_synced_message_id"] == second_id
+
+        # With no new rows a repeated enable must send nothing.
+        noop = await cli.post(f"/api/sessions/{session_id}/telegram-binding", json={"delivery_enabled": True})
+        assert noop.status == 200
+        assert (await noop.json())["backfill"]["sent"] == 0
+
+    assert forward.await_args_list[0].args[1] == "user"
+    assert "first" in forward.await_args_list[0].args[2]
+    assert "second" in forward.await_args_list[-1].args[2]
 
 
 @pytest.mark.asyncio
@@ -506,16 +558,14 @@ async def test_session_chat_stream_uses_persistent_telegram_delivery_state(adapt
     async def fake_run(**kwargs):
         return {"final_response": "stream answer", "session_id": session_id}, {}
 
-    forward = AsyncMock(return_value={"status": "sent"})
+    sync = AsyncMock(return_value={"mode": "incremental", "status": "completed", "sent": 0, "failed": 0, "skipped": 0})
     app = _create_session_app(adapter)
-    with patch.object(adapter, "_run_agent", side_effect=fake_run), patch.object(adapter, "_forward_to_telegram", forward):
+    with patch.object(adapter, "_run_agent", side_effect=fake_run), patch.object(adapter, "_sync_telegram_history", sync):
         async with TestClient(TestServer(app)) as cli:
             response = await cli.post(f"/api/sessions/{session_id}/chat/stream", json={"message": "stream me"})
             assert response.status == 200
             await response.text()
-    assert [call.args for call in forward.await_args_list] == [
-        (session_id, "user", "stream me"), (session_id, "assistant", "stream answer"),
-    ]
+    assert [call.args for call in sync.await_args_list] == [(session_id,), (session_id,)]
 
 
 @pytest.mark.asyncio

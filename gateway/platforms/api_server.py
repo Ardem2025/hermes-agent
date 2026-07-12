@@ -32,6 +32,7 @@ Requires:
 """
 
 import asyncio
+from datetime import datetime
 import hashlib
 import hmac
 import json
@@ -42,6 +43,7 @@ import re
 import sqlite3
 import time
 import uuid
+from zoneinfo import ZoneInfo
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -1037,7 +1039,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "request_field": "duplicate_to_telegram",
                 "request_override": True,
             },
-            "backfill": delivery or {"mode": "none", "status": "not_requested", "sent": 0, "failed": 0, "skipped": 0},
+            "backfill": delivery or {"mode": "incremental", "status": "not_requested", "sent": 0, "failed": 0, "skipped": 0},
         }
 
     @staticmethod
@@ -1088,50 +1090,51 @@ class APIServerAdapter(BasePlatformAdapter):
         return visible, skipped
 
     @staticmethod
-    def _telegram_summary(messages: List[Dict[str, str]], *, max_chars: int = 3500) -> str:
-        """Make one compact, explicitly-labelled human transcript summary."""
-        lines = ["🧾 **Conversation summary**", ""]
-        used = sum(len(line) + 1 for line in lines)
-        for message in messages:
-            label = "User" if message["role"] == "user" else "Assistant"
-            compact = " ".join(message["content"].split())
-            remaining = max_chars - used - len(label) - 5
-            if remaining <= 0:
-                lines.append("… (earlier transcript omitted)")
-                break
-            if len(compact) > remaining:
-                compact = compact[:max(0, remaining - 1)].rstrip() + "…"
-            lines.append(f"**{label}:** {compact}")
-            used += len(lines[-1]) + 1
-        if len(lines) == 2:
-            lines.append("No user-facing messages yet.")
-        return "\n".join(lines)
+    def _telegram_sync_text(message: Dict[str, Any], text: str) -> str:
+        """Add a readable, stable Moscow timestamp to a historical row."""
+        timestamp = message.get("timestamp")
+        try:
+            local = datetime.fromtimestamp(float(timestamp), tz=ZoneInfo("Europe/Moscow"))
+            stamp = local.strftime("%d.%m.%Y %H:%M MSK")
+        except (TypeError, ValueError, OverflowError, OSError):
+            stamp = "unknown time (MSK)"
+        return f"🕓 {stamp}\n{text}"
 
-    async def _resync_telegram_backfill(self, session_id: str, mode: str) -> Dict[str, Any]:
-        """Deliver a bounded clean transcript to an already bound topic."""
-        delivery = {"mode": mode, "status": "not_requested" if mode == "none" else "completed", "sent": 0, "failed": 0, "skipped": 0}
-        if mode == "none":
-            return delivery
+    async def _sync_telegram_history(self, session_id: str) -> Dict[str, Any]:
+        """Incrementally deliver a bound transcript and durably checkpoint rows.
+
+        The checkpoint advances one row at a time only after a safe local skip
+        or confirmed Telegram outcome.  A failure stops the ordered walk so no
+        later row can make an earlier unsent row disappear from a retry.
+        """
+        delivery = {"mode": "incremental", "status": "completed", "sent": 0, "failed": 0, "skipped": 0}
         db = self._ensure_session_db()
+        binding = db.get_telegram_topic_binding_by_session(session_id=session_id)
+        if not binding or not binding.get("delivery_enabled", True):
+            delivery.update(status="not_requested")
+            return delivery
+        checkpoint = binding.get("last_synced_message_id")
         raw_messages = db.get_messages(db.resolve_resume_session_id(session_id))
-        messages, skipped = self._telegram_backfill_transcript(raw_messages)
-        delivery["skipped"] = skipped
-        if mode == "summary":
-            outgoing = [{"role": "assistant", "content": self._telegram_summary(messages)}]
-        else:
-            outgoing = messages[-TELEGRAM_BACKFILL_LIMITS["full"]:]
-            delivery["skipped"] += max(0, len(messages) - len(outgoing))
-        for message in outgoing:
-            result = await self._forward_to_telegram(session_id, message["role"], message["content"])
-            if result.get("status") == "sent":
-                delivery["sent"] += 1
-            elif result.get("status") == "skipped":
+        for message in raw_messages:
+            message_id = message.get("id")
+            if not isinstance(message_id, int) or (checkpoint is not None and message_id <= checkpoint):
+                continue
+            text = self._user_facing_message_text(message)
+            if text is None:
                 delivery["skipped"] += 1
-            else:
-                delivery["failed"] += 1
-                delivery.setdefault("failures", []).append(result.get("error") or result.get("status"))
-        if delivery["failed"]:
-            delivery["status"] = "partial" if delivery["sent"] else "failed"
+                db.advance_telegram_topic_sync_checkpoint(session_id=session_id, message_id=message_id)
+                continue
+            result = await self._forward_to_telegram(
+                session_id, str(message.get("role")).lower(), self._telegram_sync_text(message, text)
+            )
+            if result.get("status") in {"sent", "skipped"}:
+                delivery["sent" if result.get("status") == "sent" else "skipped"] += 1
+                db.advance_telegram_topic_sync_checkpoint(session_id=session_id, message_id=message_id)
+                continue
+            delivery["failed"] += 1
+            delivery["status"] = "partial" if delivery["sent"] or delivery["skipped"] else "failed"
+            delivery["failures"] = [result.get("error") or result.get("status")]
+            break
         return delivery
 
     def _telegram_delivery_enabled(self, session_id: str) -> bool:
@@ -1805,10 +1808,12 @@ class APIServerAdapter(BasePlatformAdapter):
         chat_id = str(body.get("chat_id") or "").strip()
         thread_id = str(body.get("thread_id") or "").strip()
         topic_name = str(body.get("topic_name") or session.get("title") or f"Hermes {session_id[:24]}").strip()
+        # ``backfill`` remains accepted for old clients, but history is now
+        # always row-by-row incremental; summary/full replays are retired.
         backfill_provided = "backfill" in body
-        backfill = str(body.get("backfill") or "summary").lower()
-        if backfill not in {"none", "summary", "full"}:
-            return web.json_response(_openai_error("backfill must be one of none, summary, full", code="invalid_backfill"), status=400)
+        backfill = str(body.get("backfill") or "incremental").lower()
+        if backfill not in {"none", "summary", "full", "incremental"}:
+            return web.json_response(_openai_error("backfill must be one of none, summary, full, incremental", code="invalid_backfill"), status=400)
         if "delivery_enabled" in body and not isinstance(body["delivery_enabled"], bool):
             return web.json_response(_openai_error("delivery_enabled must be a boolean", code="invalid_delivery_enabled"), status=400)
         delivery_enabled = body.get("delivery_enabled", True)
@@ -1822,12 +1827,16 @@ class APIServerAdapter(BasePlatformAdapter):
                 return web.json_response(_openai_error("Session is already bound to another Telegram chat", code="telegram_binding_conflict"), status=409)
             if thread_id and thread_id != str(existing.get("thread_id")):
                 return web.json_response(_openai_error("Session is already bound to another Telegram topic", code="telegram_binding_conflict"), status=409)
-            # Metadata updates neither create a topic nor resend history. A
-            # repeat POST only backfills when the caller explicitly requests it.
+            should_sync = False
             if "delivery_enabled" in body:
                 db.set_telegram_topic_delivery_enabled(session_id=session_id, delivery_enabled=delivery_enabled)
                 existing = db.get_telegram_topic_binding_by_session(session_id=session_id)
-            delivery = await self._resync_telegram_backfill(session_id, backfill) if backfill_provided else None
+                # Turning delivery back on is the durable resume trigger.
+                should_sync = delivery_enabled
+            # Preserve a compatibility escape hatch: a legacy explicit
+            # backfill request means "attempt the incremental pending rows".
+            should_sync = should_sync or (backfill_provided and backfill != "none")
+            delivery = await self._sync_telegram_history(session_id) if should_sync else None
             return web.json_response(self._telegram_binding_response(session_id, existing, delivery=delivery))
         if not chat_id:
             return web.json_response(_openai_error("chat_id is required", code="missing_chat_id"), status=400)
@@ -1860,7 +1869,9 @@ class APIServerAdapter(BasePlatformAdapter):
             logger.exception("Failed to persist Telegram binding for %s", session_id)
             return web.json_response(_openai_error("Failed to persist Telegram binding", code="telegram_binding_failed"), status=503)
 
-        delivery = await self._resync_telegram_backfill(session_id, backfill)
+        # First successful bind sends the complete eligible history, one row
+        # per Telegram message, unless delivery was explicitly disabled.
+        delivery = await self._sync_telegram_history(session_id) if delivery_enabled else None
         return web.json_response(self._telegram_binding_response(session_id, binding, delivery=delivery), status=201)
 
     async def _handle_delete_telegram_binding(self, request: "web.Request") -> "web.Response":
@@ -1910,7 +1921,10 @@ class APIServerAdapter(BasePlatformAdapter):
             return web.json_response(_openai_error("system_message must be a string", code="invalid_system_message"), status=400)
         history = self._conversation_history_for_session(session_id)
         if duplicate_to_telegram:
-            await self._forward_to_telegram(session_id, "user", user_message)
+            # Drain any older pending rows before this turn. The completed turn
+            # is delivered from persisted history below so its durable message
+            # ids and checkpoint always agree.
+            await self._sync_telegram_history(session_id)
         result, usage = await self._run_agent(
             user_message=user_message,
             conversation_history=history,
@@ -1921,7 +1935,7 @@ class APIServerAdapter(BasePlatformAdapter):
         effective_session_id = result.get("session_id") if isinstance(result, dict) else session_id
         final_response = result.get("final_response", "") if isinstance(result, dict) else ""
         if duplicate_to_telegram:
-            await self._forward_to_telegram(session_id, "assistant", final_response)
+            await self._sync_telegram_history(session_id)
         headers = {"X-Hermes-Session-Id": effective_session_id or session_id}
         if gateway_session_key:
             headers["X-Hermes-Session-Key"] = gateway_session_key
@@ -2006,7 +2020,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 await queue.put(_event_payload("message.started", {"message": {"id": message_id, "role": "assistant"}}))
                 history = self._conversation_history_for_session(session_id)
                 if duplicate_to_telegram:
-                    await self._forward_to_telegram(session_id, "user", user_message)
+                    await self._sync_telegram_history(session_id)
                 result, usage = await self._run_agent(
                     user_message=user_message,
                     conversation_history=history,
@@ -2018,7 +2032,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 )
                 final_response = result.get("final_response", "") if isinstance(result, dict) else ""
                 if duplicate_to_telegram:
-                    await self._forward_to_telegram(session_id, "assistant", final_response)
+                    await self._sync_telegram_history(session_id)
                 effective_session_id = result.get("session_id", session_id) if isinstance(result, dict) else session_id
                 turn_messages = self._turn_transcript_messages(history, user_message, result) if isinstance(result, dict) else []
                 await queue.put(_event_payload("assistant.completed", {

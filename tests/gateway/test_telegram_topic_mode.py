@@ -549,7 +549,7 @@ async def test_topic_root_command_explicitly_migrates_and_enables_topic_mode(tmp
 
     assert "Telegram multi-session topics are enabled" in result
     assert "All Messages" in result
-    assert session_db.get_meta("telegram_dm_topic_schema_version") == "3"
+    assert session_db.get_meta("telegram_dm_topic_schema_version") == "4"
     assert session_db.is_telegram_topic_mode_enabled(chat_id="208214988", user_id="208214988")
     assert runner._telegram_topic_mode_enabled(_make_source()) is True
     runner._run_agent.assert_not_called()
@@ -1115,7 +1115,7 @@ def test_migration_rebuilds_v1_binding_table_with_cascade_fk(tmp_path):
     ).fetchall()
     assert any(row[2] == "sessions" and (row[6] or "") != "CASCADE" for row in fk_rows)
 
-    # Re-run migration — should upgrade through v2 CASCADE to the v3 delivery shape.
+    # Re-run migration — should upgrade through v2 CASCADE to the v4 sync shape.
     db.apply_telegram_topic_migration()
 
     fk_rows_after = db._conn.execute(
@@ -1127,11 +1127,12 @@ def test_migration_rebuilds_v1_binding_table_with_cascade_fk(tmp_path):
         for row in db._conn.execute("PRAGMA table_info('telegram_dm_topic_bindings')").fetchall()
     }
     assert "delivery_enabled" in binding_columns
+    assert "last_synced_message_id" in binding_columns
 
     version = db._conn.execute(
         "SELECT value FROM state_meta WHERE key = 'telegram_dm_topic_schema_version'"
     ).fetchone()
-    assert version is not None and version[0] == "3"
+    assert version is not None and version[0] == "4"
 
 
 @pytest.mark.asyncio

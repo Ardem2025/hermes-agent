@@ -4097,6 +4097,8 @@ class SessionDB:
           v2 — session_id FK gets ON DELETE CASCADE so session pruning
                automatically clears bindings.
           v3 — persistent delivery_enabled flag for WebUI -> Telegram delivery.
+          v4 — durable last_synced_message_id checkpoint for incremental
+               WebUI transcript delivery.
         """
         def _do(conn):
             conn.executescript(
@@ -4122,6 +4124,7 @@ class SessionDB:
                     session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
                     managed_mode TEXT NOT NULL DEFAULT 'auto',
                     delivery_enabled INTEGER NOT NULL DEFAULT 1,
+                    last_synced_message_id INTEGER,
                     linked_at REAL NOT NULL,
                     updated_at REAL NOT NULL,
                     PRIMARY KEY (chat_id, thread_id)
@@ -4162,13 +4165,14 @@ class SessionDB:
                             session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
                             managed_mode TEXT NOT NULL DEFAULT 'auto',
                             delivery_enabled INTEGER NOT NULL DEFAULT 1,
+                            last_synced_message_id INTEGER,
                             linked_at REAL NOT NULL,
                             updated_at REAL NOT NULL,
                             PRIMARY KEY (chat_id, thread_id)
                         );
                         INSERT INTO telegram_dm_topic_bindings_new
                             SELECT chat_id, thread_id, user_id, session_key,
-                                   session_id, managed_mode, 1, linked_at, updated_at
+                                   session_id, managed_mode, 1, NULL, linked_at, updated_at
                             FROM telegram_dm_topic_bindings;
                         DROP TABLE telegram_dm_topic_bindings;
                         ALTER TABLE telegram_dm_topic_bindings_new
@@ -4192,10 +4196,18 @@ class SessionDB:
                     "ADD COLUMN delivery_enabled INTEGER NOT NULL DEFAULT 1"
                 )
 
+            # v3 → v4: the durable row id checkpoint lets a paused binding
+            # resume without replaying already delivered transcript rows.
+            if "last_synced_message_id" not in binding_columns:
+                conn.execute(
+                    "ALTER TABLE telegram_dm_topic_bindings "
+                    "ADD COLUMN last_synced_message_id INTEGER"
+                )
+
             conn.execute(
                 "INSERT INTO state_meta (key, value) VALUES (?, ?) "
                 "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                ("telegram_dm_topic_schema_version", "3"),
+                ("telegram_dm_topic_schema_version", "4"),
             )
         self._execute_write(_do)
 
@@ -4407,8 +4419,8 @@ class SessionDB:
                 """
                 INSERT INTO telegram_dm_topic_bindings (
                     chat_id, thread_id, user_id, session_key, session_id,
-                    managed_mode, delivery_enabled, linked_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    managed_mode, delivery_enabled, last_synced_message_id, linked_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(chat_id, thread_id) DO UPDATE SET
                     user_id = excluded.user_id,
                     session_key = excluded.session_key,
@@ -4424,6 +4436,7 @@ class SessionDB:
                     session_id,
                     managed_mode,
                     1 if delivery_enabled else 0,
+                    None,
                     now,
                     now,
                 ),
@@ -4441,6 +4454,33 @@ class SessionDB:
                     "UPDATE telegram_dm_topic_bindings "
                     "SET delivery_enabled = ?, updated_at = ? WHERE session_id = ?",
                     (1 if delivery_enabled else 0, time.time(), str(session_id)),
+                )
+                updated = cursor.rowcount > 0
+            except sqlite3.OperationalError:
+                updated = False
+
+        self._execute_write(_do)
+        return updated
+
+    def advance_telegram_topic_sync_checkpoint(self, *, session_id: str, message_id: int) -> bool:
+        """Record delivery through one persisted message row, monotonically.
+
+        A caller must invoke this only after a row was safely skipped or its
+        Telegram send succeeded.  Keeping this individual and monotonic makes
+        a failed later send retryable after a process restart.
+        """
+        updated = False
+
+        def _do(conn):
+            nonlocal updated
+            try:
+                cursor = conn.execute(
+                    "UPDATE telegram_dm_topic_bindings "
+                    "SET last_synced_message_id = CASE "
+                    "WHEN last_synced_message_id IS NULL OR last_synced_message_id < ? "
+                    "THEN ? ELSE last_synced_message_id END, updated_at = ? "
+                    "WHERE session_id = ?",
+                    (int(message_id), int(message_id), time.time(), str(session_id)),
                 )
                 updated = cursor.rowcount > 0
             except sqlite3.OperationalError:
