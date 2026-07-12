@@ -1140,6 +1140,7 @@ class APIServerAdapter(BasePlatformAdapter):
         if not db:
             return False
         try:
+            db.apply_telegram_topic_migration()
             binding = db.get_telegram_topic_binding_by_session(session_id=session_id)
         except Exception:
             logger.debug("Failed to get Telegram delivery state for session %s", session_id, exc_info=True)
@@ -1812,6 +1813,7 @@ class APIServerAdapter(BasePlatformAdapter):
             return web.json_response(_openai_error("delivery_enabled must be a boolean", code="invalid_delivery_enabled"), status=400)
         delivery_enabled = body.get("delivery_enabled", True)
         db = self._ensure_session_db()
+        db.apply_telegram_topic_migration()
         existing = db.get_telegram_topic_binding_by_session(session_id=session_id)
         # A repeat POST is a safe history re-sync: retain the canonical topic
         # and do not create another Telegram forum topic.

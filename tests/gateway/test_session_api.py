@@ -349,6 +349,61 @@ async def test_existing_telegram_binding_toggles_delivery_without_topic_or_backf
 
 
 @pytest.mark.asyncio
+async def test_existing_v2_binding_migrates_before_delivery_toggle(adapter, session_db):
+    session_id = session_db.create_session("legacy-v2-toggle", "api_server")
+    session_db.apply_telegram_topic_migration()
+    session_db.bind_telegram_topic(
+        chat_id="-100123", thread_id="77", user_id="-100123",
+        session_key="telegram:-100123:77", session_id=session_id, managed_mode="api",
+    )
+    # Recreate the production v2 shape: existing binding, no delivery column.
+    with session_db._lock:
+        session_db._conn.executescript(
+            """
+            ALTER TABLE telegram_dm_topic_bindings RENAME TO telegram_dm_topic_bindings_v3;
+            CREATE TABLE telegram_dm_topic_bindings (
+                chat_id TEXT NOT NULL,
+                thread_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                session_key TEXT NOT NULL,
+                session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                managed_mode TEXT NOT NULL DEFAULT 'auto',
+                linked_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                PRIMARY KEY (chat_id, thread_id)
+            );
+            INSERT INTO telegram_dm_topic_bindings
+                SELECT chat_id, thread_id, user_id, session_key, session_id,
+                       managed_mode, linked_at, updated_at
+                FROM telegram_dm_topic_bindings_v3;
+            DROP TABLE telegram_dm_topic_bindings_v3;
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_telegram_dm_topic_session
+                ON telegram_dm_topic_bindings(session_id);
+            UPDATE state_meta SET value = '2'
+                WHERE key = 'telegram_dm_topic_schema_version';
+            """
+        )
+        session_db._conn.commit()
+
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        disabled = await cli.post(
+            f"/api/sessions/{session_id}/telegram-binding",
+            json={"delivery_enabled": False, "backfill": "none"},
+        )
+        assert disabled.status == 200, await disabled.text()
+        payload = await disabled.json()
+        assert payload["thread_id"] == "77"
+        assert payload["delivery_enabled"] is False
+        assert payload["backfill"]["status"] == "not_requested"
+
+    binding = session_db.get_telegram_topic_binding_by_session(session_id=session_id)
+    assert binding["thread_id"] == "77"
+    assert binding["delivery_enabled"] == 0
+    assert session_db.get_meta("telegram_dm_topic_schema_version") == "3"
+
+
+@pytest.mark.asyncio
 async def test_existing_telegram_binding_resyncs_clean_user_facing_transcript(adapter, session_db):
     session_id = session_db.create_session("clean-bind-session", "api_server")
     session_db.append_message(session_id, "system", "hidden instruction")
