@@ -95,6 +95,7 @@ MAX_REQUEST_BYTES = 10_000_000  # 10 MB — accommodates long agent conversation
 CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
+TELEGRAM_BACKFILL_LIMITS = {"summary": 12, "full": 100}
 
 
 def _coerce_port(value: Any, default: int = DEFAULT_PORT) -> int:
@@ -891,6 +892,9 @@ class APIServerAdapter(BasePlatformAdapter):
         # in-flight run by run_id.
         self._run_approval_sessions: Dict[str, str] = {}
         self._session_db: Optional[Any] = None  # Lazy-init SessionDB for session continuity
+        # Set by GatewayRunner; never resolve a process-global runner because
+        # FriendsHost serves independent per-profile gateway instances.
+        self.gateway_runner: Optional[Any] = None
         # Concurrency cap shared across all agent-serving endpoints
         # (/v1/chat/completions, /v1/responses, /v1/runs). Read from
         # config.yaml gateway.api_server.max_concurrent_runs; 0 disables
@@ -1499,6 +1503,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "session_chat": True,
                 "session_chat_streaming": True,
                 "session_fork": True,
+                "telegram_session_binding": True,
                 "admin_config_rw": False,
                 "jobs_admin": False,
                 "memory_write_api": False,
@@ -1529,6 +1534,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "session_delete": {"method": "DELETE", "path": "/api/sessions/{session_id}"},
                 "session_messages": {"method": "GET", "path": "/api/sessions/{session_id}/messages"},
                 "session_fork": {"method": "POST", "path": "/api/sessions/{session_id}/fork"},
+                "session_telegram_binding": {"method": "GET|POST|DELETE", "path": "/api/sessions/{session_id}/telegram-binding"},
                 "session_chat": {"method": "POST", "path": "/api/sessions/{session_id}/chat"},
                 "session_chat_stream": {"method": "POST", "path": "/api/sessions/{session_id}/chat/stream"},
             },
@@ -1690,6 +1696,167 @@ class APIServerAdapter(BasePlatformAdapter):
             logger.warning("Failed to load session history for %s: %s", session_id, exc)
             return []
 
+    def _telegram_runner_and_adapter(self) -> tuple[Optional[Any], Optional[Any]]:
+        """Return this adapter's owning runner and its Telegram adapter only."""
+        runner = getattr(self, "gateway_runner", None)
+        if runner is None:
+            return None, None
+        try:
+            return runner, runner.adapters.get(Platform.TELEGRAM)
+        except Exception:
+            logger.debug("Telegram adapter lookup failed", exc_info=True)
+            return runner, None
+
+    @staticmethod
+    def _user_facing_message_text(message: Dict[str, Any]) -> Optional[str]:
+        """Project persisted transcript rows to safe user-visible text."""
+        role = str(message.get("role") or "").strip().lower()
+        if role not in {"user", "assistant"}:
+            return None
+        if role == "assistant" and (message.get("tool_calls") or message.get("tool_call_id")
+                                    or message.get("tool_name") or message.get("reasoning")
+                                    or message.get("reasoning_content")):
+            return None
+        content = message.get("content")
+        if isinstance(content, list):
+            text = "\n".join(str(part.get("text") or "").strip() for part in content
+                             if isinstance(part, dict) and part.get("type") in {"text", "input_text"}).strip()
+        elif isinstance(content, str):
+            text = content.strip()
+        else:
+            return None
+        if not text:
+            return None
+        if role == "assistant" and text[:1] in "[{":
+            try:
+                if isinstance(json.loads(text), (dict, list)):
+                    return None
+            except (TypeError, ValueError):
+                pass
+        return text
+
+    @classmethod
+    def _telegram_backfill_transcript(cls, messages: List[Dict[str, Any]]) -> tuple[List[Dict[str, str]], int]:
+        visible, skipped = [], 0
+        for message in messages:
+            text = cls._user_facing_message_text(message)
+            if text is None:
+                skipped += 1
+            else:
+                visible.append({"role": str(message.get("role")).lower(), "content": text})
+        return visible, skipped
+
+    @staticmethod
+    def _telegram_summary(messages: List[Dict[str, str]], *, max_chars: int = 3500) -> str:
+        """Render a compact transcript without ever exceeding ``max_chars``."""
+        max_chars = max(0, max_chars)
+        header = "🧾 **Conversation summary**"
+        empty = "No user-facing messages yet."
+        omission = "… (earlier transcript omitted)"
+        lines: List[str] = []
+
+        def append_bounded(line: str) -> bool:
+            candidate = "\n".join([*lines, line])
+            if len(candidate) <= max_chars:
+                lines.append(line)
+                return True
+            return False
+
+        append_bounded(header)
+        if not messages:
+            append_bounded(empty)
+            return "\n".join(lines)
+
+        for message in messages:
+            label = "User" if message["role"] == "user" else "Assistant"
+            compact = " ".join(message["content"].split())
+            if not append_bounded(f"**{label}:** {compact}"):
+                # Do not slice arbitrary Unicode text.  Make room for the
+                # marker by dropping complete older visible rows if needed.
+                while len(lines) > 1 and len("\n".join([*lines, omission])) > max_chars:
+                    lines.pop()
+                append_bounded(omission)
+                break
+        return "\n".join(lines)
+
+    def _telegram_delivery_enabled(self, session_id: str) -> bool:
+        db = self._ensure_session_db()
+        if db is None:
+            return False
+        try:
+            # Required before every delivery-state read so legacy v2 rows are safe.
+            db.apply_telegram_topic_migration()
+            binding = db.get_telegram_topic_binding_by_session(session_id=session_id)
+            return bool(binding and binding.get("delivery_enabled", True))
+        except Exception:
+            logger.debug("Telegram delivery-state lookup failed", exc_info=True)
+            return False
+
+    async def _forward_to_telegram(self, session_id: str, role: str, content: Any) -> Dict[str, Any]:
+        """Best-effort delivery; failures never affect canonical API transcript."""
+        db = self._ensure_session_db()
+        if db is None:
+            return {"status": "unavailable", "error": "session_db_unavailable"}
+        try:
+            binding = db.get_telegram_topic_binding_by_session(session_id=session_id)
+        except Exception:
+            return {"status": "failed", "error": "binding_lookup_failed"}
+        if not binding:
+            return {"status": "unbound"}
+        chat_id, thread_id = binding.get("chat_id"), binding.get("thread_id")
+        if not chat_id or not thread_id:
+            return {"status": "invalid_binding", "error": "missing_chat_or_thread"}
+        _, telegram = self._telegram_runner_and_adapter()
+        if telegram is None:
+            return {"status": "unavailable", "error": "telegram_not_connected"}
+        if isinstance(content, list):
+            content = "\n".join(str(part.get("text") or "") for part in content if isinstance(part, dict) and part.get("type") in {"text", "input_text"})
+        elif not isinstance(content, str):
+            content = str(content or "")
+        if not content.strip():
+            return {"status": "skipped", "reason": "empty_content"}
+        formatted = f"👤 **User:**\n{content}" if role == "user" else content
+        try:
+            result = await telegram.send(str(chat_id), formatted, metadata={"thread_id": str(thread_id)})
+            if getattr(result, "success", True) is False:
+                return {"status": "failed", "error": str(getattr(result, "error", "telegram_send_failed"))}
+            return {"status": "sent", "chat_id": str(chat_id), "thread_id": str(thread_id)}
+        except Exception as exc:
+            logger.warning("Telegram topic delivery failed for %s/%s: %s", chat_id, thread_id, exc)
+            return {"status": "failed", "error": str(exc)[:500]}
+
+    async def _resync_telegram_backfill(self, session_id: str, mode: str) -> Dict[str, Any]:
+        delivery = {"mode": mode, "status": "not_requested" if mode == "none" else "completed", "sent": 0, "failed": 0, "skipped": 0}
+        if mode == "none":
+            return delivery
+        db = self._ensure_session_db()
+        messages, skipped = self._telegram_backfill_transcript(db.get_messages(db.resolve_resume_session_id(session_id)))
+        delivery["skipped"] = skipped
+        outgoing = ([{"role": "assistant", "content": self._telegram_summary(messages)}] if mode == "summary" else messages[-TELEGRAM_BACKFILL_LIMITS["full"]:])
+        if mode == "full":
+            delivery["skipped"] += max(0, len(messages) - len(outgoing))
+        for message in outgoing:
+            result = await self._forward_to_telegram(session_id, message["role"], message["content"])
+            if result.get("status") == "sent": delivery["sent"] += 1
+            elif result.get("status") == "skipped": delivery["skipped"] += 1
+            else:
+                delivery["failed"] += 1
+                delivery.setdefault("failures", []).append(result.get("error") or result.get("status"))
+        if delivery["failed"]:
+            delivery["status"] = "partial" if delivery["sent"] else "failed"
+        return delivery
+
+    def _telegram_binding_response(self, session_id: str, binding: Optional[Dict[str, Any]], *, delivery: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        bound = bool(binding)
+        binding_view = self._build_telegram_binding_dict(binding.get("chat_id"), binding.get("thread_id")) if bound else None
+        enabled = bool(binding.get("delivery_enabled", True)) if bound else False
+        return {"object": "hermes.telegram_binding", "bound": bound, "session_id": session_id,
+                "telegram_binding": binding_view, "chat_id": binding_view["chat_id"] if binding_view else None,
+                "thread_id": binding_view["thread_id"] if binding_view else None, "bot_username": binding_view["bot_username"] if binding_view else None,
+                "link": binding_view["link"] if binding_view else None, "delivery_enabled": enabled,
+                "future_duplication": {"persistent": True, "enabled": enabled, "default": "binding_delivery_enabled", "request_field": "duplicate_to_telegram", "request_override": True},
+                "backfill": delivery or {"mode": "none", "status": "not_requested", "sent": 0, "failed": 0, "skipped": 0}}
+
     def _build_telegram_binding_dict(self, chat_id: str, thread_id: str) -> dict:
         """Build a client-safe Telegram DM-topic binding, including a usable link."""
         payload = {"chat_id": str(chat_id), "thread_id": str(thread_id), "bot_username": None, "link": None}
@@ -1733,6 +1900,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     payload["telegram_binding"] = self._build_telegram_binding_dict(
                         binding.get("chat_id"), binding.get("thread_id")
                     )
+                    payload["telegram_binding"]["delivery_enabled"] = bool(binding.get("delivery_enabled", True))
             except Exception:
                 logger.debug("Failed to load Telegram topic binding", exc_info=True)
         return payload
@@ -1920,6 +2088,100 @@ class APIServerAdapter(BasePlatformAdapter):
         fork = db.get_session(fork_id) or {"id": fork_id, "parent_session_id": source_id}
         return web.json_response({"object": "hermes.session", "session": self._session_response(fork)}, status=201)
 
+    async def _handle_get_telegram_binding(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err: return auth_err
+        session_id = request.match_info["session_id"]
+        _, err = self._get_existing_session_or_404(session_id)
+        if err: return err
+        db = self._ensure_session_db()
+        try:
+            db.apply_telegram_topic_migration()
+            binding = db.get_telegram_topic_binding_by_session(session_id=session_id)
+        except Exception:
+            logger.exception("Telegram binding lookup failed")
+            return web.json_response(_openai_error("Telegram binding lookup failed", code="telegram_binding_failed"), status=503)
+        return web.json_response(self._telegram_binding_response(session_id, binding))
+
+    async def _handle_post_telegram_binding(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err: return auth_err
+        session_id = request.match_info["session_id"]
+        session, err = self._get_existing_session_or_404(session_id)
+        if err: return err
+        body, err = await self._read_json_body(request)
+        if err: return err
+        unknown = sorted(set(body) - {"chat_id", "thread_id", "topic_name", "user_id", "backfill", "delivery_enabled"})
+        if unknown: return web.json_response(_openai_error(f"Unsupported binding fields: {', '.join(unknown)}", code="unsupported_binding_field"), status=400)
+        if "delivery_enabled" in body and not isinstance(body["delivery_enabled"], bool):
+            return web.json_response(_openai_error("delivery_enabled must be a boolean", code="invalid_delivery_enabled"), status=400)
+        backfill_provided = "backfill" in body
+        backfill = str(body.get("backfill") or "summary").lower()
+        if backfill not in {"none", "summary", "full"}:
+            return web.json_response(_openai_error("backfill must be one of none, summary, full", code="invalid_backfill"), status=400)
+        db = self._ensure_session_db()
+        try: db.apply_telegram_topic_migration()
+        except Exception:
+            logger.exception("Telegram binding migration failed")
+            return web.json_response(_openai_error("Telegram binding migration failed", code="telegram_binding_failed"), status=503)
+        existing = db.get_telegram_topic_binding_by_session(session_id=session_id)
+        chat_id, thread_id = str(body.get("chat_id") or "").strip(), str(body.get("thread_id") or "").strip()
+        if existing:
+            if chat_id and chat_id != str(existing.get("chat_id")):
+                return web.json_response(_openai_error("Session is already bound to another Telegram chat", code="telegram_binding_conflict"), status=409)
+            if thread_id and thread_id != str(existing.get("thread_id")):
+                return web.json_response(_openai_error("Session is already bound to another Telegram topic", code="telegram_binding_conflict"), status=409)
+            if "delivery_enabled" in body:
+                db.set_telegram_topic_delivery_enabled(session_id=session_id, delivery_enabled=body["delivery_enabled"])
+                existing = db.get_telegram_topic_binding_by_session(session_id=session_id)
+            delivery = await self._resync_telegram_backfill(session_id, backfill) if backfill_provided else None
+            return web.json_response(self._telegram_binding_response(session_id, existing, delivery=delivery))
+        if not chat_id:
+            return web.json_response(_openai_error("chat_id is required", code="missing_chat_id"), status=400)
+        runner, telegram = self._telegram_runner_and_adapter()
+        if telegram is None:
+            return web.json_response(_openai_error("Telegram adapter is not connected", code="telegram_unavailable"), status=503)
+        topic_name = str(body.get("topic_name") or session.get("title") or f"Hermes {session_id[:24]}").strip()
+        if not thread_id:
+            create_topic = getattr(telegram, "create_handoff_thread", None)
+            if not callable(create_topic): return web.json_response(_openai_error("Telegram adapter cannot create topics", code="telegram_topic_unsupported"), status=503)
+            try: thread_id = str(await create_topic(chat_id, topic_name) or "")
+            except Exception as exc:
+                logger.exception("Telegram topic creation failed")
+                return web.json_response(_openai_error(f"Failed to create Telegram topic: {exc}", code="telegram_topic_create_failed"), status=502)
+        if not thread_id: return web.json_response(_openai_error("Telegram did not create a topic", code="telegram_topic_create_failed"), status=502)
+        try:
+            from gateway.delivery import looks_like_telegram_private_chat_id
+            from gateway.session import SessionSource, build_session_key
+            private = looks_like_telegram_private_chat_id(chat_id)
+            source = SessionSource(Platform.TELEGRAM, chat_id, chat_type="dm" if private else "thread", user_id=str(body.get("user_id") or (chat_id if private else "system:api")), thread_id=thread_id)
+            session_key = runner._session_key_for_source(source) if runner and hasattr(runner, "_session_key_for_source") else build_session_key(source)
+            db.bind_telegram_topic(chat_id=chat_id, thread_id=thread_id, user_id=source.user_id or "", session_key=session_key, session_id=session_id, managed_mode="api", delivery_enabled=body.get("delivery_enabled", True))
+            binding = db.get_telegram_topic_binding_by_session(session_id=session_id)
+        except ValueError as exc:
+            return web.json_response(_openai_error(str(exc), code="telegram_binding_conflict"), status=409)
+        except Exception:
+            logger.exception("Failed to persist Telegram binding")
+            return web.json_response(_openai_error("Failed to persist Telegram binding", code="telegram_binding_failed"), status=503)
+        return web.json_response(self._telegram_binding_response(session_id, binding, delivery=await self._resync_telegram_backfill(session_id, backfill)), status=201)
+
+    async def _handle_delete_telegram_binding(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err: return auth_err
+        session_id = request.match_info["session_id"]
+        _, err = self._get_existing_session_or_404(session_id)
+        if err: return err
+        db = self._ensure_session_db()
+        try:
+            db.apply_telegram_topic_migration()
+            binding = db.get_telegram_topic_binding_by_session(session_id=session_id)
+            deleted = bool(binding and db.unbind_telegram_topic(chat_id=binding["chat_id"], thread_id=binding["thread_id"]))
+        except Exception:
+            logger.exception("Telegram unbind failed")
+            return web.json_response(_openai_error("Failed to remove Telegram binding", code="telegram_binding_failed"), status=503)
+        payload = self._telegram_binding_response(session_id, None); payload["deleted"] = deleted
+        return web.json_response(payload)
+
     async def _handle_session_chat(self, request: "web.Request") -> "web.Response":
         """POST /api/sessions/{session_id}/chat — one synchronous agent turn."""
         auth_err = self._check_auth(request)
@@ -1938,10 +2200,15 @@ class APIServerAdapter(BasePlatformAdapter):
         user_message, err = _session_chat_user_message(body)
         if err is not None:
             return err
+        duplicate_to_telegram = _coerce_request_bool(
+            body.get("duplicate_to_telegram"), default=self._telegram_delivery_enabled(session_id)
+        )
         system_prompt = body.get("system_message") or body.get("instructions")
         if system_prompt is not None and not isinstance(system_prompt, str):
             return web.json_response(_openai_error("system_message must be a string", code="invalid_system_message"), status=400)
         history = self._conversation_history_for_session(session_id)
+        if duplicate_to_telegram:
+            await self._forward_to_telegram(session_id, "user", user_message)
         result, usage = await self._run_agent(
             user_message=user_message,
             conversation_history=history,
@@ -1951,6 +2218,8 @@ class APIServerAdapter(BasePlatformAdapter):
         )
         effective_session_id = result.get("session_id") if isinstance(result, dict) else session_id
         final_response = _resolve_media_to_data_urls(result.get("final_response", "") if isinstance(result, dict) else "")
+        if duplicate_to_telegram:
+            await self._forward_to_telegram(session_id, "assistant", final_response)
         headers = {"X-Hermes-Session-Id": effective_session_id or session_id}
         if gateway_session_key:
             headers["X-Hermes-Session-Key"] = gateway_session_key
@@ -1982,6 +2251,9 @@ class APIServerAdapter(BasePlatformAdapter):
         user_message, err = _session_chat_user_message(body)
         if err is not None:
             return err
+        duplicate_to_telegram = _coerce_request_bool(
+            body.get("duplicate_to_telegram"), default=self._telegram_delivery_enabled(session_id)
+        )
         system_prompt = body.get("system_message") or body.get("instructions")
         if system_prompt is not None and not isinstance(system_prompt, str):
             return web.json_response(_openai_error("system_message must be a string", code="invalid_system_message"), status=400)
@@ -2031,6 +2303,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 await queue.put(_event_payload("run.started", {"user_message": {"role": "user", "content": user_message}}))
                 await queue.put(_event_payload("message.started", {"message": {"id": message_id, "role": "assistant"}}))
                 history = self._conversation_history_for_session(session_id)
+                if duplicate_to_telegram:
+                    await self._forward_to_telegram(session_id, "user", user_message)
                 result, usage = await self._run_agent(
                     user_message=user_message,
                     conversation_history=history,
@@ -2041,6 +2315,8 @@ class APIServerAdapter(BasePlatformAdapter):
                     gateway_session_key=gateway_session_key,
                 )
                 final_response = _resolve_media_to_data_urls(result.get("final_response", "") if isinstance(result, dict) else "")
+                if duplicate_to_telegram:
+                    await self._forward_to_telegram(session_id, "assistant", final_response)
                 effective_session_id = result.get("session_id", session_id) if isinstance(result, dict) else session_id
                 turn_messages = self._turn_transcript_messages(history, user_message, result) if isinstance(result, dict) else []
                 await queue.put(_event_payload("assistant.completed", {
@@ -4823,6 +5099,9 @@ class APIServerAdapter(BasePlatformAdapter):
             # Session/client control surface (thin wrappers over SessionDB + _run_agent)
             self._app.router.add_get("/api/sessions", self._handle_list_sessions)
             self._app.router.add_post("/api/sessions", self._handle_create_session)
+            self._app.router.add_get("/api/sessions/{session_id}/telegram-binding", self._handle_get_telegram_binding)
+            self._app.router.add_post("/api/sessions/{session_id}/telegram-binding", self._handle_post_telegram_binding)
+            self._app.router.add_delete("/api/sessions/{session_id}/telegram-binding", self._handle_delete_telegram_binding)
             self._app.router.add_get("/api/sessions/{session_id}", self._handle_get_session)
             self._app.router.add_patch("/api/sessions/{session_id}", self._handle_patch_session)
             self._app.router.add_delete("/api/sessions/{session_id}", self._handle_delete_session)

@@ -5634,6 +5634,7 @@ class SessionDB:
           v1 — initial shape (no ON DELETE CASCADE on session_id FK)
           v2 — session_id FK gets ON DELETE CASCADE so session pruning
                automatically clears bindings.
+          v3 — persistent delivery_enabled flag for WebUI -> Telegram delivery.
         """
         def _do(conn):
             conn.executescript(
@@ -5658,6 +5659,7 @@ class SessionDB:
                     session_key TEXT NOT NULL,
                     session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
                     managed_mode TEXT NOT NULL DEFAULT 'auto',
+                    delivery_enabled INTEGER NOT NULL DEFAULT 1,
                     linked_at REAL NOT NULL,
                     updated_at REAL NOT NULL,
                     PRIMARY KEY (chat_id, thread_id)
@@ -5697,13 +5699,14 @@ class SessionDB:
                             session_key TEXT NOT NULL,
                             session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
                             managed_mode TEXT NOT NULL DEFAULT 'auto',
+                            delivery_enabled INTEGER NOT NULL DEFAULT 1,
                             linked_at REAL NOT NULL,
                             updated_at REAL NOT NULL,
                             PRIMARY KEY (chat_id, thread_id)
                         );
                         INSERT INTO telegram_dm_topic_bindings_new
                             SELECT chat_id, thread_id, user_id, session_key,
-                                   session_id, managed_mode, linked_at, updated_at
+                                   session_id, managed_mode, 1, linked_at, updated_at
                             FROM telegram_dm_topic_bindings;
                         DROP TABLE telegram_dm_topic_bindings;
                         ALTER TABLE telegram_dm_topic_bindings_new
@@ -5715,10 +5718,15 @@ class SessionDB:
                         """
                     )
 
+            # v2 → v3 is additive and idempotent; legacy mappings retain
+            # enabled delivery so upgrade never silently changes routing policy.
+            columns = {row[1] for row in conn.execute("PRAGMA table_info('telegram_dm_topic_bindings')").fetchall()}
+            if "delivery_enabled" not in columns:
+                conn.execute("ALTER TABLE telegram_dm_topic_bindings ADD COLUMN delivery_enabled INTEGER NOT NULL DEFAULT 1")
             conn.execute(
                 "INSERT INTO state_meta (key, value) VALUES (?, ?) "
                 "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                ("telegram_dm_topic_schema_version", "2"),
+                ("telegram_dm_topic_schema_version", "3"),
             )
         self._execute_write(_do)
 
@@ -5973,6 +5981,7 @@ class SessionDB:
         session_key: str,
         session_id: str,
         managed_mode: str = "auto",
+        delivery_enabled: bool = True,
     ) -> None:
         """Bind one Telegram DM topic thread to one Hermes session.
 
@@ -6006,8 +6015,8 @@ class SessionDB:
                 """
                 INSERT INTO telegram_dm_topic_bindings (
                     chat_id, thread_id, user_id, session_key, session_id,
-                    managed_mode, linked_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    managed_mode, delivery_enabled, linked_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(chat_id, thread_id) DO UPDATE SET
                     user_id = excluded.user_id,
                     session_key = excluded.session_key,
@@ -6022,11 +6031,36 @@ class SessionDB:
                     session_key,
                     session_id,
                     managed_mode,
+                    1 if delivery_enabled else 0,
                     now,
                     now,
                 ),
             )
         self._execute_write(_do)
+
+    def set_telegram_topic_delivery_enabled(self, *, session_id: str, delivery_enabled: bool) -> bool:
+        """Toggle durable WebUI delivery without altering a topic binding."""
+        self.apply_telegram_topic_migration()
+        updated = False
+        def _do(conn):
+            nonlocal updated
+            cursor = conn.execute("UPDATE telegram_dm_topic_bindings SET delivery_enabled = ?, updated_at = ? WHERE session_id = ?", (1 if delivery_enabled else 0, time.time(), str(session_id)))
+            updated = bool(cursor.rowcount)
+        self._execute_write(_do)
+        return updated
+
+    def unbind_telegram_topic(self, *, chat_id: str, thread_id: str) -> bool:
+        """Remove one binding without deleting its Telegram topic or transcript."""
+        deleted = False
+        def _do(conn):
+            nonlocal deleted
+            try:
+                cursor = conn.execute("DELETE FROM telegram_dm_topic_bindings WHERE chat_id = ? AND thread_id = ?", (str(chat_id), str(thread_id)))
+                deleted = bool(cursor.rowcount)
+            except sqlite3.OperationalError:
+                deleted = False
+        self._execute_write(_do)
+        return deleted
 
     def is_telegram_session_linked_to_topic(self, *, session_id: str) -> bool:
         """Return True if a Hermes session is already bound to any Telegram DM topic.

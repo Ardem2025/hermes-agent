@@ -6,8 +6,9 @@ import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
-from gateway.config import PlatformConfig
+from gateway.config import Platform, PlatformConfig
 from gateway.platforms.api_server import APIServerAdapter
+from gateway.run import GatewayRunner
 from hermes_state import SessionDB
 
 
@@ -41,6 +42,9 @@ def _create_session_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_get("/v1/capabilities", adapter._handle_capabilities)
     app.router.add_get("/api/sessions", adapter._handle_list_sessions)
     app.router.add_post("/api/sessions", adapter._handle_create_session)
+    app.router.add_get("/api/sessions/{session_id}/telegram-binding", adapter._handle_get_telegram_binding)
+    app.router.add_post("/api/sessions/{session_id}/telegram-binding", adapter._handle_post_telegram_binding)
+    app.router.add_delete("/api/sessions/{session_id}/telegram-binding", adapter._handle_delete_telegram_binding)
     app.router.add_get("/api/sessions/{session_id}", adapter._handle_get_session)
     app.router.add_patch("/api/sessions/{session_id}", adapter._handle_patch_session)
     app.router.add_delete("/api/sessions/{session_id}", adapter._handle_delete_session)
@@ -252,6 +256,74 @@ async def test_session_chat_loads_history_and_preserves_session_headers(auth_ada
 
 
 @pytest.mark.asyncio
+async def test_telegram_binding_toggle_preserves_mapping_and_never_resends(adapter, session_db):
+    session_id = session_db.create_session("binding-toggle", "api_server")
+    created = []
+    class Telegram:
+        async def create_handoff_thread(self, chat_id, name):
+            created.append((chat_id, name)); return "77"
+    adapter.gateway_runner = type("Runner", (), {"adapters": {"telegram": Telegram()}})()
+    # Platform enum is used as a string enum, so use a direct lookup adapter shim.
+    adapter._telegram_runner_and_adapter = lambda: (adapter.gateway_runner, Telegram())
+    adapter._forward_to_telegram = AsyncMock(return_value={"status": "sent"})
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        first = await cli.post(f"/api/sessions/{session_id}/telegram-binding", json={"chat_id": "-100123", "backfill": "none"})
+        assert first.status == 201, await first.text()
+        toggle = await cli.post(f"/api/sessions/{session_id}/telegram-binding", json={"delivery_enabled": False})
+        assert toggle.status == 200, await toggle.text()
+        assert (await toggle.json())["delivery_enabled"] is False
+        got = await cli.get(f"/api/sessions/{session_id}/telegram-binding")
+        assert (await got.json())["thread_id"] == "77"
+    assert len(created) == 1
+    assert adapter._forward_to_telegram.await_count == 0
+    assert session_db.get_telegram_topic_binding_by_session(session_id=session_id)["delivery_enabled"] == 0
+
+
+@pytest.mark.asyncio
+async def test_session_chat_delivery_uses_persisted_state_and_request_override(adapter, session_db):
+    session_id = session_db.create_session("delivery-state", "api_server")
+    session_db.bind_telegram_topic(chat_id="-100123", thread_id="77", user_id="api", session_key="telegram:thread:-100123:77", session_id=session_id, managed_mode="api", delivery_enabled=False)
+    forward = AsyncMock(return_value={"status": "sent"})
+    app = _create_session_app(adapter)
+    with patch.object(adapter, "_run_agent", return_value=({"final_response": "answer", "session_id": session_id}, {})), patch.object(adapter, "_forward_to_telegram", forward):
+        async with TestClient(TestServer(app)) as cli:
+            assert (await cli.post(f"/api/sessions/{session_id}/chat", json={"message": "private"})).status == 200
+            assert (await cli.post(f"/api/sessions/{session_id}/chat", json={"message": "share", "duplicate_to_telegram": True})).status == 200
+    assert [call.args for call in forward.await_args_list] == [(session_id, "user", "share"), (session_id, "assistant", "answer")]
+
+
+@pytest.mark.asyncio
+async def test_existing_v2_binding_is_migrated_for_get_and_toggle(adapter, session_db):
+    session_id = session_db.create_session("legacy-v2", "api_server")
+    session_db.apply_telegram_topic_migration()
+    session_db.bind_telegram_topic(chat_id="-100123", thread_id="77", user_id="api", session_key="telegram:thread:-100123:77", session_id=session_id)
+    with session_db._lock:
+        session_db._conn.executescript("""
+            ALTER TABLE telegram_dm_topic_bindings RENAME TO binding_v3;
+            CREATE TABLE telegram_dm_topic_bindings (
+              chat_id TEXT NOT NULL, thread_id TEXT NOT NULL, user_id TEXT NOT NULL,
+              session_key TEXT NOT NULL, session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+              managed_mode TEXT NOT NULL DEFAULT 'auto', linked_at REAL NOT NULL, updated_at REAL NOT NULL,
+              PRIMARY KEY (chat_id, thread_id));
+            INSERT INTO telegram_dm_topic_bindings SELECT chat_id,thread_id,user_id,session_key,session_id,managed_mode,linked_at,updated_at FROM binding_v3;
+            DROP TABLE binding_v3;
+            CREATE UNIQUE INDEX idx_telegram_dm_topic_bindings_session ON telegram_dm_topic_bindings(session_id);
+            UPDATE state_meta SET value='2' WHERE key='telegram_dm_topic_schema_version';
+        """)
+        session_db._conn.commit()
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        got = await cli.get(f"/api/sessions/{session_id}/telegram-binding")
+        assert got.status == 200
+        assert (await got.json())["delivery_enabled"] is True
+        changed = await cli.post(f"/api/sessions/{session_id}/telegram-binding", json={"delivery_enabled": False})
+        assert changed.status == 200
+        assert (await changed.json())["delivery_enabled"] is False
+    assert session_db.get_meta("telegram_dm_topic_schema_version") == "3"
+
+
+@pytest.mark.asyncio
 async def test_session_chat_accepts_multimodal_message(auth_adapter, session_db):
     session_id = session_db.create_session("image-session", "api_server")
     image_payload = [
@@ -407,6 +479,134 @@ async def test_session_chat_stream_run_completed_carries_turn_transcript(adapter
     # The tool call is preserved alongside the intermediate text.
     assert any(m.get("tool_calls") for m in messages)
 
+
+
+def test_telegram_summary_respects_tiny_and_default_bounds():
+    messages = [
+        {"role": "user", "content": "Привет 👋 " * 1_000},
+        {"role": "assistant", "content": "ответ " * 1_000},
+    ]
+
+    for max_chars in (0, 1, 10, 350, 3500):
+        summary = APIServerAdapter._telegram_summary(messages, max_chars=max_chars)
+        assert len(summary) <= max_chars
+
+
+def test_telegram_summary_adds_marker_only_when_it_fits():
+    messages = [
+        {"role": "user", "content": "short"},
+        {"role": "assistant", "content": "later message that does not fit"},
+    ]
+    marker = "… (earlier transcript omitted)"
+    max_chars = len("🧾 **Conversation summary**\n**User:** short\n" + marker)
+
+    summary = APIServerAdapter._telegram_summary(messages, max_chars=max_chars)
+
+    assert len(summary) <= max_chars
+    assert "**User:** short" in summary
+    assert summary.endswith(marker)
+    assert "**Assistant:**" not in summary
+    assert APIServerAdapter._telegram_summary(messages, max_chars=1) == ""
+
+
+@pytest.mark.asyncio
+async def test_profile_owned_runner_is_attached_when_api_adapter_is_created():
+    """Binding must use this profile's runner, not the global runner ref."""
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner.config = type("Config", (), {"group_sessions_per_user": False})()
+    adapter = GatewayRunner._create_adapter(runner, Platform.API_SERVER, PlatformConfig(enabled=True))
+    assert isinstance(adapter, APIServerAdapter)
+    assert adapter.gateway_runner is runner
+
+
+@pytest.mark.asyncio
+async def test_binding_backfill_none_summary_and_full_filter_transcript(adapter, session_db):
+    session_id = session_db.create_session("backfill-session", "api_server")
+    session_db.append_message(session_id, "user", "first visible")
+    session_db.append_message(session_id, "assistant", "tool planning", tool_calls=[{"id": "call_1"}])
+    session_db.append_message(session_id, "tool", "private tool result", tool_name="web_search")
+    session_db.append_message(session_id, "assistant", '{"private":"structured"}')
+    session_db.append_message(session_id, "assistant", "second visible")
+    sent = []
+
+    class Telegram:
+        async def create_handoff_thread(self, chat_id, name):
+            return "77"
+
+        async def send(self, chat_id, content, metadata=None):
+            sent.append((chat_id, content, metadata))
+            return type("Result", (), {"success": True})()
+
+    telegram = Telegram()
+    adapter.gateway_runner = type("Runner", (), {"adapters": {Platform.TELEGRAM: telegram}})()
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        none = await cli.post(
+            f"/api/sessions/{session_id}/telegram-binding",
+            json={"chat_id": "-100123", "backfill": "none"},
+        )
+        assert none.status == 201
+        assert (await none.json())["backfill"]["sent"] == 0
+
+        summary = await cli.post(
+            f"/api/sessions/{session_id}/telegram-binding", json={"backfill": "summary"}
+        )
+        assert summary.status == 200
+        assert (await summary.json())["backfill"] == {
+            "mode": "summary", "status": "completed", "sent": 1, "failed": 0, "skipped": 3,
+        }
+
+        full = await cli.post(
+            f"/api/sessions/{session_id}/telegram-binding", json={"backfill": "full"}
+        )
+        assert full.status == 200
+        assert (await full.json())["backfill"] == {
+            "mode": "full", "status": "completed", "sent": 2, "failed": 0, "skipped": 3,
+        }
+
+    assert len(sent) == 3
+    assert "first visible" in sent[0][1] and "second visible" in sent[0][1]
+    assert [entry[1] for entry in sent[1:]] == ["👤 **User:**\nfirst visible", "second visible"]
+    assert all("tool planning" not in entry[1] and "private tool result" not in entry[1] for entry in sent)
+
+
+@pytest.mark.asyncio
+async def test_session_stream_delivery_uses_persisted_state_and_request_override(adapter, session_db):
+    session_id = session_db.create_session("stream-delivery-state", "api_server")
+    session_db.bind_telegram_topic(
+        chat_id="-100123", thread_id="77", user_id="api", session_key="telegram:thread:-100123:77",
+        session_id=session_id, managed_mode="api", delivery_enabled=False,
+    )
+    forward = AsyncMock(return_value={"status": "sent"})
+
+    app = _create_session_app(adapter)
+    with patch.object(adapter, "_run_agent", return_value=({"final_response": "answer", "session_id": session_id}, {})), patch.object(adapter, "_forward_to_telegram", forward):
+        async with TestClient(TestServer(app)) as cli:
+            private = await cli.post(f"/api/sessions/{session_id}/chat/stream", json={"message": "private"})
+            assert private.status == 200
+            await private.text()
+            shared = await cli.post(
+                f"/api/sessions/{session_id}/chat/stream",
+                json={"message": "share", "duplicate_to_telegram": True},
+            )
+            assert shared.status == 200
+            await shared.text()
+    assert [call.args for call in forward.await_args_list] == [(session_id, "user", "share"), (session_id, "assistant", "answer")]
+
+
+@pytest.mark.asyncio
+async def test_binding_endpoints_require_owner_api_key(auth_adapter, session_db):
+    session_id = session_db.create_session("binding-auth", "api_server")
+    app = _create_session_app(auth_adapter)
+    async with TestClient(TestServer(app)) as cli:
+        for method, path, kwargs in (
+            (cli.get, f"/api/sessions/{session_id}/telegram-binding", {}),
+            (cli.post, f"/api/sessions/{session_id}/telegram-binding", {"json": {"chat_id": "-100123"}}),
+            (cli.delete, f"/api/sessions/{session_id}/telegram-binding", {}),
+        ):
+            response = await method(path, **kwargs)
+            assert response.status == 401
+            assert (await response.json())["error"]["code"] == "invalid_api_key"
 
 
 @pytest.mark.asyncio
