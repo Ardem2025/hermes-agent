@@ -7293,9 +7293,45 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # engages drain on the first tick.
         asyncio.create_task(self._drain_control_watcher())
 
+        # Pre-warm the agent runtime to avoid cold-start delays on first message
+        asyncio.create_task(self._prewarm_agent())
+
         logger.info("Press Ctrl+C to stop")
         
         return True
+
+    async def _prewarm_agent(self) -> None:
+        """Background task that pre-warms the agent imports and initial caches."""
+        try:
+            logger.info("Pre-warming agent runtime (pre-importing heavy libraries)...")
+            loop = asyncio.get_running_loop()
+            
+            def perform_prewarm():
+                try:
+                    import run_agent
+                except Exception as e:
+                    logger.debug("Pre-warm: run_agent import failed: %s", e)
+                try:
+                    import model_tools
+                except Exception as e:
+                    logger.debug("Pre-warm: model_tools import failed: %s", e)
+                try:
+                    import spacy
+                except Exception as e:
+                    logger.debug("Pre-warm: spacy import failed: %s", e)
+                try:
+                    import onnxruntime
+                except Exception as e:
+                    logger.debug("Pre-warm: onnxruntime import failed: %s", e)
+                try:
+                    import qdrant_client
+                except Exception as e:
+                    logger.debug("Pre-warm: qdrant_client import failed: %s", e)
+                logger.info("✓ Agent pre-warm completed successfully (heavy libraries cached).")
+                
+            await loop.run_in_executor(None, perform_prewarm)
+        except Exception as e:
+            logger.warning("Agent pre-warming encountered an error: %s", e)
 
     async def _handoff_watcher(self, interval: float = 2.0) -> None:
         """Background task that processes pending CLI→gateway session handoffs.
