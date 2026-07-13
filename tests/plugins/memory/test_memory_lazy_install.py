@@ -218,7 +218,9 @@ class TestSealedVenvDurableTarget:
         )
 
         # Drive ensure(): missing first, satisfied after the (stubbed) install.
-        states = iter([False, True])
+        # Need False for each spec on first check, True for each spec on second check.
+        num_specs = len(ld.LAZY_DEPS[feature])
+        states = iter([False] * num_specs + [True] * num_specs)
         monkeypatch.setattr(ld, "_is_satisfied", lambda spec: next(states))
 
         captured = {}
