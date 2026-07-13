@@ -13477,8 +13477,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         session_db = getattr(self, "_session_db", None)
         if session_db is not None:
+            if hasattr(session_db, "_db"):
+                session_db = session_db._db
             try:
-                binding = await session_db.get_telegram_topic_binding(
+                binding = session_db.get_telegram_topic_binding(
                     chat_id=str(source.chat_id),
                     thread_id=str(source.thread_id),
                 )
