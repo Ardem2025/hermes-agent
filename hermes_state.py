@@ -4203,6 +4203,18 @@ class SessionDB:
                     "ALTER TABLE telegram_dm_topic_bindings "
                     "ADD COLUMN last_synced_message_id INTEGER"
                 )
+                # Existing topics may already contain transcript deliveries
+                # from the pre-checkpoint implementation. Baseline each legacy
+                # binding at its current persisted tail so the first v4 toggle
+                # cannot replay the whole conversation. Brand-new v4 bindings
+                # are inserted later with NULL and therefore sync all history.
+                conn.execute(
+                    "UPDATE telegram_dm_topic_bindings "
+                    "SET last_synced_message_id = ("
+                    "SELECT MAX(id) FROM messages "
+                    "WHERE messages.session_id = telegram_dm_topic_bindings.session_id"
+                    ")"
+                )
 
             conn.execute(
                 "INSERT INTO state_meta (key, value) VALUES (?, ?) "

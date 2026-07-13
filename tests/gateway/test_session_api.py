@@ -357,6 +357,7 @@ async def test_existing_v2_binding_migrates_before_delivery_toggle(adapter, sess
         chat_id="-100123", thread_id="77", user_id="-100123",
         session_key="telegram:-100123:77", session_id=session_id, managed_mode="api",
     )
+    legacy_tail_id = session_db.append_message(session_id, "assistant", "already delivered before v4")
     # Recreate the production v2 shape: existing binding, no delivery column.
     with session_db._lock:
         session_db._conn.executescript(
@@ -401,6 +402,7 @@ async def test_existing_v2_binding_migrates_before_delivery_toggle(adapter, sess
     binding = session_db.get_telegram_topic_binding_by_session(session_id=session_id)
     assert binding["thread_id"] == "77"
     assert binding["delivery_enabled"] == 0
+    assert binding["last_synced_message_id"] == legacy_tail_id
     assert session_db.get_meta("telegram_dm_topic_schema_version") == "4"
 
 
