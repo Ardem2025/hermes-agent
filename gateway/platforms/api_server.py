@@ -2029,11 +2029,15 @@ class APIServerAdapter(BasePlatformAdapter):
         if auth_err:
             return auth_err
         session_id = request.match_info["session_id"]
-        _, err = self._get_existing_session_or_404(session_id)
+        session, err = self._get_existing_session_or_404(session_id)
         if err:
             return err
         db = self._ensure_session_db()
-        resolved_id = db.resolve_resume_session_id(session_id)
+        parent_id = session.get("parent_session_id")
+        if parent_id and parent_id != session_id:
+            resolved_id = session_id
+        else:
+            resolved_id = db.resolve_resume_session_id(session_id)
         messages = db.get_messages(resolved_id)
         return web.json_response({
             "object": "list",

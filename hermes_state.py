@@ -4011,12 +4011,14 @@ class SessionDB:
                 # run). This mirrors the child-exclusion in ``get_compression_tip``.
                 try:
                     child_row = self._conn.execute(
-                        "SELECT id FROM sessions "
-                        "WHERE parent_session_id = ? "
-                        "  AND json_extract(COALESCE(model_config, '{}'), '$._branched_from') IS NULL "
-                        "  AND json_extract(COALESCE(model_config, '{}'), '$._delegate_from') IS NULL "
-                        "  AND COALESCE(source, '') != 'tool' "
-                        "ORDER BY started_at DESC, id DESC LIMIT 1",
+                        "SELECT child.id FROM sessions child "
+                        "JOIN sessions parent ON child.parent_session_id = parent.id "
+                        "WHERE parent.id = ? "
+                        "  AND parent.end_reason = 'compression' "
+                        "  AND json_extract(COALESCE(child.model_config, '{}'), '$._branched_from') IS NULL "
+                        "  AND json_extract(COALESCE(child.model_config, '{}'), '$._delegate_from') IS NULL "
+                        "  AND COALESCE(child.source, '') != 'tool' "
+                        "ORDER BY child.started_at DESC, child.id DESC LIMIT 1",
                         (current,),
                     ).fetchone()
                 except Exception:

@@ -44,6 +44,8 @@ def test_redirects_from_empty_head_to_descendant_with_messages(db):
         ("bulk",   "mid3"),    # has messages
         ("tail",   "bulk"),    # empty tail after another compression
     ])
+    db._conn.execute("UPDATE sessions SET end_reason = 'compression' WHERE id IN ('head', 'mid1', 'mid2', 'mid3')")
+    db._conn.commit()
     for i in range(5):
         db.append_message("bulk", role="user", content=f"msg {i}")
 
@@ -78,6 +80,8 @@ def test_empty_session_id_passthrough(db):
 def test_walks_from_middle_of_chain(db):
     # If the user happens to know an intermediate ID, we still find the msg-bearing descendant.
     _make_chain(db, [("a", None), ("b", "a"), ("c", "b"), ("d", "c")])
+    db._conn.execute("UPDATE sessions SET end_reason = 'compression' WHERE id IN ('a', 'b', 'c')")
+    db._conn.commit()
     db.append_message("d", role="user", content="x")
     assert db.resolve_resume_session_id("b") == "d"
     assert db.resolve_resume_session_id("c") == "d"
@@ -144,6 +148,8 @@ def test_prefers_most_recent_child_when_fork_exists(db):
         ("older_fork", "parent"),
         ("newer_fork", "parent"),
     ])
+    db._conn.execute("UPDATE sessions SET end_reason = 'compression' WHERE id = 'parent'")
+    db._conn.commit()
     db.append_message("newer_fork", role="user", content="x")
     assert db.resolve_resume_session_id("parent") == "newer_fork"
 
@@ -160,6 +166,8 @@ def test_redirects_from_message_bearing_parent_to_child(db):
         ("original", None),
         ("continued", "original"),
     ])
+    db._conn.execute("UPDATE sessions SET end_reason = 'compression' WHERE id = 'original'")
+    db._conn.commit()
     # Both parent and child have messages
     db.append_message("original", role="user", content="old msg")
     db.append_message("original", role="assistant", content="old reply")
