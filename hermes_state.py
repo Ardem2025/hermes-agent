@@ -4098,7 +4098,8 @@ class SessionDB:
                automatically clears bindings.
           v3 — persistent delivery_enabled flag for WebUI -> Telegram delivery.
           v4 — durable last_synced_message_id checkpoint for incremental
-               WebUI transcript delivery.
+               WebUI transcript delivery; nullable role metadata is reconciled
+               in-place for backward compatibility.
         """
         def _do(conn):
             conn.executescript(
@@ -4125,6 +4126,8 @@ class SessionDB:
                     managed_mode TEXT NOT NULL DEFAULT 'auto',
                     delivery_enabled INTEGER NOT NULL DEFAULT 1,
                     last_synced_message_id INTEGER,
+                    role_id TEXT,
+                    prompt_revision TEXT,
                     linked_at REAL NOT NULL,
                     updated_at REAL NOT NULL,
                     PRIMARY KEY (chat_id, thread_id)
@@ -4166,13 +4169,15 @@ class SessionDB:
                             managed_mode TEXT NOT NULL DEFAULT 'auto',
                             delivery_enabled INTEGER NOT NULL DEFAULT 1,
                             last_synced_message_id INTEGER,
+                            role_id TEXT,
+                            prompt_revision TEXT,
                             linked_at REAL NOT NULL,
                             updated_at REAL NOT NULL,
                             PRIMARY KEY (chat_id, thread_id)
                         );
                         INSERT INTO telegram_dm_topic_bindings_new
                             SELECT chat_id, thread_id, user_id, session_key,
-                                   session_id, managed_mode, 1, NULL, linked_at, updated_at
+                                   session_id, managed_mode, 1, NULL, NULL, NULL, linked_at, updated_at
                             FROM telegram_dm_topic_bindings;
                         DROP TABLE telegram_dm_topic_bindings;
                         ALTER TABLE telegram_dm_topic_bindings_new
@@ -4215,6 +4220,15 @@ class SessionDB:
                     "WHERE messages.session_id = telegram_dm_topic_bindings.session_id"
                     ")"
                 )
+
+            # Nullable role metadata preserves every legacy binding.
+            binding_columns = {
+                row[1] for row in conn.execute("PRAGMA table_info('telegram_dm_topic_bindings')").fetchall()
+            }
+            if "role_id" not in binding_columns:
+                conn.execute("ALTER TABLE telegram_dm_topic_bindings ADD COLUMN role_id TEXT")
+            if "prompt_revision" not in binding_columns:
+                conn.execute("ALTER TABLE telegram_dm_topic_bindings ADD COLUMN prompt_revision TEXT")
 
             conn.execute(
                 "INSERT INTO state_meta (key, value) VALUES (?, ?) "
@@ -4398,6 +4412,8 @@ class SessionDB:
         session_id: str,
         managed_mode: str = "auto",
         delivery_enabled: bool = True,
+        role_id: Optional[str] = None,
+        prompt_revision: Optional[str] = None,
     ) -> None:
         """Bind one Telegram DM topic thread to one Hermes session.
 
@@ -4431,13 +4447,15 @@ class SessionDB:
                 """
                 INSERT INTO telegram_dm_topic_bindings (
                     chat_id, thread_id, user_id, session_key, session_id,
-                    managed_mode, delivery_enabled, last_synced_message_id, linked_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    managed_mode, delivery_enabled, last_synced_message_id, role_id, prompt_revision, linked_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(chat_id, thread_id) DO UPDATE SET
                     user_id = excluded.user_id,
                     session_key = excluded.session_key,
                     session_id = excluded.session_id,
                     managed_mode = excluded.managed_mode,
+                    role_id = excluded.role_id,
+                    prompt_revision = excluded.prompt_revision,
                     updated_at = excluded.updated_at
                 """,
                 (
@@ -4449,6 +4467,8 @@ class SessionDB:
                     managed_mode,
                     1 if delivery_enabled else 0,
                     None,
+                    str(role_id) if role_id else None,
+                    str(prompt_revision) if prompt_revision else None,
                     now,
                     now,
                 ),

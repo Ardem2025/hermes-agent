@@ -177,3 +177,23 @@ async def test_internal_events_bypass_hook(monkeypatch):
     # Even though the hook would say skip, internal events bypass it.
     await runner._handle_message(event)
     assert called["count"] == 0
+
+@pytest.mark.asyncio
+async def test_observation_suppression_short_circuits_before_auth(monkeypatch):
+    """An observation hook may explicitly suppress both a session and reply."""
+    _clear_auth_env(monkeypatch)
+
+    def _fake_hook(name, **kwargs):
+        if name == "pre_gateway_dispatch":
+            return [{"suppress_session": True, "suppress_reply": True,
+                     "storage_namespace": "observation:telegram-business"}]
+        return []
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", _fake_hook)
+    runner, adapter = _make_runner(Platform.WHATSAPP)
+
+    result = await runner._handle_message(_make_event("observed"))
+
+    assert result is None
+    adapter.send.assert_not_awaited()
+    runner.pairing_store.generate_code.assert_not_called()

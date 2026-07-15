@@ -87,3 +87,17 @@ async def test_reconnect_storm_sets_and_heartbeat_clears_flag(monkeypatch):
     with patch("gateway.platforms.telegram.asyncio.sleep", new_callable=AsyncMock):
         await adapter._verify_polling_after_reconnect()
     assert adapter._send_path_degraded is False
+
+@pytest.mark.asyncio
+async def test_telegram_forbidden_is_one_non_retryable_classification():
+    """Bot API 403 must return a non-retryable result from one send attempt."""
+    adapter = _make_adapter()
+    forbidden = type("Forbidden", (Exception,), {})
+    adapter._bot.send_message = AsyncMock(side_effect=forbidden("403: bot was blocked"))
+
+    result = await adapter.send("123", "hello")
+
+    assert result.success is False
+    assert result.error == "telegram_forbidden"
+    assert result.retryable is False
+    assert adapter._bot.send_message.await_count == 1
