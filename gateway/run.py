@@ -9820,6 +9820,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if canonical == "resume":
             return await self._handle_resume_command(event)
 
+        if canonical == "quota":
+            return await self._handle_quota_command(event)
+
         if canonical == "sessions":
             return await self._handle_sessions_command(event)
 

@@ -3672,6 +3672,27 @@ class GatewaySlashCommandsMixin:
             return t("gateway.resume.resumed_one", title=title, count=msg_count)
         return t("gateway.resume.resumed_many", title=title, count=msg_count)
 
+    async def _handle_quota_command(self, event: MessageEvent) -> str:
+        """Handle /quota command — run the quota watchdog script and return its Markdown table."""
+        import asyncio
+        import subprocess
+
+        try:
+            cmd = ["sudo", "python3", "/home/hermes-itadmin/.hermes/scripts/check_gemini_quotas.py", "--always-table"]
+            
+            def _run():
+                res = subprocess.run(cmd, capture_output=True, text=True, check=True)
+                return res.stdout
+                
+            stdout = await asyncio.to_thread(_run)
+            return stdout.strip() if stdout else "No quota output received."
+        except subprocess.CalledProcessError as e:
+            logger.error(f"Error running check_gemini_quotas.py: {e.stderr}")
+            return f"❌ Failed to query quotas: {e.stderr or e.output or 'Unknown error'}"
+        except Exception as e:
+            logger.error(f"Unexpected error in /quota command: {e}")
+            return f"❌ Unexpected error checking quotas: {str(e)}"
+
     async def _handle_sessions_command(self, event: MessageEvent) -> str:
         """Handle /sessions — list previous sessions for gateway chats."""
         if not self._session_db:
