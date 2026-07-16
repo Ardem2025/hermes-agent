@@ -66,6 +66,32 @@ def test_post_gateway_session_bound_is_a_supported_plugin_hook():
 
 
 @pytest.mark.asyncio
+async def test_post_bound_hook_fires_after_native_selection_without_deferred_intent(monkeypatch):
+    """Reconciliation hooks run for every native session selection."""
+    class StopAfterPost(BaseException):
+        pass
+
+    def _fake_hook(name, **kwargs):
+        if name == "post_gateway_session_bound":
+            assert kwargs["event"].plugin_deferred_intents is None
+            assert kwargs["session_entry"].session_id == "native-session"
+            raise StopAfterPost
+        return []
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", _fake_hook)
+    runner, _adapter = _make_runner(Platform.WHATSAPP)
+    runner._recover_telegram_topic_thread_id = lambda _source: None  # noqa: SLF001
+    runner._is_telegram_topic_lane = lambda _source: False  # noqa: SLF001
+    runner._cache_session_source = lambda *_args: None  # noqa: SLF001
+    runner.session_store.get_or_create_session.return_value = SimpleNamespace(
+        session_key="native-key", session_id="native-session", was_auto_reset=False,
+    )
+
+    with pytest.raises(StopAfterPost):
+        await runner._handle_message_with_agent(_make_event("normal message"), _make_event().source, "quick", 1)  # noqa: SLF001
+
+
+@pytest.mark.asyncio
 async def test_hook_skip_short_circuits_dispatch(monkeypatch):
     """A plugin returning {'action': 'skip'} drops the message before auth."""
     _clear_auth_env(monkeypatch)

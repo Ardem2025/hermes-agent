@@ -10714,21 +10714,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 except Exception:
                     logger.debug("Failed to record Telegram topic binding", exc_info=True)
         # This is deliberately after native session selection and topic-binding
-        # persistence. Plugins receive the authoritative session id and may
-        # consume deferred intents only in their tenant-local projections.
-        if getattr(event, "plugin_deferred_intents", None):
-            try:
-                from hermes_cli.plugins import invoke_hook as _invoke_hook
-                _invoke_hook(
-                    "post_gateway_session_bound",
-                    event=event,
-                    gateway=self,
-                    session_store=self.session_store,
-                    session_entry=session_entry,
-                    source=source,
-                )
-            except Exception:
-                logger.warning("post_gateway_session_bound invocation failed", exc_info=True)
+        # persistence. Every successfully selected native session is reported:
+        # plugins may narrowly reconcile their own durable projection even
+        # without a deferred activation intent.
+        try:
+            from hermes_cli.plugins import invoke_hook as _invoke_hook
+            _invoke_hook(
+                "post_gateway_session_bound",
+                event=event,
+                gateway=self,
+                session_store=self.session_store,
+                session_entry=session_entry,
+                source=source,
+            )
+        except Exception:
+            logger.warning("post_gateway_session_bound invocation failed", exc_info=True)
         # Capture and immediately consume was_auto_reset so it does not
         # re-fire on subsequent messages — preventing the cleanup from
         # wiping model/reasoning overrides set between turns (Closes #48031).
