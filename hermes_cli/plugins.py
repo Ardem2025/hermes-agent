@@ -171,6 +171,11 @@ VALID_HOOKS: Set[str] = {
     #   {"action": "allow"}  /  None             -> normal dispatch
     # Kwargs: event: MessageEvent, gateway: GatewayRunner, session_store.
     "pre_gateway_dispatch",
+    # Fired after GatewayRunner has selected a concrete session and refreshed
+    # its native topic binding. This is the safe point for a plugin that needs
+    # the authoritative Hermes session id.
+    # Kwargs: event, gateway, session_store, session_entry, source.
+    "post_gateway_session_bound",
     # Approval lifecycle hooks. Fired by tools/approval.py when a dangerous
     # command needs user approval -- fires BOTH for CLI-interactive prompts
     # and for gateway/ACP approvals (Telegram, Discord, Slack, TUI, etc.).

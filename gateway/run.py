@@ -8811,6 +8811,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         #   {"action": "allow"}   /   None          -> normal dispatch
         # Hook runs BEFORE auth so plugins can handle unauthorized senders
         # (e.g. customer handover ingest) without triggering the pairing flow.
+        # ``system_context`` is bounded trusted plugin metadata for this turn
+        # only; it never replaces user text. Generic ``context`` metadata does
+        # not have system-prompt privilege.
+        _plugin_context_parts: list[str] = []
+        _plugin_deferred_intents: list[dict] = []
         if not is_internal:
             try:
                 from hermes_cli.plugins import invoke_hook as _invoke_hook
@@ -8824,9 +8829,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.warning("pre_gateway_dispatch invocation failed: %s", _hook_exc)
                 _hook_results = []
 
+            _plugin_rewrite_text: str | None = None
             for _result in _hook_results:
                 if not isinstance(_result, dict):
                     continue
+                _context = _result.get("system_context")
+                if isinstance(_context, str):
+                    _context = _context.strip()
+                    if _context:
+                        _plugin_context_parts.append(_context[:2048])
+                _intent = _result.get("deferred_activation")
+                if isinstance(_intent, dict):
+                    # Keep an opaque, bounded payload. The host does not
+                    # interpret tenant-specific keys.
+                    _plugin_deferred_intents.append(dict(list(_intent.items())[:16]))
                 _action = _result.get("action")
                 _suppress_session = bool(_result.get("suppress_session"))
                 _suppress_reply = bool(_result.get("suppress_reply"))
@@ -8840,14 +8856,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         source.chat_id or "unknown",
                     )
                     return None
-                if _action == "rewrite":
+                if _action == "rewrite" and _plugin_rewrite_text is None:
                     _new_text = _result.get("text")
                     if isinstance(_new_text, str):
-                        event = dataclasses.replace(event, text=_new_text)
-                        source = event.source
-                    break
-                if _action == "allow":
-                    break
+                        # First rewrite wins, while later hooks may still
+                        # contribute bounded context or deferred intents.
+                        _plugin_rewrite_text = _new_text
+
+            if _plugin_rewrite_text is not None:
+                event = dataclasses.replace(event, text=_plugin_rewrite_text)
+                source = event.source
+
+            if _plugin_context_parts or _plugin_deferred_intents:
+                event = dataclasses.replace(
+                    event,
+                    plugin_system_context="\n\n".join(_plugin_context_parts)[:4096] or None,
+                    plugin_deferred_intents=_plugin_deferred_intents or None,
+                )
 
         if is_internal:
             pass
@@ -10688,6 +10713,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     await asyncio.to_thread(self._record_telegram_topic_binding, source, session_entry)
                 except Exception:
                     logger.debug("Failed to record Telegram topic binding", exc_info=True)
+        # This is deliberately after native session selection and topic-binding
+        # persistence. Plugins receive the authoritative session id and may
+        # consume deferred intents only in their tenant-local projections.
+        if getattr(event, "plugin_deferred_intents", None):
+            try:
+                from hermes_cli.plugins import invoke_hook as _invoke_hook
+                _invoke_hook(
+                    "post_gateway_session_bound",
+                    event=event,
+                    gateway=self,
+                    session_store=self.session_store,
+                    session_entry=session_entry,
+                    source=source,
+                )
+            except Exception:
+                logger.warning("post_gateway_session_bound invocation failed", exc_info=True)
         # Capture and immediately consume was_auto_reset so it does not
         # re-fire on subsequent messages — preventing the cleanup from
         # wiping model/reasoning overrides set between turns (Closes #48031).
@@ -10751,8 +10792,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             pass
 
-        # Build the context prompt to inject
+        # Build the context prompt to inject. Plugin context is ephemeral
+        # system metadata, separate from user text and persisted history.
         context_prompt = build_session_context_prompt(context, redact_pii=_redact_pii)
+        _plugin_system_context = getattr(event, "plugin_system_context", None)
+        if isinstance(_plugin_system_context, str) and _plugin_system_context.strip():
+            context_prompt = "\n\n".join(
+                part for part in (context_prompt, _plugin_system_context.strip()[:4096]) if part
+            )
         
         # If the previous session expired and was auto-reset, prepend a notice
         # so the agent knows this is a fresh conversation (not an intentional /reset).

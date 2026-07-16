@@ -13,6 +13,7 @@ import pytest
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent
 from gateway.session import SessionSource
+from hermes_cli.plugins import VALID_HOOKS
 
 
 def _clear_auth_env(monkeypatch) -> None:
@@ -58,6 +59,10 @@ def _make_runner(platform: Platform):
     runner._running_agents = {}
     runner._update_prompt_pending = {}
     return runner, adapter
+
+
+def test_post_gateway_session_bound_is_a_supported_plugin_hook():
+    assert "post_gateway_session_bound" in VALID_HOOKS
 
 
 @pytest.mark.asyncio
@@ -106,6 +111,64 @@ async def test_hook_rewrite_replaces_event_text(monkeypatch):
     await runner._handle_message(_make_event("original"))
 
     assert seen_text.get("value") == "REWRITTEN"
+
+
+@pytest.mark.asyncio
+async def test_hook_system_context_reaches_agent_without_rewriting_user_text(monkeypatch):
+    """Trusted plugin metadata is bounded system context, never user input."""
+    _clear_auth_env(monkeypatch)
+    monkeypatch.setenv("WHATSAPP_ALLOWED_USERS", "*")
+    seen = {}
+
+    def _fake_hook(name, **kwargs):
+        if name == "pre_gateway_dispatch":
+            return [{"action": "allow", "system_context": "workflow=active\n" + "x" * 9000}]
+        return []
+
+    async def _capture(event, source, _quick_key, _run_generation):
+        seen["text"] = event.text
+        seen["context"] = event.plugin_system_context
+        return "ok"
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", _fake_hook)
+    runner, _adapter = _make_runner(Platform.WHATSAPP)
+    runner._handle_message_with_agent = _capture  # noqa: SLF001
+
+    await runner._handle_message(_make_event("original"))
+
+    assert seen["text"] == "original"
+    assert seen["context"].startswith("workflow=active")
+    assert len(seen["context"]) == 2048
+
+
+@pytest.mark.asyncio
+async def test_hook_context_is_explicit_and_later_hooks_are_not_dropped(monkeypatch):
+    _clear_auth_env(monkeypatch)
+    monkeypatch.setenv("WHATSAPP_ALLOWED_USERS", "*")
+    seen = {}
+
+    def _fake_hook(name, **kwargs):
+        if name == "pre_gateway_dispatch":
+            return [
+                {"action": "allow", "context": "must-not-be-system"},
+                {"action": "allow", "system_context": "second-hook"},
+                {"action": "rewrite", "text": "rewritten"},
+            ]
+        return []
+
+    async def _capture(event, source, _quick_key, _run_generation):
+        seen["text"] = event.text
+        seen["context"] = event.plugin_system_context
+        return "ok"
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", _fake_hook)
+    runner, _adapter = _make_runner(Platform.WHATSAPP)
+    runner._handle_message_with_agent = _capture  # noqa: SLF001
+
+    await runner._handle_message(_make_event("original"))
+
+    assert seen["text"] == "rewritten"
+    assert seen["context"] == "second-hook"
 
 
 @pytest.mark.asyncio
