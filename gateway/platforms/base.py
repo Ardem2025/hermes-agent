@@ -1495,6 +1495,10 @@ class MessageEvent:
     # It is never substituted for user text or written to transcript history.
     plugin_system_context: Optional[str] = None
 
+    # Opaque, trusted activation intents returned by pre-dispatch plugins.
+    # They are never user text and are consumed only after session selection.
+    plugin_deferred_intents: Optional[list[dict]] = None
+
     # Channel context recovered by history backfill (e.g. messages between
     # bot turns that were missed due to require_mention).  Kept separate
     # from ``text`` so the sender-prefix logic in run.py can operate on the

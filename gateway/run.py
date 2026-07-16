@@ -6385,6 +6385,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # ``context``/``system_context`` is bounded trusted plugin metadata for
         # this turn only; it never replaces user text.
         _plugin_context_parts: list[str] = []
+        _plugin_deferred_intents: list[dict] = []
         if not is_internal:
             try:
                 from hermes_cli.plugins import invoke_hook as _invoke_hook
@@ -6406,6 +6407,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _context = _context.strip()
                     if _context:
                         _plugin_context_parts.append(_context[:2048])
+                _intent = _result.get("deferred_activation")
+                if isinstance(_intent, dict):
+                    # Preserve only a small, JSON-like intent payload.  The
+                    # producer is a loaded plugin; the host never interprets
+                    # its tenant-specific keys.
+                    _plugin_deferred_intents.append(dict(list(_intent.items())[:16]))
                 _action = _result.get("action")
                 if _action == "skip":
                     logger.info(
@@ -6424,10 +6431,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if _action == "allow":
                     break
 
-            if _plugin_context_parts:
+            if _plugin_context_parts or _plugin_deferred_intents:
                 # Keep aggregate plugin metadata bounded even with many hooks.
                 event = dataclasses.replace(
-                    event, plugin_system_context="\n\n".join(_plugin_context_parts)[:4096]
+                    event,
+                    plugin_system_context="\n\n".join(_plugin_context_parts)[:4096] or None,
+                    plugin_deferred_intents=_plugin_deferred_intents or None,
                 )
 
         if is_internal:
@@ -7997,6 +8006,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     self._record_telegram_topic_binding(source, session_entry)
                 except Exception:
                     logger.debug("Failed to record Telegram topic binding", exc_info=True)
+        # This is deliberately after native session selection and topic-binding
+        # persistence.  Plugins receive the actual Hermes session id and may
+        # consume a deferred intent created during pre-dispatch; pre-dispatch
+        # must never write an authoritative binding with a missing id.
+        if getattr(event, "plugin_deferred_intents", None):
+            try:
+                from hermes_cli.plugins import invoke_hook as _invoke_hook
+                _invoke_hook(
+                    "post_gateway_session_bound",
+                    event=event,
+                    gateway=self,
+                    session_store=self.session_store,
+                    session_entry=session_entry,
+                    source=source,
+                )
+            except Exception:
+                logger.warning("post_gateway_session_bound invocation failed", exc_info=True)
         if getattr(session_entry, "was_auto_reset", False):
             # Treat auto-reset as a full conversation boundary — drop every
             # session-scoped transient state so the fresh session does not

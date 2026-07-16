@@ -13,6 +13,7 @@ import pytest
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent
 from gateway.session import SessionSource
+from hermes_cli.plugins import VALID_HOOKS
 
 
 def _clear_auth_env(monkeypatch) -> None:
@@ -58,6 +59,10 @@ def _make_runner(platform: Platform):
     runner._running_agents = {}
     runner._update_prompt_pending = {}
     return runner, adapter
+
+
+def test_post_gateway_session_bound_is_a_supported_plugin_hook():
+    assert "post_gateway_session_bound" in VALID_HOOKS
 
 
 @pytest.mark.asyncio
