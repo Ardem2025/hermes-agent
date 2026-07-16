@@ -11275,14 +11275,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             "Session hygiene auto-compress failed: %s", e
                         )
 
-        # Persisted Telegram role topics use an explicit persona and must not
-        # inherit the generic first-contact/onboarding instructions.
-        role_prompt = self._telegram_topic_role_prompt(source)
-        if role_prompt:
-            context_prompt = (context_prompt + "\n\n" + role_prompt).strip()
-
         # First-message onboarding -- only on the very first interaction ever
-        if not role_prompt and not history and not self.session_store.has_any_sessions():
+        if not history and not self.session_store.has_any_sessions():
             # Default first-contact note: a brief self-introduction.
             _intro_note = (
                 "\n\n[System note: This is the user's very first message ever. "
@@ -16720,27 +16714,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         }
 
     # ------------------------------------------------------------------
-
-    def _telegram_topic_role_prompt(self, source: SessionSource) -> str:
-        """Return a fail-closed role directive for a persisted Telegram topic."""
-        if not self._session_db or source.platform != Platform.TELEGRAM or not source.thread_id:
-            return ""
-        binding = self._session_db.get_telegram_topic_binding(
-            chat_id=str(source.chat_id), thread_id=str(source.thread_id)
-        )
-        if not binding:
-            return ""
-        role_id = str(binding.get("role_id") or "").strip().casefold()
-        revision = str(binding.get("prompt_revision") or "v1").strip()
-        if role_id != "life-coach" or revision != "v1":
-            return ""
-        return (
-            "[ROLE TOPIC: life-coach/v1] This is the Life Coach topic. "
-            "Act as a warm, practical life coach: help the user clarify goals, "
-            "notice patterns, and choose small next actions. Do not conduct, "
-            "mention, or follow any onboarding questionnaire or onboarding persona "
-            "in this topic, even if generic instructions elsewhere mention onboarding."
-        )
 
     async def _run_agent(
         self,
