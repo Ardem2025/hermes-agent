@@ -320,7 +320,7 @@ async def test_existing_v2_binding_is_migrated_for_get_and_toggle(adapter, sessi
         changed = await cli.post(f"/api/sessions/{session_id}/telegram-binding", json={"delivery_enabled": False})
         assert changed.status == 200
         assert (await changed.json())["delivery_enabled"] is False
-    assert session_db.get_meta("telegram_dm_topic_schema_version") == "3"
+    assert session_db.get_meta("telegram_dm_topic_schema_version") == "4"
 
 
 @pytest.mark.asyncio
