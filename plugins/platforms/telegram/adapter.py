@@ -3863,6 +3863,10 @@ class TelegramAdapter(BasePlatformAdapter):
             is_timeout = (_to and isinstance(e, _to)) or "timed out" in err_str
             is_connect_timeout = self._looks_like_connect_timeout(e)
             is_pool_timeout = self._looks_like_pool_timeout(e)
+            is_forbidden = type(e).__name__.lower() == "forbidden" or "forbidden" in err_str or "403" in err_str
+            if is_forbidden:
+                logger.warning("[%s] Telegram delivery forbidden; classified non-retryable", self.name)
+                return SendResult(success=False, error="telegram_forbidden", retryable=False, error_kind=error_kind)
             return SendResult(
                 success=False,
                 error=safe_error,

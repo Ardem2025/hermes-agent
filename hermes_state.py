@@ -5637,6 +5637,7 @@ class SessionDB:
           v2 — session_id FK gets ON DELETE CASCADE so session pruning
                automatically clears bindings.
           v3 — persistent delivery_enabled flag for WebUI -> Telegram delivery.
+          v4 — nullable role metadata for isolated topic personas.
         """
         def _do(conn):
             conn.executescript(
@@ -5662,6 +5663,8 @@ class SessionDB:
                     session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
                     managed_mode TEXT NOT NULL DEFAULT 'auto',
                     delivery_enabled INTEGER NOT NULL DEFAULT 1,
+                    role_id TEXT,
+                    prompt_revision TEXT,
                     linked_at REAL NOT NULL,
                     updated_at REAL NOT NULL,
                     PRIMARY KEY (chat_id, thread_id)
@@ -5702,13 +5705,15 @@ class SessionDB:
                             session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
                             managed_mode TEXT NOT NULL DEFAULT 'auto',
                             delivery_enabled INTEGER NOT NULL DEFAULT 1,
+                            role_id TEXT,
+                            prompt_revision TEXT,
                             linked_at REAL NOT NULL,
                             updated_at REAL NOT NULL,
                             PRIMARY KEY (chat_id, thread_id)
                         );
                         INSERT INTO telegram_dm_topic_bindings_new
                             SELECT chat_id, thread_id, user_id, session_key,
-                                   session_id, managed_mode, 1, linked_at, updated_at
+                                   session_id, managed_mode, 1, NULL, NULL, linked_at, updated_at
                             FROM telegram_dm_topic_bindings;
                         DROP TABLE telegram_dm_topic_bindings;
                         ALTER TABLE telegram_dm_topic_bindings_new
@@ -5725,10 +5730,14 @@ class SessionDB:
             columns = {row[1] for row in conn.execute("PRAGMA table_info('telegram_dm_topic_bindings')").fetchall()}
             if "delivery_enabled" not in columns:
                 conn.execute("ALTER TABLE telegram_dm_topic_bindings ADD COLUMN delivery_enabled INTEGER NOT NULL DEFAULT 1")
+            if "role_id" not in columns:
+                conn.execute("ALTER TABLE telegram_dm_topic_bindings ADD COLUMN role_id TEXT")
+            if "prompt_revision" not in columns:
+                conn.execute("ALTER TABLE telegram_dm_topic_bindings ADD COLUMN prompt_revision TEXT")
             conn.execute(
                 "INSERT INTO state_meta (key, value) VALUES (?, ?) "
                 "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                ("telegram_dm_topic_schema_version", "3"),
+                ("telegram_dm_topic_schema_version", "4"),
             )
         self._execute_write(_do)
 
@@ -5984,6 +5993,8 @@ class SessionDB:
         session_id: str,
         managed_mode: str = "auto",
         delivery_enabled: bool = True,
+        role_id: Optional[str] = None,
+        prompt_revision: Optional[str] = None,
     ) -> None:
         """Bind one Telegram DM topic thread to one Hermes session.
 
@@ -6017,13 +6028,15 @@ class SessionDB:
                 """
                 INSERT INTO telegram_dm_topic_bindings (
                     chat_id, thread_id, user_id, session_key, session_id,
-                    managed_mode, delivery_enabled, linked_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    managed_mode, delivery_enabled, role_id, prompt_revision, linked_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(chat_id, thread_id) DO UPDATE SET
                     user_id = excluded.user_id,
                     session_key = excluded.session_key,
                     session_id = excluded.session_id,
                     managed_mode = excluded.managed_mode,
+                    role_id = excluded.role_id,
+                    prompt_revision = excluded.prompt_revision,
                     updated_at = excluded.updated_at
                 """,
                 (
@@ -6034,6 +6047,8 @@ class SessionDB:
                     session_id,
                     managed_mode,
                     1 if delivery_enabled else 0,
+                    str(role_id) if role_id else None,
+                    str(prompt_revision) if prompt_revision else None,
                     now,
                     now,
                 ),
