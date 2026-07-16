@@ -1,7 +1,7 @@
 """
 Contextual first-touch onboarding hints.
 
-Instead of blocking first-run questionnaires, show a one-time hint the *first*
+Instead of blocking first-run prompts, show a one-time hint the *first*
 time a user hits a behavior fork — message-while-running, first long-running
 tool, etc.  Each hint is shown once per install (tracked in ``config.yaml`` under
 ``onboarding.seen.<flag>``) and then never again.
