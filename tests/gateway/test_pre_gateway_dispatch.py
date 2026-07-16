@@ -142,6 +142,36 @@ async def test_hook_system_context_reaches_agent_without_rewriting_user_text(mon
 
 
 @pytest.mark.asyncio
+async def test_hook_context_is_explicit_and_later_hooks_are_not_dropped(monkeypatch):
+    _clear_auth_env(monkeypatch)
+    monkeypatch.setenv("WHATSAPP_ALLOWED_USERS", "*")
+    seen = {}
+
+    def _fake_hook(name, **kwargs):
+        if name == "pre_gateway_dispatch":
+            return [
+                {"action": "allow", "context": "must-not-be-system"},
+                {"action": "allow", "system_context": "second-hook"},
+                {"action": "rewrite", "text": "rewritten"},
+            ]
+        return []
+
+    async def _capture(event, source, _quick_key, _run_generation):
+        seen["text"] = event.text
+        seen["context"] = event.plugin_system_context
+        return "ok"
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", _fake_hook)
+    runner, _adapter = _make_runner(Platform.WHATSAPP)
+    runner._handle_message_with_agent = _capture  # noqa: SLF001
+
+    await runner._handle_message(_make_event("original"))
+
+    assert seen["text"] == "rewritten"
+    assert seen["context"] == "second-hook"
+
+
+@pytest.mark.asyncio
 async def test_hook_allow_falls_through_to_auth(monkeypatch):
     """A plugin returning {'action': 'allow'} continues to normal dispatch."""
     _clear_auth_env(monkeypatch)

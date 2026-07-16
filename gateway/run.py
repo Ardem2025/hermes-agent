@@ -6399,10 +6399,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.warning("pre_gateway_dispatch invocation failed: %s", _hook_exc)
                 _hook_results = []
 
+            _plugin_rewrite_text: str | None = None
             for _result in _hook_results:
                 if not isinstance(_result, dict):
                     continue
-                _context = _result.get("system_context", _result.get("context"))
+                # System-prompt privilege is explicit: generic plugin metadata
+                # named ``context`` is never promoted into a system message.
+                _context = _result.get("system_context")
                 if isinstance(_context, str):
                     _context = _context.strip()
                     if _context:
@@ -6422,14 +6425,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         source.chat_id or "unknown",
                     )
                     return None
-                if _action == "rewrite":
+                if _action == "rewrite" and _plugin_rewrite_text is None:
                     _new_text = _result.get("text")
                     if isinstance(_new_text, str):
-                        event = dataclasses.replace(event, text=_new_text)
-                        source = event.source
-                    break
-                if _action == "allow":
-                    break
+                        # First rewrite wins, but later hooks may still append
+                        # bounded context or deferred intents deterministically.
+                        _plugin_rewrite_text = _new_text
+
+            if _plugin_rewrite_text is not None:
+                event = dataclasses.replace(event, text=_plugin_rewrite_text)
+                source = event.source
 
             if _plugin_context_parts or _plugin_deferred_intents:
                 # Keep aggregate plugin metadata bounded even with many hooks.
