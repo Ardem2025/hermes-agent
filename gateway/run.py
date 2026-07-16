@@ -6382,6 +6382,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         #   {"action": "allow"}   /   None          -> normal dispatch
         # Hook runs BEFORE auth so plugins can handle unauthorized senders
         # (e.g. customer handover ingest) without triggering the pairing flow.
+        # ``context``/``system_context`` is bounded trusted plugin metadata for
+        # this turn only; it never replaces user text.
+        _plugin_context_parts: list[str] = []
         if not is_internal:
             try:
                 from hermes_cli.plugins import invoke_hook as _invoke_hook
@@ -6398,6 +6401,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             for _result in _hook_results:
                 if not isinstance(_result, dict):
                     continue
+                _context = _result.get("system_context", _result.get("context"))
+                if isinstance(_context, str):
+                    _context = _context.strip()
+                    if _context:
+                        _plugin_context_parts.append(_context[:2048])
                 _action = _result.get("action")
                 if _action == "skip":
                     logger.info(
@@ -6415,6 +6423,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     break
                 if _action == "allow":
                     break
+
+            if _plugin_context_parts:
+                # Keep aggregate plugin metadata bounded even with many hooks.
+                event = dataclasses.replace(
+                    event, plugin_system_context="\n\n".join(_plugin_context_parts)[:4096]
+                )
 
         if is_internal:
             pass
@@ -8025,8 +8039,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             pass
 
-        # Build the context prompt to inject
+        # Build the context prompt to inject. Plugin context is trusted,
+        # ephemeral system metadata for this turn and is intentionally kept
+        # separate from both user text and persisted conversation history.
         context_prompt = build_session_context_prompt(context, redact_pii=_redact_pii)
+        _plugin_system_context = getattr(event, "plugin_system_context", None)
+        if isinstance(_plugin_system_context, str) and _plugin_system_context.strip():
+            context_prompt = "\n\n".join(
+                part for part in (context_prompt, _plugin_system_context.strip()[:4096]) if part
+            )
         
         # If the previous session expired and was auto-reset, prepend a notice
         # so the agent knows this is a fresh conversation (not an intentional /reset).

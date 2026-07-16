@@ -109,6 +109,34 @@ async def test_hook_rewrite_replaces_event_text(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_hook_system_context_reaches_agent_without_rewriting_user_text(monkeypatch):
+    """Trusted plugin metadata is bounded system context, never user input."""
+    _clear_auth_env(monkeypatch)
+    monkeypatch.setenv("WHATSAPP_ALLOWED_USERS", "*")
+    seen = {}
+
+    def _fake_hook(name, **kwargs):
+        if name == "pre_gateway_dispatch":
+            return [{"action": "allow", "system_context": "workflow=active\n" + "x" * 9000}]
+        return []
+
+    async def _capture(event, source, _quick_key, _run_generation):
+        seen["text"] = event.text
+        seen["context"] = event.plugin_system_context
+        return "ok"
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", _fake_hook)
+    runner, _adapter = _make_runner(Platform.WHATSAPP)
+    runner._handle_message_with_agent = _capture  # noqa: SLF001
+
+    await runner._handle_message(_make_event("original"))
+
+    assert seen["text"] == "original"
+    assert seen["context"].startswith("workflow=active")
+    assert len(seen["context"]) == 2048
+
+
+@pytest.mark.asyncio
 async def test_hook_allow_falls_through_to_auth(monkeypatch):
     """A plugin returning {'action': 'allow'} continues to normal dispatch."""
     _clear_auth_env(monkeypatch)
