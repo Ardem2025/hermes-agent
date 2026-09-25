@@ -387,7 +387,7 @@ def _strip_mdv2(text: str) -> str:
     cleaned = re.sub(r'(?<!\w)_([^_]+)_(?!\w)', r'\1', cleaned)  # italic; word-bounded so snake_case survives
     cleaned = re.sub(r'~([^~]+)~', r'\1', cleaned)  # strikethrough
     cleaned = re.sub(r'\|\|([^|]+)\|\|', r'\1', cleaned)  # spoiler
-    return cleaned
+    return strip_markdown(cleaned)
 
 
 _CHUNK_INDICATOR_ON_FENCE_RE = re.compile(r'(?m)^``` (?P<indicator>(?:\\)?\(\d+/\d+(?:\\)?\))$')
@@ -401,6 +401,9 @@ def _separate_chunk_indicator_from_fence(text: str) -> str:
 
 # MarkdownV2 has no table syntax, so pipe tables become bullet groups via convert_table_to_bullets().
 from gateway.platforms.helpers import (
+    strip_markdown,
+    normalize_latex_math_symbols,
+    normalize_markdown_bullets,
     TABLE_SEPARATOR_RE as _TABLE_SEPARATOR_RE, compile_mention_patterns, convert_table_to_bullets as _wrap_markdown_tables)
 
 # Rich-message regions whose internal newlines must stay bare (Telegram renders them natively):
@@ -5613,6 +5616,9 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
         modified), markdown constructs become MarkdownV2 syntax, everything else is escaped."""
         if not content:
             return content
+
+        content = normalize_latex_math_symbols(content)
+        content = normalize_markdown_bullets(content)
         placeholders: dict = {}
         counter = [0]
 
