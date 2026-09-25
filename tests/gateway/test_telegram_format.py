@@ -768,3 +768,89 @@ class TestSpecialCharactersAndTables:
         assert "\\le" not in out
         assert "\\ge" not in out
         assert "$" not in out
+
+
+class TestBddScenarios20260925:
+    """Canonical test suite for the 6 SpDD BDD Scenarios (task_20260925_telegram_formatting_fix)."""
+
+    def test_scenario_1_empty_backticks_and_multiline_boundary(self, adapter):
+        inp = (
+            "3. **Reasoning скрыт (`show_reasoning: false`):** Поскольку блок мыслей `` вырезается, а модель 14B...\n"
+            "- Параметр 1: `val`\n"
+            "- Параметр 2: `val2`\n"
+        )
+        out = adapter.format_message(inp)
+        assert "\\`\\`" in out or "``" not in out
+        assert "`show_reasoning: false`" in out
+        assert "`val`" in out
+        assert "`val2`" in out
+        assert "•" in out
+
+    def test_scenario_2_zero_bullet_eating_strip_markdown(self):
+        inp = (
+            "* Скомпилирован байткод всех пропатченных модулей\n"
+            "* Запущен локальный E2E-тест конвертации\n"
+            "* Перезапущен сервис hermes-gateway-andrey.service"
+        )
+        out = strip_markdown(inp)
+        expected = inp.strip()
+        assert out == expected
+        assert out.count("*") == 3
+
+    def test_scenario_3_code_symbols_protection_strip_markdown(self):
+        inp = "Маркеры `*`, `-`, `+` в начале строк переводятся в нативные символы `•` и `◦`"
+        out = strip_markdown(inp)
+        assert out == "Маркеры *, -, + в начале строк переводятся в нативные символы • и ◦"
+
+    @pytest.mark.asyncio
+    async def test_scenario_4_fallback_crash_free_plain_text(self, adapter):
+        adapter._bot = MagicMock()
+        adapter._bot.send_message = AsyncMock(
+            side_effect=[
+                Exception("400 Bad Request: Can't parse entities in message text"),
+                SimpleNamespace(message_id=428774),
+            ]
+        )
+        send_kwargs = {"chat_id": 12345678}
+        raw = "**Important:** Check `*`, `-`, `+` list markers."
+        formatted = adapter.format_message(raw)
+        res = await adapter._send_chunk_markdown_or_plain(formatted, send_kwargs, original_raw_chunk=raw)
+        assert res.message_id == 428774
+        assert adapter._bot.send_message.call_count == 2
+        second_call = adapter._bot.send_message.call_args_list[1]
+        plain_text = second_call.kwargs.get("text")
+        assert "\\" not in plain_text
+        assert "Important: Check *, -, + list markers." in plain_text
+        assert second_call.kwargs.get("parse_mode") is None
+
+    def test_scenario_5_latex_math_to_unicode(self):
+        inp = r"Значение $x \ge 180$, погрешность $\approx 5\%$, дробь $\frac{a}{b}$, угол $90^\circ$, предел $\alpha \to \infty$."
+        out = normalize_latex_math_symbols(inp)
+        assert "x ≥ 180" in out
+        assert "≈ 5%" in out
+        assert "a/b" in out
+        assert "90°" in out
+        assert "α → ∞" in out
+        assert r"\ge" not in out
+        assert r"\approx" not in out
+        assert r"\frac" not in out
+        assert r"\alpha" not in out
+        assert r"\to" not in out
+        assert r"\infty" not in out
+
+    @pytest.mark.asyncio
+    async def test_scenario_6_streaming_incomplete_markdown_edit(self, adapter):
+        adapter._bot = MagicMock()
+        adapter._bot.edit_message_text = AsyncMock(
+            side_effect=[
+                Exception("400 Bad Request: Can't parse entities: can't find end of code entity"),
+                None,
+            ]
+        )
+        partial = "Here is the code:\n```python\ndef run():\n    return 42"
+        res = await adapter.edit_message("12345678", "100", partial, finalize=True)
+        assert res.success is True
+        assert adapter._bot.edit_message_text.call_count == 2
+
+
+

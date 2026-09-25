@@ -116,7 +116,7 @@ def bounded_put(store: MutableMapping[str, Any], key: str, value: Any, cap: int)
 # squeeze run after these, in that order (see ``strip_markdown``).
 _STRIP_RULES = (
     (re.compile(r"\*\*(.+?)\*\*", re.DOTALL), r"\1"),
-    (re.compile(r"\*(.+?)\*", re.DOTALL), r"\1"),
+    (re.compile(r"(?<!\*)\*(?!\s)([^*\n]+?)(?<!\s)\*(?!\*)"), r"\1"),
     (re.compile(r"\b__(?![\s_])(.+?)(?<![\s_])__\b", re.DOTALL), r"\1"),
     (re.compile(r"\b_(?![\s_])(.+?)(?<![\s_])_\b", re.DOTALL), r"\1"),
     (re.compile(r"```[a-zA-Z0-9_+-]*\n?"), ""),
@@ -148,9 +148,36 @@ def strip_markdown(text: str, *, keep_link_targets: bool = False) -> str:
     ``keep_link_targets`` rewrites ``[label](https://url)`` as ``label\nurl``
     instead of discarding the URL; pass it on platforms that auto-link bare URLs.
     """
+    if not text:
+        return text
+
+    placeholders: dict[str, str] = {}
+    counter = [0]
+
+    def _stash_code(m: re.Match) -> str:
+        key = f"\x00STRIP_PH_{counter[0]}\x00"
+        counter[0] += 1
+        raw = m.group(0)
+        if raw.startswith("```"):
+            inner = re.sub(r"^```[a-zA-Z0-9_+-]*\n?", "", raw)
+            inner = re.sub(r"\n?```$", "", inner)
+            placeholders[key] = inner
+        elif raw.startswith("`") and raw.endswith("`"):
+            placeholders[key] = raw[1:-1]
+        else:
+            placeholders[key] = raw
+        return key
+
+    text = re.sub(r'(```(?:[^\n]*\n)?[\s\S]*?```)', _stash_code, text)
+    text = re.sub(r'(`[^`\n]+`)', _stash_code, text)
+
     for pattern, repl in _STRIP_RULES:
         text = pattern.sub(repl, text)
     text = _MD_LINK_RE.sub(_keep_link_target if keep_link_targets else r"\1", text)
+
+    for key, val in reversed(list(placeholders.items())):
+        text = text.replace(key, val)
+
     return _NEWLINE_SQUEEZE_RE.sub("\n\n", text).strip()
 
 
@@ -758,6 +785,9 @@ class TextBatchAggregator:
 # ─── LaTeX & Math Normalization ──────────────────────────────────────────────
 _LATEX_MACRO_REPLACEMENTS = (
     # Relations / Comparisons
+    (re.compile(r'\\%'), '%'),
+    (re.compile(r'\\#'), '#'),
+    (re.compile(r'\\&'), '&'),
     (re.compile(r'\\(?:ge|geq)\b'), '≥'),
     (re.compile(r'\\(?:le|leq)\b'), '≤'),
     (re.compile(r'\\(?:approx|sim)\b'), '≈'),
