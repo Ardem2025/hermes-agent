@@ -3554,7 +3554,9 @@ class TelegramAdapter(BasePlatformAdapter):
             _TimedOut = None  # type: ignore[assignment,misc]
         return _NetErr, _BadReq, _TimedOut
 
-    async def _send_chunk_markdown_or_plain(self, chunk: str, send_kwargs: Dict[str, Any]):
+    async def _send_chunk_markdown_or_plain(
+        self, chunk: str, send_kwargs: Dict[str, Any], *, original_raw_chunk: Optional[str] = None
+    ):
         """MarkdownV2 first; on a parse/markdown rejection resend as stripped plain text."""
         try:
             return await _await_with_thread_deadline(
@@ -3563,8 +3565,9 @@ class TelegramAdapter(BasePlatformAdapter):
         except Exception as md_error:
             if "parse" in str(md_error).lower() or "markdown" in str(md_error).lower():
                 logger.warning("[%s] MarkdownV2 parse failed, falling back to plain text: %s", self.name, md_error)
+                plain_text = strip_markdown(original_raw_chunk) if original_raw_chunk is not None else strip_markdown(chunk)
                 return await _await_with_thread_deadline(
-                    self._bot.send_message(text=_strip_mdv2(chunk), parse_mode=None, **send_kwargs),
+                    self._bot.send_message(text=plain_text, parse_mode=None, **send_kwargs),
                     timeout=_TEXT_SEND_DEADLINE, label="telegram-send", dump_on_blocked_loop=False)
             raise
 
@@ -5758,9 +5761,9 @@ class TelegramAdapter(BasePlatformAdapter):
         )
 
         # 2) Protect inline code (`...`)
-        #    Escape \ inside inline code per MarkdownV2 spec.
+        #    Escape \ inside inline code per MarkdownV2 spec ([^`\n]+ prevents multi-line spans).
         text = re.sub(
-            r'(`[^`]+`)',
+            r'(`[^`\n]+`)',
             lambda m: _ph(m.group(0).replace('\\', '\\\\')),
             text,
         )
