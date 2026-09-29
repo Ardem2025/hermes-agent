@@ -3007,8 +3007,33 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
     def _session_db_unavailable() -> "web.Response":
         return _error_response("Session database unavailable", 503, code="session_db_unavailable")
 
-    @staticmethod
-    def _session_response(session: Dict[str, Any]) -> Dict[str, Any]:
+    def _get_active_subagents_for_session(self, session_id: str) -> List[Dict[str, Any]]:
+        if not session_id:
+            return []
+        active = []
+        try:
+            from tools.delegate_tool_registry import _active_subagents, _active_subagents_lock
+            with _active_subagents_lock:
+                for sid, rec in _active_subagents.items():
+                    owner_sid = str(rec.get("owner_agent_session_id") or rec.get("owner_session_id") or "")
+                    if owner_sid == session_id:
+                        started = rec.get("started_at")
+                        active.append({
+                            "subagent_id": rec.get("subagent_id", sid),
+                            "parent_id": rec.get("parent_id"),
+                            "depth": rec.get("depth", 0),
+                            "goal": rec.get("goal", ""),
+                            "model": rec.get("model", ""),
+                            "status": rec.get("status", "running"),
+                            "last_tool": rec.get("last_tool"),
+                            "tool_count": rec.get("tool_count", 0),
+                            "running_seconds": round(time.time() - started, 1) if isinstance(started, (int, float)) else None,
+                        })
+        except Exception as e:
+            logger.debug("Failed to query live subagents for session %s: %s", session_id, e)
+        return active
+
+    def _session_response(self, session: Dict[str, Any]) -> Dict[str, Any]:
         """Return a stable, client-safe session representation."""
         safe_keys = (
             "id", "source", "user_id", "model", "title", "started_at", "ended_at", "end_reason",
@@ -3040,6 +3065,73 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             isinstance(model_config, dict)
             and model_config.get("_delegate_from") is not None
         )
+
+        session_id = str(session.get("id") or "")
+        active_subagents = self._get_active_subagents_for_session(session_id)
+        has_async = False
+        try:
+            from tools.async_delegation import has_live_for_session
+            has_async = has_live_for_session(session_key=session_id, origin_ui_session_id=session_id, parent_session_id=session_id)
+        except Exception as e:
+            logger.debug("Failed to check async delegations for session %s: %s", session_id, e)
+        has_active_subagents = bool(active_subagents or has_async)
+
+        active_run = None
+        if session_id and hasattr(self, "_run_statuses"):
+            for r_id, r_info in list(self._run_statuses.items()):
+                if str(r_info.get("session_id") or "") == session_id and r_info.get("status") in {"queued", "running", "waiting_for_approval"}:
+                    active_run = (r_id, r_info)
+                    break
+        if active_run:
+            r_id, r_info = active_run
+            payload["is_generating"] = True
+            payload["active_run_id"] = r_id
+            payload["tool_status"] = r_info.get("tool_status") or "Ассистент думает над задачей..."
+            payload["current_tool"] = r_info.get("current_tool")
+        else:
+            is_gen = False
+            tool_status = None
+            current_tool = None
+            runner = getattr(self, "gateway_runner", None)
+            if runner:
+                adapters_to_check = list(getattr(runner, "adapters", {}).values())
+                prof_adapters = getattr(runner, "_profile_adapters", {})
+                if isinstance(prof_adapters, dict):
+                    for p_dict in prof_adapters.values():
+                        if isinstance(p_dict, dict):
+                            adapters_to_check.extend(p_dict.values())
+                source_val = str(session.get("source") or "")
+                user_id_val = str(session.get("user_id") or "")
+                for ad in adapters_to_check:
+                    active_sess = getattr(ad, "_active_sessions", {})
+                    if not isinstance(active_sess, dict):
+                        continue
+                    for sk, guard in active_sess.items():
+                        sk_str = str(sk)
+                        if (session_id and session_id in sk_str) or (source_val and source_val in sk_str) or (user_id_val and user_id_val in sk_str):
+                            is_gen = True
+                            tool_status = (getattr(ad, "_last_status", {}) or {}).get(sk) or "Ассистент думает над задачей..."
+                            break
+                    if is_gen:
+                        break
+            if not is_gen and has_active_subagents:
+                is_gen = True
+                if active_subagents and active_subagents[0].get("last_tool"):
+                    tool_status = f"Подзадача выполняет {active_subagents[0]['last_tool']}..."
+                elif active_subagents:
+                    tool_status = f"Выполняются подзадачи ({len(active_subagents)} в работе)..."
+                else:
+                    tool_status = "Выполняется фоновая подзадача..."
+                current_tool = "delegate_task"
+
+            payload["is_generating"] = is_gen
+            payload["active_run_id"] = None
+            payload["tool_status"] = tool_status
+            payload["current_tool"] = current_tool
+
+        payload["has_active_subagents"] = has_active_subagents
+        payload["active_subagents_count"] = len(active_subagents)
+        payload["active_subagents"] = active_subagents
         return payload
 
     @staticmethod
@@ -3672,6 +3764,33 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         def _tool_progress(event_type: str, tool_name: str = None, preview: str = None, args=None, **kwargs) -> None:
             if event_type == "reasoning.available":
                 events.enqueue("tool.progress", {"message_id": message_id, "tool_name": tool_name or "_thinking", "delta": preview or ""})
+                self._set_run_status(run_id, "running", tool_status="Ассистент думает над задачей...", current_tool="_thinking")
+            elif event_type in {"subagent.start", "subagent.tool", "subagent.thinking", "subagent.progress", "subagent.complete"}:
+                subagent_id = kwargs.get("subagent_id")
+                goal = kwargs.get("goal") or preview or ""
+                last_tool = tool_name or kwargs.get("tool_name")
+                
+                events.enqueue(event_type, {
+                    "message_id": message_id,
+                    "subagent_id": subagent_id,
+                    "goal": goal,
+                    "tool_name": last_tool,
+                    "preview": preview,
+                    "status": kwargs.get("status", "running"),
+                    "tool_count": kwargs.get("tool_count", 0),
+                    "depth": kwargs.get("depth", 0),
+                    "args": args,
+                })
+                
+                if event_type == "subagent.start":
+                    friendly_status = f"Подзадача: {goal[:50]}..." if goal else "Запуск подзадачи..."
+                    self._set_run_status(run_id, "running", tool_status=friendly_status, current_tool="delegate_task")
+                elif event_type == "subagent.tool":
+                    friendly_status = f"Подзадача вызывает {last_tool}..." if last_tool else "Подзадача выполняет инструмент..."
+                    self._set_run_status(run_id, "running", tool_status=friendly_status, current_tool=last_tool)
+                elif event_type == "subagent.complete":
+                    friendly_status = "Подзадача завершена"
+                    self._set_run_status(run_id, "running", tool_status=friendly_status, current_tool="delegate_task")
             elif event_type in {"tool.started", "tool.completed", "tool.failed"}:
                 event_name = (
                     "tool.failed"
