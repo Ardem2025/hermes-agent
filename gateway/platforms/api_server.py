@@ -3100,15 +3100,22 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                     for p_dict in prof_adapters.values():
                         if isinstance(p_dict, dict):
                             adapters_to_check.extend(p_dict.values())
-                source_val = str(session.get("source") or "")
-                user_id_val = str(session.get("user_id") or "")
+                chat_id_val = str(session.get("chat_id") or "")
                 for ad in adapters_to_check:
                     active_sess = getattr(ad, "_active_sessions", {})
                     if not isinstance(active_sess, dict):
                         continue
                     for sk, guard in active_sess.items():
                         sk_str = str(sk)
-                        if (session_id and session_id in sk_str) or (source_val and source_val in sk_str) or (user_id_val and user_id_val in sk_str):
+                        is_match = False
+                        if session_id and (sk_str == session_id or sk_str.endswith(f":{session_id}")):
+                            is_match = True
+                        elif chat_id_val and (sk_str == chat_id_val or sk_str.endswith(f":{chat_id_val}")):
+                            is_match = True
+                        elif session.get("gateway_session_key") and sk_str == str(session.get("gateway_session_key")):
+                            is_match = True
+
+                        if is_match:
                             is_gen = True
                             tool_status = (getattr(ad, "_last_status", {}) or {}).get(sk) or "Ассистент думает над задачей..."
                             break
