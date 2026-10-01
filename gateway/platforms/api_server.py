@@ -288,7 +288,7 @@ _REQUEST_OPTION_MISSING = object()
 # vocabulary clamping happens downstream in agent.reasoning_effort.
 _REASONING_EFFORTS = frozenset({"none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"})
 _RUNTIME_AGENT_OVERRIDE_KEYS = (
-    "api_key", "base_url", "provider", "api_mode", "command", "args", "credential_pool")
+    "api_key", "base_url", "provider", "requested_provider", "api_mode", "command", "args", "credential_pool")
 
 
 def _clean_request_string(value: Any) -> Optional[str]:
@@ -352,7 +352,7 @@ def _resolve_request_runtime_agent_kwargs(provider: str, target_model: Optional[
         raise RuntimeError(format_runtime_provider_error(exc)) from exc
 
     return {
-        **{k: runtime.get(k) for k in ("api_key", "base_url", "provider", "api_mode", "command")},
+        **{k: runtime.get(k) for k in ("api_key", "base_url", "provider", "requested_provider", "api_mode", "command")},
         "args": list(runtime.get("args") or []),
         "credential_pool": runtime.get("credential_pool")}
 
@@ -2308,7 +2308,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         route_provider = _clean_request_string(route_cfg.get("provider"))
         session_key = gateway_session_key or session_id
         session_row_model = _clean_request_string(session_model)
-        current_provider = _clean_request_string(runtime_kwargs.get("provider"))
+        current_provider = _clean_request_string(runtime_kwargs.get("requested_provider") or runtime_kwargs.get("provider"))
         session_override = None if confirmed_runtime_lock else self._session_model_override_for(session_key)
         # Model-string precedence (override > session-persisted > global) is owned by
         # hermes_cli.model_switch.resolve_effective_model.
@@ -2317,7 +2317,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             model = resolve_effective_model(session_override, None, model)
             self._apply_provider_runtime(
                 runtime_kwargs,
-                _clean_request_string(session_override.get("provider")) or current_provider,
+                _clean_request_string(session_override.get("requested_provider")) or _clean_request_string(session_override.get("provider")) or current_provider,
                 target_model=model)
             _apply_runtime_agent_overrides(runtime_kwargs, session_override)
             if route or request_model or request_provider:
