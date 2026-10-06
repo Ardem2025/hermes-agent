@@ -506,6 +506,7 @@ class SessionEntry:
     auto_reset_reason: Optional[str] = None
     reset_had_activity: bool = False
     prev_session_id: Optional[str] = None  # feeds the continuity note
+    parent_session_id: Optional[str] = None
     # Explicit /new or /reset triggers topic/channel skill re-injection on the first turn.
     is_fresh_reset: bool = False
     # Historical finalization fence; timers no longer write it.
@@ -551,7 +552,7 @@ class SessionEntry:
     )
     _RESET_FIELDS = (
         "is_fresh_reset", "was_auto_reset", "auto_reset_reason", "reset_had_activity",
-        "prev_session_id",
+        "prev_session_id", "parent_session_id",
     )
 
     def to_dict(self) -> dict[str, Any]:
@@ -1154,6 +1155,44 @@ class SessionStore(
             session_key, end_session_id=old_entry.session_id, end_reason="session_reset",
             create_kwargs=db_create_kwargs, origin=old_entry.origin,
             display_name=new_entry.display_name, during=" during reset",
+        )
+        return new_entry
+
+    def rotate_session_with_continuity(
+        self,
+        session_key: str,
+        parent_session_id: Optional[str] = None,
+        display_name: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Optional[SessionEntry]:
+        """Atomically rotate a session with continuity tracking and parent link."""
+        with self._lock:
+            old_entry = self._entry_locked(session_key)
+            if old_entry is None:
+                return None
+            parent_id = parent_session_id or old_entry.session_id
+            now = _now()
+            session_id = _new_session_id(now)
+            entry_metadata = dict(old_entry.metadata or {})
+            if metadata:
+                entry_metadata.update(metadata)
+            new_entry = self._replace_route_locked(
+                session_key, old_entry, session_id, now,
+                display_name=display_name if display_name is not None else old_entry.display_name,
+                is_fresh_reset=True,
+                prev_session_id=parent_id,
+                parent_session_id=parent_id,
+                metadata=entry_metadata,
+            )
+            db_create_kwargs = self._session_create_kwargs(
+                session_id=session_id, session_key=session_key, origin=old_entry.origin,
+                source_value=old_entry.platform.value if old_entry.platform else "unknown",
+                display_name=old_entry.display_name, parent_session_id=parent_id,
+            )
+        self._finish_route_transition(
+            session_key, end_session_id=old_entry.session_id, end_reason="hygiene_rotation",
+            create_kwargs=db_create_kwargs, origin=old_entry.origin,
+            display_name=new_entry.display_name, during=" during hygiene rotation",
         )
         return new_entry
 
