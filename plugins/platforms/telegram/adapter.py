@@ -819,7 +819,7 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
             getattr(chat, "type", "dm"), is_forum=thread_id_raw is not None and (is_topic_message or is_forum_group))
         thread_id = None
         if thread_id_raw is not None and (
-            (chat_type == "forum" and (is_topic_message or is_forum_group)) or (chat_type == "dm" and is_topic_message)):
+            (chat_type == "forum" and (is_topic_message or is_forum_group)) or (chat_type in ("dm", "private"))):
             thread_id = str(thread_id_raw)
         return SessionSource(
             platform=Platform.TELEGRAM, chat_id=chat_id or "", chat_type=chat_type, user_id=user_id,
@@ -2714,7 +2714,8 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
             text = None
         thread_id = None
         thread_id_raw = getattr(message, "message_thread_id", None)
-        if self._is_id_like(thread_id_raw) and bool(getattr(message, "is_topic_message", False)):
+        chat_type_raw = getattr(chat, "type", "dm")
+        if self._is_id_like(thread_id_raw) and (bool(getattr(message, "is_topic_message", False)) or chat_type_raw in ("private", "dm")):
             thread_id = str(thread_id_raw)[:128]
         edited_at = None
         edit_date = getattr(message, "edit_date", None)
@@ -5426,7 +5427,7 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
         is_group = chat_type in ("group", "supergroup")
         is_forum_group = is_group and getattr(chat, "is_forum", False) is True
         if raw is not None:
-            if is_forum_group or (is_group and is_topic_message) or (chat_type == "private" and is_topic_message):
+            if is_forum_group or (is_group and is_topic_message) or (chat_type in ("private", "dm")):
                 return str(raw)
             return None
         return cls._GENERAL_TOPIC_THREAD_ID if is_forum_group else None

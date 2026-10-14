@@ -586,3 +586,29 @@ def test_unrecovered_group_topic_message_keeps_its_prompt_inputs():
 
     assert (event.source.chat_topic, event.auto_skill, event.channel_prompt) == (
         "Engineering", "software-development", "engineering prompt")
+def test_effective_message_thread_id_for_media_and_edited_in_dm():
+    """Verify that media and edited messages in DM topics retain thread_id even without is_topic_message."""
+    from types import SimpleNamespace
+    adapter = _make_adapter()
+    chat = SimpleNamespace(id=139351986, type="private")
+    
+    # Media message in DM with message_thread_id but is_topic_message is False
+    msg_media = SimpleNamespace(
+        chat=chat,
+        message_id=4001,
+        message_thread_id=374809,
+        is_topic_message=False,
+    )
+    tid = adapter._effective_message_thread_id(msg_media)
+    assert tid == "374809"
+    
+    # Edited message in DM with message_thread_id
+    update_edited = SimpleNamespace(
+        edited_message=msg_media,
+        message_reaction=None,
+    )
+    event = adapter._normalize_message_edited_event(update_edited)
+    assert event is not None
+    assert event["payload"]["thread_id"] == "374809"
+
+
