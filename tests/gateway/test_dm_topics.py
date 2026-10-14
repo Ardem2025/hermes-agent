@@ -496,3 +496,25 @@ def test_effective_message_thread_id_for_media_and_edited_in_dm():
     assert event["payload"]["thread_id"] == "374809"
 
 
+
+
+@pytest.mark.asyncio
+async def test_handle_forum_topic_created_buffers_recent_topic():
+    """BDD-1: Service message forum_topic_created buffers topic creation for opening message routing."""
+    from types import SimpleNamespace
+    adapter = _make_adapter()
+    chat = SimpleNamespace(id=139351986, type="private")
+    forum_topic_created = SimpleNamespace(name="Проаудируй мой личный кабинет")
+    msg = SimpleNamespace(
+        chat=chat,
+        message_id=374815,
+        message_thread_id=374815,
+        forum_topic_created=forum_topic_created,
+    )
+    update = SimpleNamespace(effective_message=msg, effective_chat=chat)
+    await adapter._handle_forum_topic_created(update, None)
+
+    recent = adapter.get_recent_dm_topic_creation("139351986")
+    assert recent is not None
+    assert recent["thread_id"] == "374815"
+    assert recent["name"] == "Проаудируй мой личный кабинет"

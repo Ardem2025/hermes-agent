@@ -175,6 +175,22 @@ class GatewayTopicThreadsMixin:
         inbound = str(source.thread_id or "")
         if inbound and inbound not in self._TELEGRAM_GENERAL_TOPIC_IDS:
             return None
+
+        # Check if a new topic was recently created in this DM chat (Issue #136567 / PR #137348).
+        # A thread-less opening message arriving right after topic creation belongs to that new topic,
+        # not whichever older topic was most recently active.
+        try:
+            adapter_getter = getattr(self, "_adapter_for_source", None)
+            adapter = adapter_getter(source) if callable(adapter_getter) else None
+            if adapter and hasattr(adapter, "get_recent_dm_topic_creation"):
+                recent = adapter.get_recent_dm_topic_creation(str(source.chat_id))
+                if recent and recent.get("thread_id"):
+                    recent_tid = str(recent["thread_id"])
+                    if recent_tid and recent_tid != inbound:
+                        return recent_tid
+        except Exception:
+            logger.debug("topic-recover: recent topic creation check failed", exc_info=True)
+
         session_db = self._sync_session_db()
         if session_db is None:
             return None

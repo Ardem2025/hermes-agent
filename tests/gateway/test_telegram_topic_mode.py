@@ -787,6 +787,55 @@ def test_recover_preserves_unknown_thread_id_for_new_topic(tmp_path):
 
     assert runner._recover_telegram_topic_thread_id(_make_source(thread_id="9999")) is None
 
+def test_recover_routes_to_recent_dm_topic_creation_when_thread_id_is_none(tmp_path):
+    import time
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.enable_telegram_topic_mode(chat_id="208214988", user_id="208214988")
+    db.create_session(session_id="sess-old", source="telegram", user_id="208214988")
+    src_old = _make_source(thread_id="12345")
+    db.bind_telegram_topic(
+        chat_id=src_old.chat_id,
+        thread_id=src_old.thread_id,
+        user_id=src_old.user_id,
+        session_key=build_session_key(src_old),
+        session_id="sess-old",
+    )
+    runner = _make_runner(session_db=db)
+
+    mock_adapter = MagicMock()
+    mock_adapter.get_recent_dm_topic_creation.return_value = {
+        "thread_id": "55555",
+        "name": "New Topic",
+        "created_at": time.time(),
+    }
+    runner._adapter_for_source = MagicMock(return_value=mock_adapter)
+
+    recovered = runner._recover_telegram_topic_thread_id(_make_source(thread_id=None))
+    assert recovered == "55555"
+
+
+def test_recover_fallback_to_binding_when_no_recent_topic_creation(tmp_path):
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.enable_telegram_topic_mode(chat_id="208214988", user_id="208214988")
+    db.create_session(session_id="sess-old", source="telegram", user_id="208214988")
+    src_old = _make_source(thread_id="12345")
+    db.bind_telegram_topic(
+        chat_id=src_old.chat_id,
+        thread_id=src_old.thread_id,
+        user_id=src_old.user_id,
+        session_key=build_session_key(src_old),
+        session_id="sess-old",
+    )
+    runner = _make_runner(session_db=db)
+
+    mock_adapter = MagicMock()
+    mock_adapter.get_recent_dm_topic_creation.return_value = None
+    runner._adapter_for_source = MagicMock(return_value=mock_adapter)
+
+    recovered = runner._recover_telegram_topic_thread_id(_make_source(thread_id=None))
+    assert recovered == "12345"
+
+
 
 
 

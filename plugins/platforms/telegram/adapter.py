@@ -683,6 +683,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
         self._send_path_degraded: bool = False
         self._general_request_drain_lock = asyncio.Lock()
         self._dm_topics: dict[str, int] = {}  # topic_name -> message_thread_id
+        self._recent_dm_topic_creations: dict[str, dict[str, Any]] = {}  # chat_id -> {"thread_id": str, "name": str, "created_at": float}
         self._forum_command_registered: set[int] = set()  # forum chats with commands registered
         self._command_menu_fingerprint: str = ""  # language + menu payload last pushed via set_my_commands
         self._forum_lock = asyncio.Lock()
@@ -2885,10 +2886,65 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
         self._accept_update()
         await super().handle_message(event)
 
+    async def _handle_forum_topic_created(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle forum topic created service messages to register new topic and buffer it for opening message routing."""
+        try:
+            msg = update.effective_message
+            if not msg or not getattr(msg, "forum_topic_created", None):
+                return
+            thread_id = getattr(msg, "message_thread_id", None) or getattr(msg, "message_id", None)
+            chat_id = update.effective_chat.id if update.effective_chat else None
+            topic_name = getattr(msg.forum_topic_created, "name", None)
+            if not thread_id or not chat_id:
+                return
+            str_chat_id = str(chat_id)
+            str_thread_id = str(thread_id)
+            topic_name_str = str(topic_name or "").strip()
+            if topic_name_str:
+                self._cache_dm_topic_from_message(str_chat_id, str_thread_id, topic_name_str)
+            if not hasattr(self, "_recent_dm_topic_creations"):
+                self._recent_dm_topic_creations = {}
+            self._recent_dm_topic_creations[str_chat_id] = {
+                "thread_id": str_thread_id,
+                "name": topic_name_str,
+                "created_at": time.time(),
+            }
+            logger.info(
+                f"[Telegram] Forum topic #{str_thread_id} ('{topic_name_str}') created in chat {str_chat_id}; buffered for opening message routing"
+            )
+        except Exception as e:
+            logger.warning(f"[Telegram] Error handling forum_topic_created: {e}")
+        return
+
+    def get_recent_dm_topic_creation(self, chat_id: str, ttl_seconds: float = 60.0) -> Optional[dict[str, Any]]:
+        """Return recently created DM topic data for chat_id if within ttl_seconds, else None."""
+        creation = getattr(self, "_recent_dm_topic_creations", {}).get(str(chat_id))
+        if not creation:
+            return None
+        created_at = creation.get("created_at", 0)
+        if (time.time() - created_at) > ttl_seconds:
+            self._recent_dm_topic_creations.pop(str(chat_id), None)
+            return None
+        return creation
+
+    def consume_recent_dm_topic_creation(self, chat_id: str, ttl_seconds: float = 60.0) -> Optional[str]:
+        """Return recently created DM topic thread_id within ttl_seconds."""
+        creation = self.get_recent_dm_topic_creation(chat_id, ttl_seconds=ttl_seconds)
+        if not creation:
+            return None
+        return str(creation.get("thread_id") or "")
+
     def _register_handlers(self, app) -> None:
         """Register every PTB handler on ``app`` (initial connect and the transient-init rebuild)."""
         table = getattr(app, "handlers", None)
         core_before = {g: len(hs) for g, hs in table.items()} if isinstance(table, dict) else {}
+                app.add_handler(
+            TelegramMessageHandler(
+                filters.StatusUpdate.FORUM_TOPIC_CREATED,
+                self._handle_forum_topic_created,
+            ),
+            group=0,
+        )
         app.add_handler(TelegramMessageHandler(filters.TEXT & ~filters.COMMAND, self._handle_text_message))
         app.add_handler(TelegramMessageHandler(filters.COMMAND, self._handle_command))
         app.add_handler(TelegramMessageHandler(
