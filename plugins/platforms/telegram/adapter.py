@@ -2938,7 +2938,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
         """Register every PTB handler on ``app`` (initial connect and the transient-init rebuild)."""
         table = getattr(app, "handlers", None)
         core_before = {g: len(hs) for g, hs in table.items()} if isinstance(table, dict) else {}
-                app.add_handler(
+        app.add_handler(
             TelegramMessageHandler(
                 filters.StatusUpdate.FORUM_TOPIC_CREATED,
                 self._handle_forum_topic_created,
