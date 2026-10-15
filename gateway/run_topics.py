@@ -284,6 +284,29 @@ class GatewayTopicThreadsMixin:
         except Exception:
             logger.debug("Failed to send Telegram topic setup image", exc_info=True)
 
+    async def _maybe_mirror_telegram_opening_message(self, source: SessionSource, recovered_thread_id: str) -> None:
+        """Mirror an initiating message sent to General lobby into the newly recovered topic thread."""
+        if not self._is_telegram_dm(source) or not source.chat_id or not source.message_id:
+            return
+        if str(source.thread_id or "") == str(recovered_thread_id or ""):
+            return
+        adapter = self._delivery_adapter_for(source) if hasattr(self, "_delivery_adapter_for") else None
+        bot = getattr(adapter, "_bot", None)
+        if bot is None or not hasattr(bot, "copy_message"):
+            return
+        try:
+            await bot.copy_message(
+                chat_id=int(source.chat_id),
+                from_chat_id=int(source.chat_id),
+                message_id=int(source.message_id),
+                message_thread_id=int(recovered_thread_id),
+            )
+            logger.info("telegram topic: mirrored opening message %s to thread %s in chat %s",
+                        source.message_id, recovered_thread_id, source.chat_id)
+        except Exception:
+            logger.debug("telegram topic: failed to mirror opening message %s to thread %s in chat %s",
+                         source.message_id, recovered_thread_id, source.chat_id, exc_info=True)
+
     # ── title sanitizers ────────────────────────────────────────────────────────────────────
 
     def _sanitize_telegram_topic_title(self, title: str) -> str:

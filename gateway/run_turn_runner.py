@@ -245,6 +245,8 @@ class TurnRunner:
         command; "all"/"new" truncate to one line capped at ``tool_preview_length``. Consecutive
         terminal calls drop the repeated header so back-to-back commands render as adjacent blocks.
         """
+        if self._ctx.progress_mode != "verbose":
+            return None, None
         if not (
             getattr(adapter, "supports_code_blocks", False) and tool_name == "terminal" and isinstance(args, dict)
             and isinstance(args.get("command"), str) and args["command"].strip()
@@ -289,19 +291,27 @@ class TurnRunner:
                         else t("gateway.progress.tool_pending", emoji=emoji, tool=tool_name))
             ctx.progress_queue.put(code)
             return None
-        if code is not None:
-            return code
-        if not preview:
-            return t("gateway.progress.tool_pending", emoji=emoji, tool=tool_name)
-        from agent.display import get_tool_verb, prepare_tool_preview, tool_verb_connector, verb_drops_preview
-        prepared = prepare_tool_preview(tool_name, args, fallback=preview, max_len=self._preview_cap())
-        preview = adapter.format_tool_preview(prepared) if adapter is not None else prepared.text
-        # Friendly labels: human-phrased line for built-in tools ("🔍 Searching the web for ...")
-        # by prefixing the verb onto the computed preview, so the command/url/query is kept.
-        verb = get_tool_verb(tool_name)
-        if not verb:
-            return t("gateway.progress.tool_preview", emoji=emoji, tool=tool_name, preview=preview)
-        return f"{emoji} {verb}" if verb_drops_preview(tool_name) else f"{emoji} {verb}{tool_verb_connector(tool_name)}{preview}"
+
+        tool_map = {
+            "terminal": "⚙️ Выполнение команды",
+            "execute_code": "⚙️ Выполнение команды",
+            "search_files": "🔎 Поиск файлов",
+            "read_file": "📖 Чтение файла",
+            "write_file": "📝 Создание файла",
+            "patch": "✏️ Редактирование файла",
+            "mem0_search": "🧠 Поиск в памяти",
+            "obsidian_search": "🧠 Поиск в базе знаний",
+            "mem0_remember": "🧠 Сохранение в память",
+            "mem0_profile": "👤 Чтение профиля",
+            "web_search": "🌐 Запрос к веб-ресурсу",
+            "web_extract": "🌐 Чтение веб-страницы",
+            "session_search": "🔍 Поиск в истории сессий",
+            "skills_list": "🛠️ Список навыков",
+            "skill_view": "🛠️ Просмотр навыка",
+            "image_generate": "🎨 Генерация изображения",
+            "text_to_speech": "🎙️ Синтез речи",
+        }
+        return tool_map.get(str(tool_name or ""), "⚡ Выполнение действия")
 
     def _progress_emit(self, msg: str) -> None:
         """Dedup consecutive identical lines (execute_code boilerplate), then route to the native

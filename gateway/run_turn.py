@@ -417,6 +417,7 @@ class GatewayTurnMixin:
                 "telegram topic recovery: chat=%s user=%s %r -> %s",
                 source.chat_id, source.user_id, source.thread_id, recovered,
             )
+            await self._maybe_mirror_telegram_opening_message(source, recovered)
             source = dataclasses.replace(source, thread_id=recovered)
             with suppress(Exception):
                 event.source = source
