@@ -290,7 +290,20 @@ class GatewayTopicThreadsMixin:
             return
         if str(source.thread_id or "") == str(recovered_thread_id or ""):
             return
-        adapter = self._delivery_adapter_for(source) if hasattr(self, "_delivery_adapter_for") else None
+        adapter = None
+        adapter_getter = getattr(self, "_adapter_for_source", None)
+        if callable(adapter_getter):
+            adapter = adapter_getter(source)
+        if adapter is None and hasattr(self, "_delivery_adapter_for") and callable(self._delivery_adapter_for):
+            adapter = self._delivery_adapter_for(source)
+        if adapter is None and hasattr(self, "_intake_adapter_for") and callable(self._intake_adapter_for):
+            adapter = self._intake_adapter_for(source)
+        if adapter is None and hasattr(self, "adapters") and isinstance(self.adapters, dict):
+            for k, ad in self.adapters.items():
+                k_val = getattr(k, "value", k)
+                if (k == source.platform or k_val == "telegram" or getattr(ad, "name", "").lower() == "telegram") and getattr(ad, "_bot", None) is not None:
+                    adapter = ad
+                    break
         bot = getattr(adapter, "_bot", None)
         if bot is None or not hasattr(bot, "copy_message"):
             return
@@ -303,9 +316,9 @@ class GatewayTopicThreadsMixin:
             )
             logger.info("telegram topic: mirrored opening message %s to thread %s in chat %s",
                         source.message_id, recovered_thread_id, source.chat_id)
-        except Exception:
-            logger.debug("telegram topic: failed to mirror opening message %s to thread %s in chat %s",
-                         source.message_id, recovered_thread_id, source.chat_id, exc_info=True)
+        except Exception as exc:
+            logger.warning("telegram topic: failed to mirror opening message %s to thread %s in chat %s: %s",
+                           source.message_id, recovered_thread_id, source.chat_id, exc)
 
     # ── title sanitizers ────────────────────────────────────────────────────────────────────
 
