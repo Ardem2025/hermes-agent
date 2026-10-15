@@ -702,8 +702,11 @@ class GatewayNotificationsMixin(GatewayNotificationOwnershipMixin):
                 for field in ("user_id", "scope_id"):
                     if data.get(field):
                         metadata[field] = str(data[field])
+            restart_msg = t("gateway.startup.restarted")
+            if not restart_msg or "Hermes" in restart_msg or "Шлюз" in restart_msg:
+                restart_msg = "♻️ Система ассистента успешно перезапущена. Ваш диалог продолжается."
             result = await transport.send(
-                platform, str(chat_id), t("gateway.startup.restarted"),
+                platform, str(chat_id), restart_msg,
                 metadata=_non_conversational_metadata(metadata, platform=platform),
             )
             # adapter.send() catches provider errors (e.g. "Chat not found") and returns
@@ -841,6 +844,8 @@ class GatewayNotificationsMixin(GatewayNotificationOwnershipMixin):
         delivered: set[tuple[str, str, Optional[str]]] = set()
         skipped = skip_targets or set()
         message = t("gateway.startup.online")
+        if not message or "Hermes" in message or "Шлюз" in message:
+            message = "♻️ Ассистент в сети и готов к работе."
         targets = list(self._served_home_channel_transports())
         # A chat already notified for ANOTHER profile is not notified again.
         notified_chats = {

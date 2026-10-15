@@ -1025,7 +1025,9 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
         Called at the start of stop() while adapters are connected; send failures never block shutdown.
         """
         restart_source = self._restart_command_source if self._restart_requested else None
-        msg = t("gateway.shutdown.notice_restart" if self._restart_requested else "gateway.shutdown.notice_shutdown")
+        msg = "♻️ Система ассистента выключается для технических работ. Вы можете продолжить работу через несколько минут."
+        if self._restart_requested:
+            msg = "Внимание! Для активации новых функций и/или обслуживания система перезапустила ассистента. Вы можете продолжать работу."
         restart_key = None
         if restart_source is not None:
             with suppress(Exception):
