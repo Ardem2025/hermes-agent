@@ -1,0 +1,5 @@
+name: secretary
+version: 1.1.0
+description: Telegram Business AI-Secretary helper with Prompt Leak Guard, Click-to-Send inline keyboards, dynamic Obsidian subpaths and SQLite chronicle logging.
+author: Nous Research / Antigravity
+entry_point: __init__:register
