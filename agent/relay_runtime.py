@@ -343,7 +343,10 @@ class _ProcessRelayPluginConfiguration:
         """Initialize Relay and report whether the resolved configuration needs managed execution."""
         config_path = _configured_plugin_inputs()
         # An explicit file replaces Relay's user file; its system file always remains above either source.
-        activation = _resolve_plugin_awaitable(relay.plugin.initialize({}, additional_plugins_toml=config_path))
+        try:
+            activation = _resolve_plugin_awaitable(relay.plugin.initialize({}, additional_plugins_toml=config_path))
+        except TypeError:
+            activation = _resolve_plugin_awaitable(relay.plugin.initialize({}))
         if activation is None:
             raise RuntimeError("NeMo Relay plugin initialization returned no activation handle")
         self._activation = activation
@@ -1385,7 +1388,10 @@ def resolve_plugin_sources(relay: Any = None) -> RelayPluginSources:
     Raises when a file cannot be read or parsed.
     """
     relay = relay or _load_nemo_relay()
-    report = relay.plugin.validate({}, additional_plugins_toml=_explicit_plugins_toml())
+    try:
+        report = relay.plugin.validate({}, additional_plugins_toml=_explicit_plugins_toml())
+    except TypeError:
+        report = relay.plugin.validate({})
     diagnostics = [d for d in (report.get("config") or {}).get("diagnostics") or [] if isinstance(d, dict)]
     return RelayPluginSources(
         config_paths=tuple(str(path) for path in report.get("config_paths") or []),

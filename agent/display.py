@@ -523,6 +523,25 @@ _TOOL_VERB_TOOLS: frozenset[str] = frozenset({
     "memory", "todo_list",
 })
 
+_TOOL_VERBS_RU: dict[str, str] = {
+    "web_search": "Поиск в сети", "web_extract": "Чтение страницы",
+    "browser_navigate": "Браузер", "browser_click": "Браузер", "browser_type": "Браузер",
+    "read_file": "Чтение файла", "write_file": "Создание файла", "patch": "Редактирование файла",
+    "search_files": "Поиск файлов", "terminal": "Выполнение команды", "execute_code": "Выполнение скрипта",
+    "image_generate": "Генерация изображения", "video_generate": "Генерация видео",
+    "text_to_speech": "Синтез речи", "vision_analyze": "Анализ изображения",
+    "session_search": "Поиск по истории",
+    "skill_view": "Работа со скиллами", "skills_list": "Список скиллов", "skill_manage": "Обновление скилла",
+    "delegate_task": "Делегирование задачи", "cronjob_manage": "Планирование задачи", "clarify": "Уточнение вопроса",
+    "memory": "Обновление памяти", "todo_list": "Работа с задачами",
+    "obsidian_search": "Поиск в базе знаний", "mem0_search": "Поиск в памяти",
+    "mem0_remember": "Запоминание факта", "mem0_profile": "Чтение профиля",
+}
+_TOOL_VERBS_RU_NO_PREVIEW: frozenset[str] = frozenset({
+    "skills_list", "session_search", "terminal", "execute_code",
+    "image_generate", "video_generate", "text_to_speech", "mem0_profile"
+})
+
 
 def _tool_verb(tool_name: str) -> str | None:
     return t(f"display.verb.{tool_name}") if tool_name in _TOOL_VERB_TOOLS else None
@@ -567,17 +586,24 @@ def tool_row_emoji(tool_name: str, args: dict | None = None, default: str = "⚡
 def get_tool_verb(tool_name: str) -> str | None:
     """Friendly verb for a built-in tool, or None (labels disabled / no curated verb);
     callers compose ``f"{verb}{tool_verb_connector(tool)}{preview}"`` themselves."""
-    return _tool_verb(tool_name) if _friendly_tool_labels else None
+    if not _friendly_tool_labels:
+        return None
+    ru = _TOOL_VERBS_RU.get(tool_name)
+    if ru:
+        return ru
+    return _tool_verb(tool_name)
 
 
 def tool_verb_connector(tool_name: str) -> str:
     """Return the connector between a verb and its preview (" for " or " ")."""
+    if tool_name in _TOOL_VERBS_RU:
+        return ": "
     return t("display.verb_connector.search" if tool_name in _TOOL_VERBS_FOR_CONNECTOR else "display.verb_connector.default")
 
 
 def verb_drops_preview(tool_name: str) -> bool:
     """Whether the verb should render alone, without the argument preview."""
-    return tool_name in _TOOL_VERBS_NO_PREVIEW
+    return tool_name in _TOOL_VERBS_NO_PREVIEW or tool_name in _TOOL_VERBS_RU_NO_PREVIEW
 
 
 def build_status_phrase(tool_name: str, args: dict | None, max_len: int = 49) -> str | None:

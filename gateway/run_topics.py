@@ -180,11 +180,22 @@ class GatewayTopicThreadsMixin:
         # A thread-less opening message arriving right after topic creation belongs to that new topic,
         # not whichever older topic was most recently active.
         try:
+            adapter = None
             adapter_getter = getattr(self, "_adapter_for_source", None)
-            adapter = adapter_getter(source) if callable(adapter_getter) else None
+            if callable(adapter_getter):
+                adapter = adapter_getter(source)
+            if adapter is None and hasattr(self, "_delivery_adapter_for") and callable(self._delivery_adapter_for):
+                adapter = self._delivery_adapter_for(source)
+            if adapter is None and hasattr(self, "_intake_adapter_for") and callable(self._intake_adapter_for):
+                adapter = self._intake_adapter_for(source)
+            if adapter is None and hasattr(self, "adapters") and isinstance(self.adapters, dict):
+                for ad in self.adapters.values():
+                    if hasattr(ad, "get_recent_dm_topic_creation"):
+                        adapter = ad
+                        break
             if adapter and hasattr(adapter, "get_recent_dm_topic_creation"):
                 recent = adapter.get_recent_dm_topic_creation(str(source.chat_id))
-                if recent and recent.get("thread_id"):
+                if isinstance(recent, dict) and recent.get("thread_id"):
                     recent_tid = str(recent["thread_id"])
                     if recent_tid and recent_tid != inbound:
                         return recent_tid

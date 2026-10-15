@@ -1739,6 +1739,9 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             ("PATCH", "/api/sessions/{session_id}", self._handle_patch_session),
             ("DELETE", "/api/sessions/{session_id}", self._handle_delete_session),
             ("GET", "/api/sessions/{session_id}/messages", self._handle_session_messages),
+            ("GET", "/api/sessions/{session_id}/telegram-binding", self._handle_get_telegram_binding),
+            ("POST", "/api/sessions/{session_id}/telegram-binding", self._handle_post_telegram_binding),
+            ("DELETE", "/api/sessions/{session_id}/telegram-binding", self._handle_delete_telegram_binding),
             ("POST", "/api/sessions/{session_id}/fork", self._handle_fork_session),
             ("POST", "/api/sessions/{session_id}/chat", self._handle_session_chat),
             ("POST", "/api/sessions/{session_id}/chat/stream", self._handle_session_chat_stream),
@@ -3301,6 +3304,226 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 "limit": limit, "offset": offset,
                 "order": order or ("latest" if default_page else "oldest"),
                 "returned": len(messages)}})
+
+    # -- Telegram topic binding helpers -----------------------------------------------
+
+    def _telegram_runner_and_adapter(self) -> tuple[Optional[Any], Optional[Any]]:
+        """Return the live gateway runner and Telegram adapter, if available."""
+        try:
+            from gateway.run import _gateway_runner_ref
+            runner = _gateway_runner_ref()
+            telegram = runner.adapters.get(Platform.TELEGRAM) if runner and hasattr(runner, "adapters") else None
+            return runner, telegram
+        except Exception:
+            logger.debug("Telegram gateway lookup failed", exc_info=True)
+            return None, None
+
+    @staticmethod
+    def _telegram_topic_link(chat_id: str, thread_id: str) -> Optional[str]:
+        """Return Telegram's stable forum-topic URL when the chat id permits it."""
+        chat = str(chat_id)
+        if chat.startswith("-100") and len(chat) > 4:
+            return f"https://t.me/c/{chat[4:]}/{thread_id}"
+        return None
+
+    @staticmethod
+    def _telegram_binding_response(
+        session_id: str,
+        binding: Optional[dict[str, Any]],
+        *,
+        delivery: Optional[dict[str, Any]] = None,
+        ended: bool = False,
+        end_reason: Optional[str] = None,
+        rebound_to_session_id: Optional[str] = None,
+        fallback_thread_id: Optional[str] = None,
+        fallback_chat_id: Optional[str] = None,
+    ) -> dict[str, Any]:
+        bound = bool(binding)
+        chat_id = str(binding.get("chat_id")) if bound else (str(fallback_chat_id) if fallback_chat_id else None)
+        thread_id = str(binding.get("thread_id")) if bound else (str(fallback_thread_id) if fallback_thread_id else None)
+        return {
+            "object": "hermes.telegram_binding",
+            "bound": bound,
+            "ended": ended,
+            "end_reason": end_reason,
+            "rebound_to_session_id": rebound_to_session_id,
+            "session_id": session_id,
+            "chat_id": chat_id,
+            "thread_id": thread_id,
+            "link": APIServerAdapter._telegram_topic_link(chat_id, thread_id) if chat_id and thread_id else None,
+            "topic_url": APIServerAdapter._telegram_topic_link(chat_id, thread_id) if chat_id and thread_id else None,
+            "delivery_enabled": bool(binding.get("delivery_enabled", True)) if bound else False,
+            "last_synced_message_id": binding.get("last_synced_message_id") if bound else None,
+            "future_duplication": {
+                "persistent": True,
+                "enabled": bool(binding.get("delivery_enabled", True)) if bound else False,
+                "default": "binding_delivery_enabled",
+                "request_field": "duplicate_to_telegram",
+                "request_override": True,
+            },
+            "backfill": delivery or {"mode": "incremental", "status": "not_requested", "sent": 0, "failed": 0, "skipped": 0},
+        }
+
+    @_require_auth
+    async def _handle_get_telegram_binding(self, request: web.Request) -> web.Response:
+        """GET /api/sessions/{session_id}/telegram-binding — current topic binding."""
+        session_id = request.match_info["session_id"]
+        existing_sess, err = await self._get_existing_session_or_404(session_id)
+        if err:
+            return err
+        db = await self._ensure_session_db_async()
+        if db is None:
+            return self._session_db_unavailable()
+        try:
+            binding = await asyncio.to_thread(db.get_telegram_topic_binding_by_session, session_id=session_id)
+            sess_dict = existing_sess if isinstance(existing_sess, dict) else {}
+            is_ended = bool(sess_dict.get("ended_at") or sess_dict.get("end_reason"))
+            end_reason = sess_dict.get("end_reason")
+            sess_thread = str(sess_dict.get("thread_id") or "").strip()
+            if not sess_thread:
+                origin_raw = sess_dict.get("origin_json") or ""
+                if isinstance(origin_raw, str) and origin_raw.startswith("{"):
+                    try:
+                        import json as _json
+                        origin_data = _json.loads(origin_raw)
+                        sess_thread = str(origin_data.get("thread_id") or "").strip()
+                    except Exception:
+                        pass
+            chat_id = str(sess_dict.get("user_id") or getattr(self, "home_chat_id", "") or "139351986").strip()
+
+            if is_ended:
+                rebound_to_sid = None
+                if sess_thread and hasattr(db, "get_telegram_topic_binding"):
+                    try:
+                        curr_b = await asyncio.to_thread(db.get_telegram_topic_binding, chat_id=chat_id, thread_id=sess_thread)
+                        if curr_b and curr_b.get("session_id") != session_id:
+                            rebound_to_sid = curr_b.get("session_id")
+                    except Exception:
+                        pass
+                return web.json_response(self._telegram_binding_response(
+                    session_id,
+                    binding,
+                    ended=True,
+                    end_reason=end_reason,
+                    rebound_to_session_id=rebound_to_sid,
+                    fallback_thread_id=sess_thread or None,
+                    fallback_chat_id=chat_id or None,
+                ))
+
+            if not binding:
+                if sess_thread and hasattr(db, "bind_telegram_topic"):
+                    try:
+                        uid = chat_id
+                        runner, _ = self._telegram_runner_and_adapter()
+                        from gateway.session import SessionSource, build_session_key
+                        source = SessionSource(Platform.TELEGRAM, chat_id, chat_type="dm", user_id=uid, thread_id=sess_thread)
+                        session_key = runner._session_key_for_source(source) if runner and hasattr(runner, "_session_key_for_source") else build_session_key(source)
+                        await asyncio.to_thread(
+                            db.bind_telegram_topic,
+                            chat_id=chat_id,
+                            thread_id=sess_thread,
+                            user_id=uid,
+                            session_key=session_key,
+                            session_id=session_id,
+                            managed_mode="auto",
+                            delivery_enabled=True,
+                        )
+                        resolved_id = db.resolve_resume_session_id(session_id) if hasattr(db, "resolve_resume_session_id") else session_id
+                        raw_messages = await asyncio.to_thread(db.get_messages, resolved_id) if hasattr(db, "get_messages") else []
+                        max_id = max((m.get("id") for m in raw_messages if isinstance(m.get("id"), int)), default=None)
+                        if max_id is not None and hasattr(db, "advance_telegram_topic_sync_checkpoint"):
+                            await asyncio.to_thread(db.advance_telegram_topic_sync_checkpoint, session_id=session_id, message_id=max_id)
+                        binding = await asyncio.to_thread(db.get_telegram_topic_binding_by_session, session_id=session_id)
+                        logger.info("[WebUI] Auto-recovered topic binding for session %s to thread %s (checkpoint=%s)", session_id, sess_thread, max_id)
+                    except Exception as recover_err:
+                        logger.warning("[WebUI] Auto-recovery of binding failed for %s: %s", session_id, recover_err)
+        except Exception:
+            logger.exception("Failed to read Telegram binding for %s", session_id)
+            return web.json_response(_openai_error("Telegram binding lookup failed", code="telegram_binding_failed"), status=503)
+        return web.json_response(self._telegram_binding_response(session_id, binding, ended=is_ended, end_reason=end_reason))
+
+    @_require_auth
+    async def _handle_post_telegram_binding(self, request: web.Request) -> web.Response:
+        """POST /api/sessions/{session_id}/telegram-binding."""
+        try:
+            session_id = request.match_info["session_id"]
+            session, err = await self._get_existing_session_or_404(session_id)
+            if err:
+                return err
+            body, err = await self._read_json_body(request)
+            if err:
+                return err
+            chat_id = str(body.get("chat_id") or session.get("user_id") or session.get("chat_id") or getattr(self, "home_chat_id", "") or "139351986").strip()
+            thread_id = str(body.get("thread_id") or "").strip()
+            topic_name = str(body.get("topic_name") or session.get("title") or f"Hermes {session_id[:24]}").strip()
+            delivery_enabled = bool(body.get("delivery_enabled", True))
+            db = await self._ensure_session_db_async()
+            if db is None:
+                return self._session_db_unavailable()
+            if hasattr(db, "apply_telegram_topic_migration"):
+                await asyncio.to_thread(db.apply_telegram_topic_migration)
+            existing = await asyncio.to_thread(db.get_telegram_topic_binding_by_session, session_id=session_id)
+            if existing:
+                if chat_id and chat_id != str(existing.get("chat_id")):
+                    return web.json_response(_openai_error("Session is already bound to another Telegram chat", code="telegram_binding_conflict"), status=409)
+                if thread_id and thread_id != str(existing.get("thread_id")):
+                    return web.json_response(_openai_error("Session is already bound to another Telegram topic", code="telegram_binding_conflict"), status=409)
+                if "delivery_enabled" in body and hasattr(db, "set_telegram_topic_delivery_enabled"):
+                    await asyncio.to_thread(db.set_telegram_topic_delivery_enabled, session_id=session_id, delivery_enabled=delivery_enabled)
+                    existing = await asyncio.to_thread(db.get_telegram_topic_binding_by_session, session_id=session_id)
+                return web.json_response(self._telegram_binding_response(session_id, existing))
+            if not chat_id:
+                return web.json_response(_openai_error("chat_id is required", code="missing_chat_id"), status=400)
+            runner, telegram = self._telegram_runner_and_adapter()
+            if not thread_id:
+                sess_thread = str(session.get("thread_id") or "").strip()
+                if sess_thread:
+                    thread_id = sess_thread
+                elif telegram:
+                    create_topic = getattr(telegram, "create_handoff_thread", None)
+                    if callable(create_topic):
+                        try:
+                            thread_id = str(await create_topic(chat_id, topic_name) or "")
+                        except Exception as exc:
+                            logger.exception("Failed creating Telegram topic for session %s", session_id)
+                            return web.json_response(_openai_error(f"Failed to create Telegram topic: {exc}", code="telegram_topic_create_failed"), status=502)
+            if not thread_id:
+                return web.json_response(_openai_error("Telegram did not create a topic", code="telegram_topic_create_failed"), status=502)
+            from gateway.session import SessionSource, build_session_key
+            source = SessionSource(Platform.TELEGRAM, chat_id, chat_type="dm", user_id=str(body.get("user_id") or chat_id), thread_id=thread_id)
+            session_key = runner._session_key_for_source(source) if runner and hasattr(runner, "_session_key_for_source") else build_session_key(source)
+            if hasattr(db, "bind_telegram_topic"):
+                await asyncio.to_thread(
+                    db.bind_telegram_topic,
+                    chat_id=chat_id, thread_id=thread_id, user_id=source.user_id or "",
+                    session_key=session_key, session_id=session_id, managed_mode="api", delivery_enabled=delivery_enabled
+                )
+            binding = await asyncio.to_thread(db.get_telegram_topic_binding_by_session, session_id=session_id)
+            return web.json_response(self._telegram_binding_response(session_id, binding), status=201)
+        except Exception as e:
+            logger.exception("Error in telegram binding: %s", e)
+            return web.json_response(_openai_error(f"Error in telegram binding: {e}", code="telegram_binding_failed"), status=500)
+
+    @_require_auth
+    async def _handle_delete_telegram_binding(self, request: web.Request) -> web.Response:
+        """DELETE /api/sessions/{session_id}/telegram-binding."""
+        session_id = request.match_info["session_id"]
+        _, err = await self._get_existing_session_or_404(session_id)
+        if err:
+            return err
+        db = await self._ensure_session_db_async()
+        if db is None:
+            return self._session_db_unavailable()
+        binding = await asyncio.to_thread(db.get_telegram_topic_binding_by_session, session_id=session_id)
+        if binding and hasattr(db, "unbind_telegram_topic"):
+            try:
+                await asyncio.to_thread(db.unbind_telegram_topic, chat_id=str(binding["chat_id"]), thread_id=str(binding["thread_id"]))
+            except Exception:
+                logger.exception("Failed to remove Telegram binding for %s", session_id)
+                return web.json_response(_openai_error("Failed to remove Telegram binding", code="telegram_binding_failed"), status=503)
+        payload = self._telegram_binding_response(session_id, None)
+        payload["deleted"] = bool(binding)
+        return web.json_response(payload)
 
     @_require_auth
     async def _handle_fork_session(self, request: web.Request) -> web.Response:
