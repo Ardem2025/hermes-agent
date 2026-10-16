@@ -2385,6 +2385,11 @@ class BasePlatformAdapter(ABC):
             return
         try:
             from gateway.session_identity import replace_source
+            if getattr(event, "metadata", None) is None:
+                event.metadata = {}
+            if "_telegram_recovered_thread_id" not in event.metadata:
+                event.metadata["_telegram_recovered_thread_id"] = str(recovered)
+                event.metadata["_telegram_original_thread_id"] = str(source.thread_id or "")
             event.source = replace_source(source, thread_id=str(recovered))  # keeps the pinned identity
         except Exception:
             logger.debug("topic recovery rewrite failed", exc_info=True)

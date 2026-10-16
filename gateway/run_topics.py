@@ -58,7 +58,8 @@ class GatewayTopicThreadsMixin:
 
     @staticmethod
     def _is_telegram_dm(source: SessionSource) -> bool:
-        return source.platform == Platform.TELEGRAM and source.chat_type == "dm"
+        plat = getattr(source.platform, "value", source.platform)
+        return (plat == "telegram" or source.platform == Platform.TELEGRAM) and source.chat_type == "dm"
 
     def _telegram_topic_mode_enabled(self, source: SessionSource) -> bool:
         """Return whether Telegram DM topic mode is active for this chat."""
@@ -284,11 +285,17 @@ class GatewayTopicThreadsMixin:
         except Exception:
             logger.debug("Failed to send Telegram topic setup image", exc_info=True)
 
-    async def _maybe_mirror_telegram_opening_message(self, source: SessionSource, recovered_thread_id: str) -> None:
+    async def _maybe_mirror_telegram_opening_message(
+        self, source: SessionSource, recovered_thread_id: str,
+        original_thread_id: Optional[str] = None, event: Optional[Any] = None
+    ) -> None:
         """Mirror an initiating message sent to General lobby into the newly recovered topic thread."""
         if not self._is_telegram_dm(source) or not source.chat_id or not source.message_id:
             return
-        if str(source.thread_id or "") == str(recovered_thread_id or ""):
+        if event is not None and getattr(event, "metadata", None) and event.metadata.get("_telegram_opening_mirrored"):
+            return
+        orig = str(original_thread_id if original_thread_id is not None else (source.thread_id or ""))
+        if orig == str(recovered_thread_id or ""):
             return
         adapter = None
         adapter_getter = getattr(self, "_adapter_for_source", None)
@@ -314,6 +321,8 @@ class GatewayTopicThreadsMixin:
                 message_id=int(source.message_id),
                 message_thread_id=int(recovered_thread_id),
             )
+            if event is not None and getattr(event, "metadata", None) is not None:
+                event.metadata["_telegram_opening_mirrored"] = True
             logger.info("telegram topic: mirrored opening message %s to thread %s in chat %s",
                         source.message_id, recovered_thread_id, source.chat_id)
         except Exception as exc:

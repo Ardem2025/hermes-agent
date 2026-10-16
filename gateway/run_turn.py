@@ -412,12 +412,18 @@ class GatewayTurnMixin:
         expected_session_key = str(event_metadata.get("gateway_session_key") or "").strip()
         recovered = (await asyncio.to_thread(self._recover_telegram_topic_thread_id, source)
                      if not expected_session_key else None)
+        original_thread_id = None
+        if recovered is None and not expected_session_key and event_metadata.get("_telegram_recovered_thread_id"):
+            recovered = str(event_metadata["_telegram_recovered_thread_id"])
+            original_thread_id = str(event_metadata.get("_telegram_original_thread_id", ""))
         if recovered is not None:
             logger.info(
                 "telegram topic recovery: chat=%s user=%s %r -> %s",
                 source.chat_id, source.user_id, source.thread_id, recovered,
             )
-            await self._maybe_mirror_telegram_opening_message(source, recovered)
+            await self._maybe_mirror_telegram_opening_message(
+                source, recovered, original_thread_id=original_thread_id, event=event
+            )
             source = dataclasses.replace(source, thread_id=recovered)
             with suppress(Exception):
                 event.source = source

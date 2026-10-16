@@ -877,6 +877,64 @@ def test_get_telegram_topic_binding_by_session_returns_binding(tmp_path):
     assert binding["session_id"] == "sess-27166"
 
 
+@pytest.mark.asyncio
+async def test_opening_message_mirrored_when_topic_recovered_upstream():
+    """Verify that if _apply_topic_recovery rewrites event.source.thread_id upstream,
+    _hmwa_resolve_session still triggers _maybe_mirror_telegram_opening_message."""
+    from unittest.mock import AsyncMock, MagicMock
+    from gateway.session import SessionSource
+    from gateway.platforms.base import MessageEvent, Platform
+    from gateway.run_topics import GatewayTopicThreadsMixin
+    from gateway.run_turn import GatewayTurnMixin
+
+    class TestRunner(GatewayTopicThreadsMixin, GatewayTurnMixin):
+        def __init__(self):
+            self.adapters = {}
+            self._session_db = None
+            self.async_session_store = MagicMock()
+            self.async_session_store.get_or_create_session = AsyncMock()
+            self.session_store = MagicMock()
+            self._session_tasks = {}
+            self._active_sessions = {}
+            self._cache_session_source = MagicMock()
+            self._sync_telegram_topic_binding = MagicMock()
+            self._TELEGRAM_GENERAL_TOPIC_IDS = frozenset({"", "1"})
+        def _is_telegram_dm(self, source):
+            return True
+        def _telegram_topic_mode_enabled(self, source):
+            return True
+        def _session_key_for_source(self, source):
+            return "agent:main:telegram:dm:123:456"
+        def _recover_telegram_topic_thread_id(self, source):
+            if str(source.thread_id or "") == "456":
+                return None
+            return "456"
+
+    runner = TestRunner()
+    runner._maybe_mirror_telegram_opening_message = AsyncMock()
+
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="123",
+        chat_type="dm",
+        user_id="123",
+        thread_id="456",
+        message_id="999",
+    )
+    event = MagicMock(spec=MessageEvent)
+    event.metadata = {
+        "_telegram_recovered_thread_id": "456",
+        "_telegram_original_thread_id": "",
+    }
+    event.source = source
+
+    await runner._hmwa_resolve_session(event, source)
+
+    runner._maybe_mirror_telegram_opening_message.assert_awaited_once_with(
+        source, "456", original_thread_id="", event=event
+    )
+
+
 # ---------------------------------------------------------------------------
 # Test for session-split thread_id recovery (issue #27166)
 # ---------------------------------------------------------------------------
