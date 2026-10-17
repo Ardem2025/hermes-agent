@@ -47,7 +47,7 @@ _TOPIC_TABLES = (
     ),
     (
         "telegram_dm_topic_bindings",
-        "profile_name, chat_id, thread_id, user_id, session_key, session_id, managed_mode, linked_at, updated_at",
+        "profile_name, chat_id, thread_id, user_id, session_key, session_id, managed_mode, delivery_enabled, last_synced_message_id, role_id, prompt_revision, reply_anchor_message_id, linked_at, updated_at",
         """
                     profile_name TEXT NOT NULL DEFAULT 'default',
                     chat_id TEXT NOT NULL,
@@ -56,10 +56,15 @@ _TOPIC_TABLES = (
                     session_key TEXT NOT NULL,
                     session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
                     managed_mode TEXT NOT NULL DEFAULT 'auto',
+                    delivery_enabled INTEGER NOT NULL DEFAULT 1,
+                    last_synced_message_id INTEGER,
+                    role_id TEXT,
+                    prompt_revision INTEGER,
+                    reply_anchor_message_id INTEGER,
                     linked_at REAL NOT NULL,
                     updated_at REAL NOT NULL,
                     PRIMARY KEY (profile_name, chat_id, thread_id)
-                """,
+        """,
     ),
 )
 
@@ -130,21 +135,32 @@ class SessionTelegramTopicsMixin:
             for table, columns, ddl in _TOPIC_TABLES:
                 conn.execute(f"CREATE TABLE IF NOT EXISTS {table} ({ddl})")
                 have = {row[1] for row in conn.execute(f"PRAGMA table_info('{table}')")}
-                if "profile_name" in have:
-                    continue
-                # v1/v2 → v3. SQLite can't ALTER a PK or FK, so rebuild (also supplies v2's
-                # ON DELETE CASCADE); _rebuild_table runs inside the open BEGIN IMMEDIATE so a crash
-                # rolls back instead of stranding rows (#42004). A {table}_new left by an older
-                # build's executescript crash is dropped first; its legacy table is still intact.
-                # v1 bindings had no ON DELETE CASCADE, so pruned sessions left orphan rows that
-                # the v3 FK (foreign_keys=ON on the writer) would reject — copy only live ones.
-                legacy_columns = columns.replace("profile_name, ", "", 1)
-                live = " WHERE EXISTS (SELECT 1 FROM sessions s WHERE s.id = session_id)" if "session_id" in columns else ""
-                conn.execute(f"DROP TABLE IF EXISTS {table}_new")
-                self._rebuild_table(
-                    conn.cursor(), table, f"{table}_legacy", f"CREATE TABLE {table} ({ddl})",
-                    f"INSERT INTO {table} ({columns}) SELECT 'default', {legacy_columns} FROM {table}_legacy{live}",
-                )
+                if "profile_name" not in have:
+                    # v1/v2 → v3. SQLite can't ALTER a PK or FK, so rebuild (also supplies v2's
+                    # ON DELETE CASCADE); _rebuild_table runs inside the open BEGIN IMMEDIATE so a crash
+                    # rolls back instead of stranding rows (#42004). A {table}_new left by an older
+                    # build's executescript crash is dropped first; its legacy table is still intact.
+                    # v1 bindings had no ON DELETE CASCADE, so pruned sessions left orphan rows that
+                    # the v3 FK (foreign_keys=ON on the writer) would reject — copy only live ones.
+                    legacy_columns = columns.replace("profile_name, ", "", 1)
+                    live = " WHERE EXISTS (SELECT 1 FROM sessions s WHERE s.id = session_id)" if "session_id" in columns else ""
+                    conn.execute(f"DROP TABLE IF EXISTS {table}_new")
+                    self._rebuild_table(
+                        conn.cursor(), table, f"{table}_legacy", f"CREATE TABLE {table} ({ddl})",
+                        f"INSERT INTO {table} ({columns}) SELECT 'default', {legacy_columns} FROM {table}_legacy{live}",
+                    )
+                if table == "telegram_dm_topic_bindings":
+                    have = {row[1] for row in conn.execute(f"PRAGMA table_info('{table}')")}
+                    for col_name, col_type in (
+                        ("delivery_enabled", "INTEGER NOT NULL DEFAULT 1"),
+                        ("last_synced_message_id", "INTEGER"),
+                        ("role_id", "TEXT"),
+                        ("prompt_revision", "INTEGER"),
+                        ("reply_anchor_message_id", "INTEGER"),
+                    ):
+                        if col_name not in have:
+                            with contextlib.suppress(sqlite3.OperationalError):
+                                conn.execute(f"ALTER TABLE telegram_dm_topic_bindings ADD COLUMN {col_name} {col_type}")
             # Indexes after any rebuild: the user index needs profile_name.
             conn.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS idx_telegram_dm_topic_bindings_session "
@@ -304,6 +320,7 @@ class SessionTelegramTopicsMixin:
     def bind_telegram_topic(
         self, *, chat_id: str, thread_id: str, user_id: str, session_key: str,
         session_id: str, managed_mode: str = "auto", profile_name: str = "default",
+        delivery_enabled: bool = True,
     ) -> None:
         """Bind one Telegram DM topic thread to one Hermes session. A session may be linked to
         only one topic: rebinding the same pair is idempotent; linking the session to a
@@ -324,19 +341,81 @@ class SessionTelegramTopicsMixin:
                 linked_profile, linked_chat, linked_thread = existing_session
                 if (str(linked_profile), str(linked_chat), str(linked_thread)) != (profile_name, chat_id, thread_id):
                     raise ValueError("session is already linked to another Telegram topic")
-            conn.execute("""
-                INSERT INTO telegram_dm_topic_bindings (
-                    profile_name, chat_id, thread_id, user_id, session_key, session_id,
-                    managed_mode, linked_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(profile_name, chat_id, thread_id) DO UPDATE SET
-                    user_id = excluded.user_id,
-                    session_key = excluded.session_key,
-                    session_id = excluded.session_id,
-                    managed_mode = excluded.managed_mode,
-                    updated_at = excluded.updated_at
-                """, (profile_name, chat_id, thread_id, user_id, session_key, session_id, managed_mode, now, now))
+            cols = {row[1] for row in conn.execute("PRAGMA table_info('telegram_dm_topic_bindings')")}
+            if "delivery_enabled" in cols:
+                conn.execute("""
+                    INSERT INTO telegram_dm_topic_bindings (
+                        profile_name, chat_id, thread_id, user_id, session_key, session_id,
+                        managed_mode, delivery_enabled, linked_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(profile_name, chat_id, thread_id) DO UPDATE SET
+                        user_id = excluded.user_id,
+                        session_key = excluded.session_key,
+                        session_id = excluded.session_id,
+                        managed_mode = excluded.managed_mode,
+                        delivery_enabled = excluded.delivery_enabled,
+                        updated_at = excluded.updated_at
+                    """, (profile_name, chat_id, thread_id, user_id, session_key, session_id, managed_mode, 1 if delivery_enabled else 0, now, now))
+            else:
+                conn.execute("""
+                    INSERT INTO telegram_dm_topic_bindings (
+                        profile_name, chat_id, thread_id, user_id, session_key, session_id,
+                        managed_mode, linked_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(profile_name, chat_id, thread_id) DO UPDATE SET
+                        user_id = excluded.user_id,
+                        session_key = excluded.session_key,
+                        session_id = excluded.session_id,
+                        managed_mode = excluded.managed_mode,
+                        updated_at = excluded.updated_at
+                    """, (profile_name, chat_id, thread_id, user_id, session_key, session_id, managed_mode, now, now))
         self._execute_write(_do)
+
+    def set_telegram_topic_delivery_enabled(self, session_id: str, delivery_enabled: bool) -> bool:
+        """Update whether outbound delivery to Telegram is enabled for this session's topic."""
+        self.apply_telegram_topic_migration()
+        updated = False
+
+        def _do(conn):
+            nonlocal updated
+            try:
+                cursor = conn.execute(
+                    "UPDATE telegram_dm_topic_bindings SET delivery_enabled = ?, updated_at = ? WHERE session_id = ?",
+                    (1 if delivery_enabled else 0, time.time(), str(session_id)),
+                )
+                updated = bool(cursor.rowcount and cursor.rowcount > 0)
+            except sqlite3.OperationalError:
+                updated = False
+
+        self._execute_write(_do)
+        return updated
+
+    def advance_telegram_topic_sync_checkpoint(self, session_id: str, message_id: int) -> bool:
+        """Record delivery through one persisted message row, monotonically."""
+        self.apply_telegram_topic_migration()
+        updated = False
+
+        def _do(conn):
+            nonlocal updated
+            try:
+                cursor = conn.execute(
+                    "UPDATE telegram_dm_topic_bindings "
+                    "SET last_synced_message_id = CASE "
+                    "WHEN last_synced_message_id IS NULL OR last_synced_message_id < ? "
+                    "THEN ? ELSE last_synced_message_id END, updated_at = ? "
+                    "WHERE session_id = ?",
+                    (int(message_id), int(message_id), time.time(), str(session_id)),
+                )
+                updated = bool(cursor.rowcount and cursor.rowcount > 0)
+            except sqlite3.OperationalError:
+                updated = False
+
+        self._execute_write(_do)
+        return updated
+
+    def unbind_telegram_topic(self, *, chat_id: str, thread_id: str, profile_name: str = "default") -> bool:
+        """Remove one Telegram topic binding without touching its session transcript."""
+        return bool(self.delete_telegram_topic_binding(chat_id=chat_id, thread_id=thread_id, profile_name=profile_name) > 0)
 
     def is_telegram_session_linked_to_topic(self, *, session_id: str) -> bool:
         """True if the session is bound to any Telegram DM topic (absent tables → False)."""
