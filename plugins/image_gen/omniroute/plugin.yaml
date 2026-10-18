@@ -1,0 +1,5 @@
+name: omniroute
+version: 1.1.0
+description: "OmniRoute dual image generation & inpainting (antigravity/gemini-3.1-flash-image + codex/gpt-5.6-sol). Routes through local OmniRoute gateway."
+author: Nous Research / Hermes Agent
+kind: backend

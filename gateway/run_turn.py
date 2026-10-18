@@ -408,6 +408,11 @@ class GatewayTurnMixin:
         the event."""
         # Topic-mode DMs: rewrite a stale/foreign thread_id to the user's last-active topic so a
         # cross-topic Reply doesn't fragment the conversation.
+        # Auto-healing Telegram topic mode if message arrived from a topic or has_topics_enabled is set
+        if self._is_telegram_dm(source):
+            has_topics = getattr(event, "has_topics_enabled", None)
+            await asyncio.to_thread(self._maybe_auto_heal_telegram_topic_mode, source, has_topics)
+
         event_metadata = getattr(event, "metadata", None) or {}
         expected_session_key = str(event_metadata.get("gateway_session_key") or "").strip()
         recovered = (await asyncio.to_thread(self._recover_telegram_topic_thread_id, source)

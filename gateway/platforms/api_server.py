@@ -1,3 +1,78 @@
+
+def _transform_media_paths(text: str) -> str:
+    """Transform MEDIA:/path/to/file or Markdown images to /api/media/{filename} links.
+    Copies files outside .hermes/media into .hermes/media directory.
+    """
+    if not text or not isinstance(text, str):
+        return text
+
+    try:
+        try:
+            from hermes_cli.config import get_hermes_home
+            media_dir = Path(get_hermes_home()) / "media"
+        except Exception:
+            media_dir = Path(os.path.expanduser("~/.hermes/media"))
+
+        try:
+            media_dir.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+
+        def _replace_media_prefix(match):
+            try:
+                raw_path = match.group(1).strip()
+                filename = os.path.basename(raw_path)
+                src_file = Path(raw_path)
+                dest_file = media_dir / filename
+                try:
+                    if src_file.is_file() and src_file.resolve() != dest_file.resolve():
+                        try:
+                            import shutil
+                            shutil.copy2(src_file, dest_file)
+                        except (OSError, PermissionError) as e:
+                            logger.debug("Failed to copy media file %s to %s: %s", src_file, dest_file, e)
+                except Exception as e:
+                    logger.debug("Error checking media path %s: %s", src_file, e)
+                return f"/api/media/{filename}"
+            except Exception as e:
+                logger.debug("Error in _replace_media_prefix: %s", e)
+                return match.group(0)
+
+        # 1. Match MEDIA:/path or MEDIA:path
+        text = re.sub(r'MEDIA:([^\s\)\]]+)', _replace_media_prefix, text)
+
+        # 2. Match markdown images ![alt](/local/path) -> ![alt](/api/media/filename)
+        def _replace_md_image(match):
+            try:
+                alt = match.group(1)
+                img_path = match.group(2).strip()
+                if img_path.startswith("http://") or img_path.startswith("https://") or img_path.startswith("data:"):
+                    return match.group(0)
+                if img_path.startswith("/api/media/"):
+                    return match.group(0)
+                filename = os.path.basename(img_path)
+                src_file = Path(img_path)
+                dest_file = media_dir / filename
+                try:
+                    if src_file.is_file() and src_file.resolve() != dest_file.resolve():
+                        try:
+                            import shutil
+                            shutil.copy2(src_file, dest_file)
+                        except (OSError, PermissionError) as e:
+                            logger.debug("Failed to copy image %s to %s: %s", src_file, dest_file, e)
+                except Exception as e:
+                    logger.debug("Error checking image path %s: %s", src_file, e)
+                return f"![{alt}](/api/media/{filename})"
+            except Exception as e:
+                logger.debug("Error in _replace_md_image: %s", e)
+                return match.group(0)
+
+        text = re.sub(r'!\[([^\]]*)\]\(([^\)]+)\)', _replace_md_image, text)
+    except Exception as e:
+        logger.debug("Error transforming media paths: %s", e)
+
+    return text
+
 """OpenAI-compatible API server platform adapter (aiohttp).
 
 Serves /v1/chat/completions, /v1/responses, /v1/models, /v1/capabilities, /api/sessions,
@@ -27,6 +102,7 @@ import uuid
 from datetime import datetime, timezone, UTC
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from zoneinfo import ZoneInfo
 
 # _resolve_request_profile result for a /p/<profile>/ prefix this gateway does not serve (-> 404);
 # distinct from None (no prefix / multiplexing off -> default profile).
@@ -70,6 +146,7 @@ _STATIC_FEATURE_FLAGS = {
     "run_approval_response": True, "tool_progress_events": True, "approval_events": True,
     "session_resources": True, "model_options": True, "session_chat": True,
     "session_chat_streaming": True, "session_fork": True, "session_model_lock": True,
+    "telegram_session_binding": True,
     "reasoning_streaming": True,
     "admin_config_rw": False, "jobs_admin": False, "memory_write_api": False,
     "skills_api": True, "audio_api": False, "realtime_voice": False,
@@ -78,6 +155,8 @@ _STATIC_FEATURE_FLAGS = {
 # /v1/capabilities "endpoints" table: name -> (method, path).
 _CAPABILITY_ENDPOINTS = (
     ("health", ("GET", "/health")), ("health_detailed", ("GET", "/health/detailed")),
+    ("media", ("GET", "/api/media/{filename}")),
+    ("file_upload", ("POST", "/api/files/upload")),
     ("models", ("GET", "/v1/models")), ("model_options", ("GET", "/api/model/options")),
     ("chat_completions", ("POST", "/v1/chat/completions")),
     ("responses", ("POST", "/v1/responses")), ("runs", ("POST", "/v1/runs")),
@@ -1124,7 +1203,7 @@ class _SessionEventQueue:
 
     def __init__(self, session_id: str, run_id: str):
         self.loop = asyncio.get_running_loop()
-        self.queue: asyncio.Queue[Optional[tuple[str, dict[str, Any]]]] = asyncio.Queue()
+        self.queue: asyncio.Queue[Optional[tuple[str, dict[str, Any]]]] = asyncio.Queue(maxsize=500)
         self.session_id = session_id
         self.run_id = run_id
         self.seq = 0
@@ -1145,6 +1224,11 @@ class _SessionEventQueue:
             running_loop = None
         with suppress(RuntimeError):
             if running_loop is self.loop:
+                if self.queue.full():
+                    try:
+                        self.queue.get_nowait()
+                    except Exception:
+                        pass
                 self.queue.put_nowait(event)
             else:
                 self.loop.call_soon_threadsafe(self.queue.put_nowait, event)
@@ -1189,6 +1273,259 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
     _handle_chat_completions = _admit_api_agent_request(OpenAICompatRoutesMixin._handle_chat_completions)
     _handle_responses = _admit_api_agent_request(OpenAICompatRoutesMixin._handle_responses)
 
+    
+    async def _handle_get_media(self, request: web.Request) -> web.Response:
+        """GET /api/media/{filename} — serve media files from configured directories."""
+        try:
+            filename = request.match_info.get("filename", "")
+            filename = os.path.basename(filename)
+            if not filename:
+                return web.json_response(_openai_error("Missing filename"), status=400)
+
+            try:
+                from hermes_cli.config import get_hermes_home
+                hermes_home = Path(get_hermes_home())
+            except Exception:
+                hermes_home = Path(os.path.expanduser("~/.hermes"))
+
+            base_search_dirs = [
+                hermes_home / "image_cache",
+                hermes_home / "cache" / "images",
+                hermes_home / "media",
+                hermes_home / "audio_cache",
+                hermes_home / "sandbox",
+                Path("/tmp"),
+                Path(os.path.expanduser("~/sandbox")),
+                Path("sandbox"),
+            ]
+
+            found_file = None
+            for sdir in base_search_dirs:
+                candidate = sdir / filename
+                if candidate.is_file():
+                    found_file = candidate
+                    break
+
+            if not found_file:
+                # Stem wildcard search
+                stem = Path(filename).stem
+                for sdir in base_search_dirs:
+                    if sdir.is_dir():
+                        matches = list(sdir.glob(f"{stem}.*"))
+                        if matches and matches[0].is_file():
+                            found_file = matches[0]
+                            break
+
+            if not found_file:
+                return web.json_response(_openai_error("File not found", err_type="not_found_error"), status=404)
+
+            ext = found_file.suffix.lower()
+            content_type = {
+                ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+                ".webp": "image/webp", ".gif": "image/gif", ".svg": "image/svg+xml",
+                ".mp3": "audio/mpeg", ".wav": "audio/wav", ".ogg": "audio/ogg",
+                ".pdf": "application/pdf", ".txt": "text/plain",
+            }.get(ext, "application/octet-stream")
+
+            data = await asyncio.to_thread(found_file.read_bytes)
+            return web.Response(body=data, content_type=content_type, headers={"Cache-Control": "public, max-age=86400"})
+        except Exception as e:
+            logger.exception("Error serving media file: %s", e)
+            return web.json_response(_openai_error(f"Internal error: {e}"), status=500)
+
+    async def _handle_post_file_upload(self, request: web.Request) -> web.Response:
+        """POST /api/files/upload — upload files from WebUI."""
+        try:
+            try:
+                from hermes_cli.config import get_hermes_home
+                hermes_home = Path(get_hermes_home())
+            except Exception:
+                hermes_home = Path(os.path.expanduser("~/.hermes"))
+
+            upload_dir = hermes_home / "media"
+            upload_dir.mkdir(parents=True, exist_ok=True)
+
+            reader = await request.multipart()
+            uploaded_files = []
+            while True:
+                field = await reader.next()
+                if field is None:
+                    break
+                if field.name in ("file", "files"):
+                    filename = os.path.basename(field.filename or f"upload_{uuid.uuid4().hex[:8]}")
+                    dest = upload_dir / filename
+                    with open(dest, "wb") as f:
+                        while True:
+                            chunk = await field.read_chunk()
+                            if not chunk:
+                                break
+                            f.write(chunk)
+                    try:
+                        os.chmod(dest, 0o664)
+                    except Exception:
+                        pass
+                    uploaded_files.append({"filename": filename, "url": f"/api/media/{filename}", "path": str(dest)})
+
+            if not uploaded_files:
+                return web.json_response(_openai_error("No files uploaded"), status=400)
+
+            return web.json_response({"files": uploaded_files, "status": "ok"})
+        except Exception as e:
+            logger.exception("Error handling file upload: %s", e)
+            return web.json_response(_openai_error(f"Upload error: {e}"), status=500)
+
+    def _get_telegram_sync_lock(self, session_id: str) -> asyncio.Lock:
+        lock = self._telegram_sync_locks.get(session_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._telegram_sync_locks[session_id] = lock
+        return lock
+
+    def _telegram_delivery_enabled(self, session_id: str) -> bool:
+        """Return the binding's durable delivery preference (unbound is off)."""
+        db = self._ensure_session_db()
+        if not db:
+            return False
+        try:
+            if hasattr(db, "apply_telegram_topic_migration"):
+                db.apply_telegram_topic_migration()
+            binding = db.get_telegram_topic_binding_by_session(session_id=session_id)
+        except Exception:
+            logger.debug("Failed to get Telegram delivery state for session %s", session_id, exc_info=True)
+            return False
+        return bool(binding and binding.get("delivery_enabled", True))
+
+    def is_telegram_bound(self, session_id: str) -> bool:
+        """Return True if session has an active Telegram topic binding with delivery enabled."""
+        return self._telegram_delivery_enabled(session_id)
+
+    def _is_preserved(self, session_id: str, initial_flag: bool) -> bool:
+        """Dynamic disconnect preservation: initial flag or dynamic Telegram binding check."""
+        if initial_flag:
+            return True
+        try:
+            return bool(self.is_telegram_bound(session_id))
+        except Exception:
+            return initial_flag
+
+    def _user_facing_message_text(self, message: Any) -> Optional[str]:
+        if not isinstance(message, dict):
+            return None
+        content = message.get("content")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts = []
+            for p in content:
+                if isinstance(p, dict) and p.get("type") == "text":
+                    parts.append(p.get("text", ""))
+            return "\n".join(parts)
+        return str(content) if content is not None else None
+
+    def _telegram_sync_text(self, message: Any, text: Optional[str]) -> str:
+        res = text or ""
+        if isinstance(message, dict) and message.get("display_kind") == "failed_turn":
+            return f"⚠️ {res}"
+        return res
+
+    async def _forward_to_telegram(self, session_id: str, role: str, content: Any) -> Dict[str, Any]:
+        """Forward a web turn to its bound Telegram topic."""
+        db = self._ensure_session_db()
+        if not db:
+            return {"status": "unavailable", "error": "session_db_unavailable"}
+        try:
+            binding = db.get_telegram_topic_binding_by_session(session_id=session_id)
+        except Exception as e:
+            logger.debug("Failed to get Telegram topic binding for session %s: %s", session_id, e)
+            return {"status": "failed", "error": "binding_lookup_failed"}
+
+        if not binding:
+            return {"status": "unbound"}
+
+        chat_id = binding.get("chat_id")
+        thread_id = binding.get("thread_id")
+        if not chat_id or not thread_id:
+            return {"status": "invalid_binding", "error": "missing_chat_or_thread"}
+
+        _, telegram_adapter = self._telegram_runner_and_adapter()
+        if not telegram_adapter:
+            return {"status": "unavailable", "error": "telegram_not_connected"}
+
+        if not content:
+            return {"status": "skipped", "reason": "empty_content"}
+
+        if role == "user":
+            formatted_content = f"👤 **User:**\n{content}"
+        else:
+            formatted_content = content
+
+        try:
+            result = await telegram_adapter.send(
+                chat_id=str(chat_id),
+                content=formatted_content,
+                metadata={"thread_id": str(thread_id)}
+            )
+            if getattr(result, "success", True) is False:
+                return {"status": "failed", "error": str(getattr(result, "error", "telegram_send_failed"))}
+            return {"status": "sent", "chat_id": str(chat_id), "thread_id": str(thread_id)}
+        except Exception as e:
+            logger.exception("Failed to send forwarded message to Telegram chat %s, thread %s: %s", chat_id, thread_id, e)
+            return {"status": "failed", "error": str(e)[:500]}
+
+    async def _sync_telegram_history(self, session_id: str) -> Dict[str, Any]:
+        """Incrementally deliver a bound transcript and durably checkpoint rows."""
+        lock = self._get_telegram_sync_lock(session_id)
+        async with lock:
+            delivery = {"mode": "incremental", "status": "completed", "sent": 0, "failed": 0, "skipped": 0}
+            db = self._ensure_session_db()
+            if not db:
+                delivery.update(status="not_requested")
+                return delivery
+            binding = db.get_telegram_topic_binding_by_session(session_id=session_id)
+            if not binding or not binding.get("delivery_enabled", True):
+                delivery.update(status="not_requested")
+                return delivery
+            checkpoint = binding.get("last_synced_message_id")
+            resolved_id = db.resolve_resume_session_id(session_id) if hasattr(db, "resolve_resume_session_id") else session_id
+            raw_messages = db.get_messages(resolved_id) if hasattr(db, "get_messages") else []
+
+            if checkpoint is None:
+                max_id = max((m.get("id") for m in raw_messages if isinstance(m.get("id"), int)), default=None)
+                if max_id is not None and hasattr(db, "advance_telegram_topic_sync_checkpoint"):
+                    db.advance_telegram_topic_sync_checkpoint(session_id=session_id, message_id=max_id)
+                delivery["skipped"] = len(raw_messages)
+                return delivery
+
+            for message in raw_messages:
+                message_id = message.get("id")
+                if not isinstance(message_id, int) or (checkpoint is not None and message_id <= checkpoint):
+                    continue
+                if message.get("platform_message_id"):
+                    delivery["skipped"] += 1
+                    if hasattr(db, "advance_telegram_topic_sync_checkpoint"):
+                        db.advance_telegram_topic_sync_checkpoint(session_id=session_id, message_id=message_id)
+                    continue
+
+                text = self._user_facing_message_text(message)
+                if text is None:
+                    delivery["skipped"] += 1
+                    if hasattr(db, "advance_telegram_topic_sync_checkpoint"):
+                        db.advance_telegram_topic_sync_checkpoint(session_id=session_id, message_id=message_id)
+                    continue
+
+                result = await self._forward_to_telegram(
+                    session_id, str(message.get("role")).lower(), self._telegram_sync_text(message, text)
+                )
+                if result.get("status") in {"sent", "skipped"}:
+                    delivery["sent" if result.get("status") == "sent" else "skipped"] += 1
+                    if hasattr(db, "advance_telegram_topic_sync_checkpoint"):
+                        db.advance_telegram_topic_sync_checkpoint(session_id=session_id, message_id=message_id)
+                    continue
+                delivery["failed"] += 1
+                delivery["status"] = "partial" if delivery["sent"] or delivery["skipped"] else "failed"
+                break
+            return delivery
+
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.API_SERVER)
         extra = config.extra or {}
@@ -1227,6 +1564,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         self._session_dbs: dict[str, Any] = {}  # per-profile-home SessionDB cache
         self._session_db_cache_lock = threading.Lock()
         self._session_db_cache_closed = False
+        self._immediately_forwarded_user_hashes: dict[str, set[str]] = {}
+        self._telegram_sync_locks: dict[str, asyncio.Lock] = {}
         # Last-known-good model per gateway_session_key ("*" = process-wide; never session_id,
         # which is per request -> unbounded). Recovers a transient empty model resolution.
         self._last_resolved_model: dict[str, str] = {}
@@ -1721,6 +2060,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         routes: list[tuple] = [
             ("GET", "/health", self._handle_health),
             ("GET", "/health/detailed", self._handle_health_detailed),
+            ("GET", "/api/media/{filename}", self._handle_get_media),
+            ("POST", "/api/files/upload", self._handle_post_file_upload),
             ("GET", "/v1/health", self._handle_health),
             ("GET", "/v1/models", self._handle_models),
             ("GET", "/api/model/options", self._handle_model_options),
@@ -3555,7 +3896,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             body, err = await self._read_json_body(request)
             if err:
                 return err
-            chat_id = str(body.get("chat_id") or session.get("user_id") or session.get("chat_id") or getattr(self, "home_chat_id", "") or "139351986").strip()
+            chat_id = str(body.get("chat_id") or body.get("telegram_chat_id") or session.get("user_id") or session.get("chat_id") or getattr(self, "home_chat_id", "") or "139351986").strip()
             thread_id = str(body.get("thread_id") or "").strip()
             topic_name = str(body.get("topic_name") or session.get("title") or f"Hermes {session_id[:24]}").strip()
             delivery_enabled = bool(body.get("delivery_enabled", True))
@@ -3958,6 +4299,12 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         run_id = f"run_{uuid.uuid4().hex}"
         events = _SessionEventQueue(session_id, run_id)
         queue, _event_payload = events.queue, events.payload
+        duplicate_to_telegram = bool(
+            ctx["body"].get("duplicate_to_telegram") if "duplicate_to_telegram" in ctx["body"] else self.is_telegram_bound(session_id)
+        )
+        preserve_on_disconnect = bool(
+            duplicate_to_telegram or self.is_telegram_bound(session_id) or ctx["body"].get("preserve_on_disconnect")
+        )
         # Claim ownership inside the request's profile scope before any run-keyed state
         # exists, so /v1/runs/{id}* control is confined to the starting profile.
         # See #93689.
@@ -4053,13 +4400,19 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 name, payload = item
                 await response.write(_sse_frame(payload, event=name, ensure_ascii=False))
         except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError):
-            await self._drain_session_stream_task_on_disconnect(
-                run_id, task, interrupt_message="SSE client disconnected", shield_wait=False)
-            logger.info("Session SSE client disconnected; interrupted live run %s", run_id)
+            if not self._is_preserved(session_id, preserve_on_disconnect):
+                await self._drain_session_stream_task_on_disconnect(
+                    run_id, task, interrupt_message="SSE client disconnected", shield_wait=False)
+                logger.info("Session SSE client disconnected; interrupted live run %s", run_id)
+            else:
+                logger.info("Session SSE client disconnected; preserved live run %s", run_id)
         except asyncio.CancelledError:
-            await self._drain_session_stream_task_on_disconnect(
-                run_id, task, interrupt_message="SSE task cancelled", shield_wait=True)
-            logger.info("Session SSE task cancelled; drained live run %s", run_id)
+            if not self._is_preserved(session_id, preserve_on_disconnect):
+                await self._drain_session_stream_task_on_disconnect(
+                    run_id, task, interrupt_message="SSE task cancelled", shield_wait=True)
+                logger.info("Session SSE task cancelled; drained live run %s", run_id)
+            else:
+                logger.info("Session SSE task cancelled; preserved live run %s", run_id)
             raise
         except Exception as exc:
             logger.debug("[api_server] session SSE stream error: %s", exc)

@@ -615,7 +615,7 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
             'cat > "$tmp"; '
             # new file: umask-default perms instead of mktemp's 0600 (#70856). Runs AFTER cat so a
             # write-masking umask can't EACCES the stream; quoted "=rw" so zsh doesn't =word-expand it.
-            'if [ ! -e "$t" ]; then chmod "=rw" "$tmp" 2>/dev/null || true; fi; '
+            'if [ ! -e "$t" ]; then chmod 664 "$tmp" 2>/dev/null || chmod "=rw" "$tmp" 2>/dev/null || true; fi; '
             'mv -f "$tmp" "$t"; '
             "trap - EXIT")
         return self._exec(script, stdin_data=content)
@@ -1544,6 +1544,15 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
         content_verified, verify_error = self._verify_written_hash(path, content_bytes)
         if verify_error is not None:
             return verify_error
+
+        # Ensure 0o664 permissions on newly created files when possible (with secrets exemption)
+        if not pre_content:
+            try:
+                base = os.path.basename(abs_path)
+                if not (base.startswith(".env") or base.endswith(".key") or "token" in base or "/.git/" in abs_path):
+                    os.chmod(abs_path, 0o664)
+            except Exception:
+                pass
 
         lint_result = self._check_lint_delta(path, pre_content=pre_content, post_content=content)
         # LSP diagnostics are a separate channel, fired only when the syntax tier is

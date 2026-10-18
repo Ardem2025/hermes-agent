@@ -243,11 +243,16 @@ async def _telegram_send_one_media(bot, chat_id, media_path, is_voice, *, captio
                 os.remove(thumb_path)
 
 
+_TELEGRAM_HTML_TAG_RE = re.compile(
+    r'</?(?:b|strong|i|em|u|ins|s|strike|del|span|tg-spoiler|a|tg-emoji|code|pre|blockquote|expandable-blockquote)\b[^>]*>',
+    re.IGNORECASE,
+)
+
 def _telegram_format(message):
     """``(formatted, parse_mode, has_html)``: text already containing HTML tags is sent as
     HTML; otherwise Markdown -> MarkdownV2 via the adapter's ``format_message``."""
     from telegram.constants import ParseMode
-    if re.search(r'<[a-zA-Z/][^>]*>', message):
+    if _TELEGRAM_HTML_TAG_RE.search(message):
         return message, ParseMode.HTML, True
     try:
         from plugins.platforms.telegram.adapter import TelegramAdapter

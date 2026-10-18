@@ -91,7 +91,9 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
             if not isinstance(_result, dict):
                 continue
             _action = _result.get("action")
-            if _action == "skip":
+            _suppress_session = bool(_result.get("suppress_session"))
+            _suppress_reply = bool(_result.get("suppress_reply"))
+            if _action == "skip" or (_suppress_session and _suppress_reply):
                 logger.info(
                     "pre_gateway_dispatch skip: reason=%s platform=%s chat=%s",
                     _result.get("reason"), source.platform.value if source.platform else "unknown",

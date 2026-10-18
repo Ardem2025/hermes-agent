@@ -38,6 +38,48 @@ def _collapse_title(title: str) -> str:
 
 
 class GatewayTopicThreadsMixin:
+    _TELEGRAM_GENERAL_TOPIC_IDS = frozenset({"", "1"})
+
+    def _maybe_auto_heal_telegram_topic_mode(
+        self, source: SessionSource, has_topics_enabled: Optional[bool] = None
+    ) -> bool:
+        """Auto-heal topic mode when a message arrives from a topic (thread_id != '' and != '1')
+        or when has_topics_enabled is confirmed. If telegram_dm_topic_mode has enabled == 0,
+        calls enable_telegram_topic_mode to set enabled=1, has_topics_enabled=1.
+        """
+        if not self._is_telegram_dm(source):
+            return False
+        chat_id = str(source.chat_id or "").strip()
+        user_id = str(source.user_id or "").strip()
+        if not chat_id or not user_id:
+            return False
+        tid = str(source.thread_id or "").strip()
+        from_topic = bool(tid and tid not in self._TELEGRAM_GENERAL_TOPIC_IDS)
+        confirmed_topics = has_topics_enabled is True
+        if not (from_topic or confirmed_topics):
+            return False
+
+        session_db = self._sync_session_db()
+        if session_db is None or not hasattr(session_db, "is_telegram_topic_mode_enabled"):
+            return False
+        profile_name = self._telegram_topic_profile_name(source)
+        try:
+            enabled = session_db.is_telegram_topic_mode_enabled(
+                chat_id=chat_id, user_id=user_id, profile_name=profile_name,
+            )
+            if not enabled:
+                logger.info(
+                    "Auto-healing topic mode for chat_id=%s user_id=%s profile=%s (from_topic=%s confirmed=%s)",
+                    chat_id, user_id, profile_name, from_topic, confirmed_topics,
+                )
+                session_db.enable_telegram_topic_mode(
+                    chat_id=chat_id, user_id=user_id, profile_name=profile_name, has_topics_enabled=True,
+                )
+                return True
+        except Exception as e:
+            logger.debug("Failed to auto-heal topic mode: %s", e)
+        return False
+
     """Telegram forum-topic and Discord auto-thread binding/rename methods for GatewayRunner."""
 
     # ── Telegram topic mode: predicates and keys ────────────────────────────────────────────
@@ -76,7 +118,11 @@ class GatewayTopicThreadsMixin:
             return False
         # Only a real True enables topic mode; anything else (including MagicMock from test
         # fixtures that didn't opt in) means off for this chat.
-        return raw is True
+        if raw is True:
+            return True
+        if self._maybe_auto_heal_telegram_topic_mode(source):
+            return True
+        return False
 
     def _is_telegram_topic_root_lobby(self, source: SessionSource) -> bool:
         """True for the main Telegram DM (or General topic) when topic mode has made it a lobby."""

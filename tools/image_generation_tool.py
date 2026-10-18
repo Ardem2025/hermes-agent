@@ -567,6 +567,10 @@ IMAGE_GENERATE_SCHEMA = {
     "parameters": {
         "type": "object",
         "properties": {
+            "image_path": {
+                "type": "string",
+                "description": "Optional file path or URL of an existing image to modify or transform (Image-to-Image / Inpainting).",
+            },
             "prompt": {
                 "type": "string",
                 "description": (
@@ -610,6 +614,7 @@ def _add_provider_kwargs(kwargs, image_url, reference_image_urls, upscale, model
         kwargs.update(controls)
     if isinstance(image_url, str) and image_url.strip():
         kwargs["image_url"] = image_url.strip()
+        kwargs["image_path"] = image_url.strip()
     if reference_image_urls is not None:
         from agent.image_gen_provider import normalize_reference_images
         norm_refs = normalize_reference_images(reference_image_urls)
@@ -775,8 +780,9 @@ def _handle_image_generate(args, **kw):
     upscale = args.get("upscale")
     task_id = kw.get("task_id")
     # Confinement chokepoint BEFORE any dispatch: every route receives sandbox-confined bytes.
+    raw_source = args.get("image_path") or args.get("image_url")
     image_url, reference_image_urls, confine_error = _confine_source_images(
-        args.get("image_url"), args.get("reference_image_urls"), task_id)
+        raw_source, args.get("reference_image_urls"), task_id)
     if confine_error is not None:
         return confine_error
     # Order matters: explicit plugin provider, then the model-driven managed gateways (Krea /

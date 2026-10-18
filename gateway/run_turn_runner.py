@@ -878,7 +878,7 @@ class TurnRunner:
             agent._title_failure_callback = lambda task, exc: logger.debug(
                 "Gateway auto-title failure suppressed (not user-visible): %s: %s", task, exc,
             )
-            session_id = getattr(agent, "session_id", None)
+            session_id = getattr(agent, "session_id", None) or getattr(ctx, "session_id", None)
             runner = self._runner
             source = runner._recover_discord_auto_thread_source(ctx.source, ctx.session_key)
             # Both lanes spend a rate-limited platform call per title, so they use the model's title
