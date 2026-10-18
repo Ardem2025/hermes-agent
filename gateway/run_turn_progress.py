@@ -1031,7 +1031,7 @@ class GatewayTurnProgressMixin:
             agent._title_failure_callback = lambda task, exc: logger.debug(
                 "Gateway auto-title failure suppressed (not user-visible): %s: %s", task, exc,
             )
-            session_id = getattr(agent, "session_id", None)
+            session_id = getattr(agent, "session_id", None) or getattr(ctx, "session_id", None)
             if local_viewer_turn(self):
                 # Main's CLI repainted its status-bar title when the auto-title landed.
                 authority, canonical_id, _generation = self._approval_owner
