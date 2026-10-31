@@ -968,3 +968,29 @@ class TestBddScenarios20260925:
 
 
 
+
+
+class TestBddScenarios20261031:
+    """BDD-1 through BDD-3 tests for HTML <br>, inequalities <= / >=, and tilde escaping."""
+
+    def test_bdd_1_html_br_line_breaks(self, adapter):
+        inp = "Строка 1<br>Строка 2<br/>Строка 3<br />Строка 4"
+        out = adapter.format_message(inp)
+        assert "<br" not in out
+        assert "Строка 1" in out and "Строка 2" in out and "Строка 3" in out and "Строка 4" in out
+        assert "\n" in out
+
+    def test_bdd_2_inequality_operators(self, adapter):
+        inp = "Проверка: $x <= 10$ и $y >= 20$, а в коде `val <= 10 && val >= 20` не меняется."
+        out = adapter.format_message(inp)
+        assert "x ≤ 10" in out
+        assert "y ≥ 20" in out
+        assert "`val <= 10 && val >= 20`" in out
+
+    def test_bdd_3_tilde_escaping_and_strikethrough(self, adapter):
+        inp = "Путь: ~/.hermes/config.yaml, а это ~~зачеркнуто~~."
+        out = adapter.format_message(inp)
+        # Одиночная тильда экранируется в MarkdownV2
+        assert r"\~/" in out or r"\~" in out
+        # Парная тильда превращается в MarkdownV2 зачеркивание ~текст~
+        assert "~зачеркнуто~" in out

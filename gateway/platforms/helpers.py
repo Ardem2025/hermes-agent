@@ -873,6 +873,10 @@ def normalize_latex_math_symbols(text: str) -> str:
     for pattern, repl in _LATEX_MACRO_REPLACEMENTS:
         text = pattern.sub(repl, text)
 
+    # 7b. Normalize inequality operators (BDD-2)
+    text = re.sub(r'<=\s', '≤ ', text)
+    text = re.sub(r'>=\s', '≥ ', text)
+
     # 8. Strip inline math $...$
     text = re.sub(r'\$([^\$\n]+?)\$', _clean_inline_dollar, text)
 

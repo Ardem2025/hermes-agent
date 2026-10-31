@@ -5645,6 +5645,8 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         if not content:
             return content
 
+        # BDD-1: Replace HTML line breaks (<br>, <br/>, <br />) before formatting
+        content = re.sub(r'<br\s*/?>', '\n', content, flags=re.IGNORECASE)
         content = normalize_latex_math_symbols(content)
         content = normalize_markdown_bullets(content)
         placeholders: dict = {}
