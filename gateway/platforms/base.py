@@ -1991,6 +1991,8 @@ class BasePlatformAdapter(ABC):
         self._pending_text_batches: dict[str, MessageEvent] = {}
         self._pending_text_batch_tasks: dict[str, asyncio.Task] = {}
         self._session_tasks: dict[str, asyncio.Task] = {}
+        self._last_status: dict[str, Optional[str]] = {}
+        self._current_tool: dict[str, Optional[str]] = {}
         # Busy-text policy is a per-profile config decision the runner installs after construction
         # (``_wire_adapter_handlers``); a constructor-time process-env read would freeze the launch
         # profile's values into every profile's adapter under multiplexing (#116893). Defaults here
@@ -3927,6 +3929,10 @@ class BasePlatformAdapter(ABC):
         if current_guard is None or (guard is not None and current_guard is not guard):
             return
         del self._active_sessions[session_key]
+        if hasattr(self, "_last_status") and isinstance(self._last_status, dict):
+            self._last_status.pop(session_key, None)
+        if hasattr(self, "_current_tool") and isinstance(self._current_tool, dict):
+            self._current_tool.pop(session_key, None)
 
     def _session_task_is_stale(self, session_key: str) -> bool:
         """True if the recorded owner task for ``session_key`` has exited. No owner task at all is
@@ -3942,9 +3948,13 @@ class BasePlatformAdapter(ABC):
         logger.warning("[%s] Healing stale session lock for %s (owner task is done/absent)",
                        self.name, session_key)
         self._active_sessions.pop(session_key, None)
+        self._last_status.pop(session_key, None)
+        self._current_tool.pop(session_key, None)
         self._pending_messages.pop(session_key, None)
         self._requeue_counts.pop(session_key, None)
         self._session_tasks.pop(session_key, None)
+        self._last_status.pop(session_key, None)
+        self._current_tool.pop(session_key, None)
         self._discard_text_debounce(session_key)
         return True
 
@@ -3955,6 +3965,8 @@ class BasePlatformAdapter(ABC):
         (False)."""
         guard = interrupt_event or asyncio.Event()
         self._active_sessions[session_key] = guard
+        self._last_status[session_key] = "Ассистент думает над задачей..."
+        self._current_tool[session_key] = None
         task = asyncio.create_task(self._process_message_background(event, session_key))
         if not self._track_session_task(session_key, task):
             self._session_tasks.pop(session_key, None)
@@ -4573,6 +4585,8 @@ class BasePlatformAdapter(ABC):
         # Reuse the interrupt event handle_message() installed; new Event only if removed externally.
         interrupt_event = self._active_sessions.get(session_key) or asyncio.Event()
         self._active_sessions[session_key] = interrupt_event
+        self._last_status[session_key] = "Ассистент думает над задачей..."
+        self._current_tool[session_key] = None
         _thread_metadata = _thread_metadata_for_event(event)
         typing_task = self._start_typing_refresh(event, interrupt_event, _thread_metadata)
         try:

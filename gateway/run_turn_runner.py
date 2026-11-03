@@ -126,6 +126,7 @@ class TurnRunner:
 
     def progress_callback(self, event_type: str, tool_name: str | None = None, preview: str | None = None, args: dict | None = None, **kwargs):
         """Callback invoked by agent on tool lifecycle events."""
+        self._progress_live_status(event_type, tool_name, args)
         ctx = self._ctx
         # Failed subagent → one clean user-facing notice, handled FIRST, before every progress-queue
         # gate: platforms with tool_progress off must still hear about a dead delegation.
@@ -198,19 +199,41 @@ class TurnRunner:
             logger.debug("subagent failure notice failed", exc_info=True)
 
     def _progress_live_status(self, event_type: str, tool_name, args) -> None:
-        """Live status line (Slack assistant status): stash the tool phrase on the adapter; the
-        _keep_typing refresh renders it. Plain dict write, safe from the sync worker thread."""
+        """Live status line (Slack assistant status + cross-channel WebUI status): stash the tool
+        phrase on the adapter; the _keep_typing refresh and WebUI polling render it. Plain dict write,
+        safe from the sync worker thread."""
         ctx = self._ctx
-        adapter = ctx._live_status_adapter
-        if adapter is None or ctx._live_status_mode == "off" or tool_name == "_thinking":
+        adapter = (
+            getattr(ctx, "_status_adapter", None)
+            or (getattr(self, "_runner", None) and hasattr(self._runner, "_adapter_for_source") and self._runner._adapter_for_source(ctx.source))
+            or getattr(ctx, "_live_status_adapter", None)
+        )
+        if adapter is None or tool_name == "_thinking":
             return
+        session_key = getattr(ctx, "session_key", None) or (
+            getattr(ctx, "source", None) and getattr(ctx.source, "session_key", None)
+        )
         try:
             if event_type == "tool.started" and tool_name and ctx._run_still_current():
-                from agent.display import build_status_phrase
-                adapter.set_status_text(ctx.source.chat_id, build_status_phrase(tool_name, args if ctx._live_status_mode == "full" else None))
-            elif event_type == "tool.completed":
-                # Between tools the model is genuinely "thinking" again — revert to the static default.
-                adapter.set_status_text(ctx.source.chat_id, None)
+                friendly_label = f"Выполняется {tool_name}..."
+                if session_key is not None:
+                    if not hasattr(adapter, "_last_status") or adapter._last_status is None:
+                        adapter._last_status = {}
+                    if not hasattr(adapter, "_current_tool") or adapter._current_tool is None:
+                        adapter._current_tool = {}
+                    adapter._last_status[session_key] = friendly_label
+                    adapter._current_tool[session_key] = tool_name
+                if hasattr(adapter, "set_status_text") and getattr(ctx, "_live_status_mode", "off") != "off":
+                    from agent.display import build_status_phrase
+                    adapter.set_status_text(ctx.source.chat_id, build_status_phrase(tool_name, args if ctx._live_status_mode == "full" else None))
+            elif event_type in {"tool.completed", "tool.failed"}:
+                if session_key is not None:
+                    if hasattr(adapter, "_last_status") and adapter._last_status is not None:
+                        adapter._last_status[session_key] = "Ассистент думает над задачей..."
+                    if hasattr(adapter, "_current_tool") and adapter._current_tool is not None:
+                        adapter._current_tool[session_key] = None
+                if hasattr(adapter, "set_status_text"):
+                    adapter.set_status_text(ctx.source.chat_id, None)
         except Exception as err:
             logger.debug("live status update failed: %s", err)
 

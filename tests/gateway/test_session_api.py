@@ -1396,3 +1396,22 @@ async def test_interim_commentary_reaches_session_sse_and_responses_stream(adapt
     monkeypatch.setattr("run_agent.AIAgent", CapturingAgent)
     adapter._create_agent(session_id="gated", interim_assistant_callback=lambda *_a, **_k: None)
     assert captured["interim_assistant_callback"] is None
+
+@pytest.mark.asyncio
+async def test_list_sessions_respects_exclude_sources(adapter, session_db):
+    """GET /api/sessions?exclude_sources=cron,subagent filters out specified sources."""
+    session_db.create_session("s_user", "api_server")
+    session_db.create_session("s_cron", "cron")
+    session_db.create_session("s_subagent", "subagent")
+    session_db.create_session("s_telegram", "telegram")
+
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.get("/api/sessions?exclude_sources=cron,subagent")
+        assert resp.status == 200
+        data = await resp.json()
+        ids = {s["id"] for s in data["data"]}
+        assert "s_user" in ids
+        assert "s_telegram" in ids
+        assert "s_cron" not in ids
+        assert "s_subagent" not in ids

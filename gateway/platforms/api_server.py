@@ -1472,6 +1472,35 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             logger.exception("Failed to send forwarded message to Telegram chat %s, thread %s: %s", chat_id, thread_id, e)
             return {"status": "failed", "error": str(e)[:500]}
 
+    async def _telegram_typing_heartbeat(self, session_id: str, interval: float = 4.0, stop_event: Optional[asyncio.Event] = None) -> None:
+        """Send typing indicators to the bound Telegram topic while generating."""
+        db = self._ensure_session_db()
+        if not db:
+            return
+        try:
+            binding = db.get_telegram_topic_binding_by_session(session_id=session_id)
+        except Exception:
+            return
+        if not binding:
+            return
+        chat_id = binding.get("chat_id")
+        thread_id = binding.get("thread_id")
+        if not chat_id or not thread_id:
+            return
+        _, telegram_adapter = self._telegram_runner_and_adapter()
+        if not telegram_adapter:
+            return
+        stop_ev = stop_event or asyncio.Event()
+        while not stop_ev.is_set():
+            try:
+                await telegram_adapter.send_typing(str(chat_id), metadata={"thread_id": str(thread_id)})
+            except Exception:
+                pass
+            try:
+                await asyncio.wait_for(stop_ev.wait(), timeout=interval)
+            except (asyncio.TimeoutError, TimeoutError):
+                pass
+
     async def _sync_telegram_history(self, session_id: str) -> Dict[str, Any]:
         """Incrementally deliver a bound transcript and durably checkpoint rows."""
         lock = self._get_telegram_sync_lock(session_id)
@@ -1512,6 +1541,16 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                     if hasattr(db, "advance_telegram_topic_sync_checkpoint"):
                         db.advance_telegram_topic_sync_checkpoint(session_id=session_id, message_id=message_id)
                     continue
+
+                if str(message.get("role", "")).lower() == "user":
+                    user_h = hashlib.sha256(str(text).strip().encode("utf-8")).hexdigest()
+                    fwd_set = self._immediately_forwarded_user_hashes.get(session_id, set())
+                    if user_h in fwd_set:
+                        fwd_set.discard(user_h)
+                        delivery["skipped"] += 1
+                        if hasattr(db, "advance_telegram_topic_sync_checkpoint"):
+                            db.advance_telegram_topic_sync_checkpoint(session_id=session_id, message_id=message_id)
+                        continue
 
                 result = await self._forward_to_telegram(
                     session_id, str(message.get("role")).lower(), self._telegram_sync_text(message, text)
@@ -3420,23 +3459,32 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                         if isinstance(p_dict, dict):
                             adapters_to_check.extend(p_dict.values())
                 chat_id_val = str(session.get("chat_id") or "")
+                thread_id_val = str(session.get("thread_id") or "")
+                sess_key = str(session.get("session_key") or session.get("gateway_session_key") or "")
                 for ad in adapters_to_check:
                     active_sess = getattr(ad, "_active_sessions", {})
                     if not isinstance(active_sess, dict):
                         continue
-                    for sk, guard in active_sess.items():
+                    for sk, guard in list(active_sess.items()):
                         sk_str = str(sk)
                         is_match = False
                         if session_id and (sk_str == session_id or sk_str.endswith(f":{session_id}")):
                             is_match = True
-                        elif chat_id_val and (sk_str == chat_id_val or sk_str.endswith(f":{chat_id_val}")):
+                        elif sess_key and (sk_str == sess_key or sk_str.endswith(f":{sess_key}") or sess_key.endswith(f":{sk_str}")):
                             is_match = True
-                        elif session.get("gateway_session_key") and sk_str == str(session.get("gateway_session_key")):
+                        elif chat_id_val and thread_id_val and (
+                            sk_str.endswith(f":{chat_id_val}:{thread_id_val}")
+                            or f":{chat_id_val}:{thread_id_val}" in sk_str
+                            or sk_str == f"{chat_id_val}:{thread_id_val}"
+                        ):
+                            is_match = True
+                        elif chat_id_val and not thread_id_val and (sk_str == chat_id_val or sk_str.endswith(f":{chat_id_val}")):
                             is_match = True
 
                         if is_match:
                             is_gen = True
                             tool_status = (getattr(ad, "_last_status", {}) or {}).get(sk) or "Ассистент думает над задачей..."
+                            current_tool = (getattr(ad, "_current_tool", {}) or {}).get(sk)
                             break
                     if is_gen:
                         break
@@ -4251,8 +4299,33 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             return handed_off
         gateway_session_key = ctx["gateway_session_key"]
         session_id = ctx["session_id"]
+        user_message = ctx.get("user_message") or ""
+        duplicate_to_telegram = bool(
+            ctx["body"].get("duplicate_to_telegram") if "duplicate_to_telegram" in ctx["body"] else self.is_telegram_bound(session_id)
+        )
+        if duplicate_to_telegram and user_message:
+            fwd = await self._forward_to_telegram(session_id, "user", user_message)
+            if fwd.get("status") == "sent":
+                user_h = hashlib.sha256(str(user_message).strip().encode("utf-8")).hexdigest()
+                self._immediately_forwarded_user_hashes.setdefault(session_id, set()).add(user_h)
+
+        heartbeat_stop = asyncio.Event()
+        heartbeat_task = asyncio.create_task(
+            self._telegram_typing_heartbeat(session_id, interval=4.0, stop_event=heartbeat_stop)
+        ) if duplicate_to_telegram else None
+
         history = await self._conversation_history_for_session(session_id)
-        result, usage = await self._run_agent(conversation_history=history, **ctx["run_kwargs"])
+        try:
+            result, usage = await self._run_agent(conversation_history=history, **ctx["run_kwargs"])
+        finally:
+            if heartbeat_task and heartbeat_stop:
+                heartbeat_stop.set()
+                heartbeat_task.cancel()
+                with suppress(asyncio.CancelledError, Exception):
+                    await heartbeat_task
+            if duplicate_to_telegram:
+                with suppress(Exception):
+                    await asyncio.shield(self._sync_telegram_history(session_id))
         # One policy-gated re-run of a transiently failed turn — the peer-DM transport's half of the
         # retry the local (``tools.bot_mode_dm``) and relayed (``tui_gateway.methods_bot_relay``)
         # delivery lanes already apply (#93091 item 5, #115325). Same policy, same gate: transient
@@ -4343,12 +4416,34 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                     "runtime": runtime_meta}))
                 self._set_run_status(run_id, "running", last_event="run.started")
                 await queue.put(_event_payload("message.started", {"message": {"id": message_id, "role": "assistant"}}))
+                
+                if duplicate_to_telegram and user_message:
+                    fwd = await self._forward_to_telegram(session_id, "user", user_message)
+                    if fwd.get("status") == "sent":
+                        user_h = hashlib.sha256(str(user_message).strip().encode("utf-8")).hexdigest()
+                        self._immediately_forwarded_user_hashes.setdefault(session_id, set()).add(user_h)
+
+                heartbeat_stop = asyncio.Event()
+                heartbeat_task = asyncio.create_task(
+                    self._telegram_typing_heartbeat(session_id, interval=4.0, stop_event=heartbeat_stop)
+                ) if duplicate_to_telegram else None
+
                 history = await self._conversation_history_for_session(session_id)
-                result, usage = await self._run_agent(
-                    conversation_history=history, stream_delta_callback=_delta,
-                    tool_progress_callback=_tool_progress, interim_assistant_callback=_commentary,
-                    active_run_id=run_id, approval_notify_callback=approval_notify,
-                    approval_session_key=run_id, **ctx["run_kwargs"])
+                try:
+                    result, usage = await self._run_agent(
+                        conversation_history=history, stream_delta_callback=_delta,
+                        tool_progress_callback=_tool_progress, interim_assistant_callback=_commentary,
+                        active_run_id=run_id, approval_notify_callback=approval_notify,
+                        approval_session_key=run_id, **ctx["run_kwargs"])
+                finally:
+                    if heartbeat_task and heartbeat_stop:
+                        heartbeat_stop.set()
+                        heartbeat_task.cancel()
+                        with suppress(asyncio.CancelledError, Exception):
+                            await heartbeat_task
+                    if duplicate_to_telegram:
+                        with suppress(Exception):
+                            await asyncio.shield(self._sync_telegram_history(session_id))
                 is_dict = isinstance(result, dict)
                 final_response = _resolve_media_to_data_urls(result.get("final_response", "") if is_dict else "")
                 effective_session_id = result.get("session_id", session_id) if is_dict else session_id
