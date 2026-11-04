@@ -11,7 +11,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from agent.auxiliary_client import reset_runtime_main, set_runtime_main
-from hermes_constants import get_hermes_home
+from hermes_constants import get_hermes_home, set_hermes_home_override
 from tools import vision_tools
 from tools.delegate_tool_config import _resolve_child_runtime
 from tools.registry import registry
@@ -60,7 +60,7 @@ def test_inherited_named_custom_child_uses_native_vision(tmp_path):
     image.write_bytes(_TINY_PNG)
     # The persisted default is a different named route: config-side fallback must not mask the child's
     # missing identity (a /model switch or session-scoped pick is where the aux slow path fired live).
-    get_hermes_home().joinpath("config.yaml").write_text(
+    (tmp_path / "config.yaml").write_text(
         """\
 model:
   provider: custom:text-endpoint
@@ -75,6 +75,7 @@ providers:
 """,
         encoding="utf-8",
     )
+    set_hermes_home_override(tmp_path)
 
     token = set_runtime_main(
         runtime["provider"],
@@ -93,6 +94,7 @@ providers:
             )
     finally:
         reset_runtime_main(token)
+        set_hermes_home_override(None)
 
     assert isinstance(result, dict) and result["_multimodal"] is True
     auxiliary.assert_not_called()

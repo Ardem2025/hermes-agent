@@ -1144,21 +1144,29 @@ class TestChildCredentialPoolResolution(unittest.TestCase):
     def test_named_custom_child_pool_follows_requested_provider_not_endpoint_order(self):
         """#45763 (salvage #89021): two named custom providers on one gateway URL keep separate pools; the child
         leases the pool of the identity it inherited, not the first entry registered for that URL."""
-        from hermes_constants import get_hermes_home
+        import tempfile
+        from pathlib import Path
+        from hermes_constants import set_hermes_home_override
 
         url = "https://gateway.invalid/v1"
-        get_hermes_home().joinpath("config.yaml").write_text(
-            f"providers:\n  claude-ai:\n    api: {url}\n  open-ai:\n    api: {url}\n", encoding="utf-8",
-        )
-        parent = _make_mock_parent()
-        parent.provider, parent.base_url, parent.requested_provider = "custom", url, "custom:open-ai"
-        parent._credential_pool = None
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_home = Path(tmp_dir)
+            tmp_home.joinpath("config.yaml").write_text(
+                f"providers:\n  claude-ai:\n    api: {url}\n  open-ai:\n    api: {url}\n", encoding="utf-8",
+            )
+            set_hermes_home_override(tmp_home)
+            try:
+                parent = _make_mock_parent()
+                parent.provider, parent.base_url, parent.requested_provider = "custom", url, "custom:open-ai"
+                parent._credential_pool = None
 
-        with patch("tools.delegate_tool_config._loaded_pool", side_effect=lambda key: key) as loaded:
-            key = _resolve_child_credential_pool("custom", parent, url, effective_requested_provider="custom:open-ai")
-        loaded.assert_called_once()
-        self.assertIn("open-ai", key)
-        self.assertNotIn("claude", key)
+                with patch("tools.delegate_tool_config._loaded_pool", side_effect=lambda key: key) as loaded:
+                    key = _resolve_child_credential_pool("custom", parent, url, effective_requested_provider="custom:open-ai")
+                loaded.assert_called_once()
+                self.assertIn("open-ai", key)
+                self.assertNotIn("claude", key)
+            finally:
+                set_hermes_home_override(None)
 
 
     @patch(
