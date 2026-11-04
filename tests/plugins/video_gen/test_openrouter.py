@@ -156,13 +156,17 @@ def test_pooled_credential_enables_the_backend(monkeypatch, tmp_path):
 def test_one_job_keeps_one_credential_while_the_pool_rotates(monkeypatch, tmp_path):
     """A job created under one account is only visible to that account: poll and download must reuse the
     submit key even when a round-robin pool would hand out the other one next."""
-    from hermes_constants import get_hermes_home
-    (get_hermes_home() / "config.yaml").write_text("credential_pool_strategies:\n  openrouter: round_robin\n")
-    _add_pooled_key("sk-or-one", "one")
-    _add_pooled_key("sk-or-two", "two")
-    result, _, bearers = _generate_capturing(monkeypatch, tmp_path, _provider(monkeypatch, [_VEO]))
-    assert result["success"], result
-    assert len(bearers) == 4 and len(set(bearers)) == 1 and bearers[0] in {"Bearer sk-or-one", "Bearer sk-or-two"}
+    from hermes_constants import set_hermes_home_override
+    (tmp_path / "config.yaml").write_text("credential_pool_strategies:\n  openrouter: round_robin\n")
+    set_hermes_home_override(tmp_path)
+    try:
+        _add_pooled_key("sk-or-one", "one")
+        _add_pooled_key("sk-or-two", "two")
+        result, _, bearers = _generate_capturing(monkeypatch, tmp_path, _provider(monkeypatch, [_VEO]))
+        assert result["success"], result
+        assert len(bearers) == 4 and len(set(bearers)) == 1 and bearers[0] in {"Bearer sk-or-one", "Bearer sk-or-two"}
+    finally:
+        set_hermes_home_override(None)
 
 
 def test_multiplexed_profile_spends_its_own_key_not_the_launch_profiles(monkeypatch, tmp_path):

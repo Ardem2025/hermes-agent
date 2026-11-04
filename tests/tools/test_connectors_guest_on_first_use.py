@@ -82,12 +82,16 @@ def test_tool_search_without_an_identity_sends_nothing(nas, monkeypatch):
     assert nas.calls == []
 
 
-def test_guest_opt_out_keeps_connectors_closed(nas):
-    from hermes_constants import get_hermes_home
+def test_guest_opt_out_keeps_connectors_closed(nas, tmp_path):
+    from hermes_constants import set_hermes_home_override
     from tools.connectors.gateway.config import connectors_available, ensure_guest_identity
 
-    (get_hermes_home() / "config.yaml").write_text("nous:\n  guest: false\n", encoding="utf-8")
+    set_hermes_home_override(tmp_path)
+    try:
+        (tmp_path / "config.yaml").write_text("nous:\n  guest: false\n", encoding="utf-8")
 
-    assert not connectors_available()
-    assert ensure_guest_identity() is None
-    assert nas.calls == []
+        assert not connectors_available()
+        assert ensure_guest_identity() is None
+        assert nas.calls == []
+    finally:
+        set_hermes_home_override(None)
