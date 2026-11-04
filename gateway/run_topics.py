@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import re
@@ -101,7 +102,8 @@ class GatewayTopicThreadsMixin:
     @staticmethod
     def _is_telegram_dm(source: SessionSource) -> bool:
         plat = getattr(source.platform, "value", source.platform)
-        return (plat == "telegram" or source.platform == Platform.TELEGRAM) and source.chat_type == "dm"
+        chat_type = str(getattr(source, "chat_type", None) or "").lower()
+        return (plat == "telegram" or getattr(source, "platform", None) == Platform.TELEGRAM) and chat_type in ("dm", "private")
 
     def _telegram_topic_mode_enabled(self, source: SessionSource) -> bool:
         """Return whether Telegram DM topic mode is active for this chat."""
@@ -566,7 +568,7 @@ class GatewayTopicThreadsMixin:
             try:
                 fut.result()
             except Exception:
-                logger.debug("%s failed", label, exc_info=True)
+                logger.warning("%s failed", label, exc_info=True)
 
         if future is not None:
             future.add_done_callback(_log_rename_failure)
@@ -594,7 +596,20 @@ class GatewayTopicThreadsMixin:
 
     def _schedule_telegram_topic_title_rename(self, source: SessionSource, session_id: str, title: str) -> None:
         """Schedule a topic rename from the auto-title background thread."""
-        if not title or not self._is_telegram_topic_lane(source) or self._telegram_topic_auto_rename_disabled(source):
+        if not title:
+            logger.debug("Telegram topic rename skipped: empty title (session_id=%s)", session_id)
+            return
+        if not self._is_telegram_topic_lane(source):
+            logger.debug(
+                "Telegram topic rename skipped: not a telegram topic lane (session_id=%s, chat_id=%s, thread_id=%s, chat_type=%s)",
+                session_id, getattr(source, "chat_id", None), getattr(source, "thread_id", None), getattr(source, "chat_type", None),
+            )
+            return
+        if self._telegram_topic_auto_rename_disabled(source):
+            logger.info(
+                "Telegram topic rename skipped: auto-rename disabled in config (session_id=%s, chat_id=%s, thread_id=%s)",
+                session_id, getattr(source, "chat_id", None), getattr(source, "thread_id", None),
+            )
             return
         self._schedule_rename_from_title_thread(
             source,
@@ -612,11 +627,25 @@ class GatewayTopicThreadsMixin:
 
     async def _rename_telegram_topic_for_session_title(self, source: SessionSource, session_id: str, title: str) -> None:
         """Best-effort rename of a Telegram DM topic when Hermes auto-titles a session."""
-        if not await asyncio.to_thread(self._is_telegram_topic_lane, source) or not source.chat_id or not source.thread_id:
+        if not await asyncio.to_thread(self._is_telegram_topic_lane, source):
+            logger.debug(
+                "Telegram topic rename skipped: not a topic lane in rename handler (session_id=%s, chat_id=%s, thread_id=%s)",
+                session_id, getattr(source, "chat_id", None), getattr(source, "thread_id", None),
+            )
+            return
+        if not source.chat_id or not source.thread_id:
+            logger.debug(
+                "Telegram topic rename skipped: missing chat_id or thread_id (session_id=%s, chat_id=%s, thread_id=%s)",
+                session_id, getattr(source, "chat_id", None), getattr(source, "thread_id", None),
+            )
             return
         # Operator kill-switch, e.g. user-managed topics (ad-hoc Threaded Mode) that auto-rename
         # would keep overwriting.
         if self._telegram_topic_auto_rename_disabled(source):
+            logger.info(
+                "Telegram topic rename skipped: auto-rename disabled in config (session_id=%s, chat_id=%s, thread_id=%s)",
+                session_id, getattr(source, "chat_id", None), getattr(source, "thread_id", None),
+            )
             return
         # Skip operator-declared topics (extra.dm_topics): fixed names chosen by the operator;
         # auto-renaming would silently mutate operator config. Check the class, not the instance —
@@ -630,37 +659,65 @@ class GatewayTopicThreadsMixin:
             except Exception:
                 operator_topic = None
             if isinstance(operator_topic, dict) and operator_topic.get("is_static", True):
+                logger.info(
+                    "Telegram topic rename skipped: operator static topic (chat_id=%s, thread_id=%s)",
+                    source.chat_id, source.thread_id,
+                )
                 return
         session_db = getattr(self, "_session_db", None)
         if session_db is not None:
             try:
-                binding = await session_db.get_telegram_topic_binding(
-                    chat_id=str(source.chat_id), thread_id=str(source.thread_id),
-                    profile_name=self._telegram_topic_profile_name(source),
-                )
-                if binding and str(binding.get("session_id") or "") != str(session_id):
-                    return
+                fn = getattr(session_db, "get_telegram_topic_binding", None)
+                if fn is not None:
+                    res = fn(
+                        chat_id=str(source.chat_id),
+                        thread_id=str(source.thread_id),
+                        profile_name=self._telegram_topic_profile_name(source),
+                    )
+                    binding = await res if inspect.isawaitable(res) else res
+                    if binding and str(binding.get("session_id") or "") != str(session_id):
+                        logger.info(
+                            "Telegram topic rename skipped: topic bound to different session (expected=%s, bound=%s, chat_id=%s, thread_id=%s)",
+                            session_id, binding.get("session_id"), source.chat_id, source.thread_id,
+                        )
+                        return
             except Exception:
-                logger.debug("Failed to verify Telegram topic binding before rename", exc_info=True)
+                logger.warning("Failed to verify Telegram topic binding before rename", exc_info=True)
                 return
         if adapter is None:
+            logger.warning(
+                "Telegram topic rename aborted: delivery adapter not found for platform=%s chat_id=%s",
+                getattr(source, "platform", None), getattr(source, "chat_id", None),
+            )
             return
         topic_name = self._sanitize_telegram_topic_title(title)
         try:
             rename_topic = getattr(adapter, "rename_dm_topic", None)
             if rename_topic is not None:
                 await rename_topic(chat_id=str(source.chat_id), thread_id=str(source.thread_id), name=topic_name)
+                logger.info(
+                    "Successfully renamed Telegram topic via adapter.rename_dm_topic (chat_id=%s, thread_id=%s, title=%r)",
+                    source.chat_id, source.thread_id, topic_name,
+                )
                 return
             bot = getattr(adapter, "_bot", None)
             edit_forum_topic = getattr(bot, "edit_forum_topic", None) or getattr(bot, "editForumTopic", None)
             if edit_forum_topic is None:
+                logger.warning(
+                    "Telegram topic rename failed: adapter has no rename_dm_topic or bot.edit_forum_topic (chat_id=%s, thread_id=%s)",
+                    source.chat_id, source.thread_id,
+                )
                 return
             try:
                 await edit_forum_topic(chat_id=int(source.chat_id), message_thread_id=int(source.thread_id), name=topic_name)
             except (TypeError, ValueError):
                 await edit_forum_topic(chat_id=source.chat_id, message_thread_id=source.thread_id, name=topic_name)
+            logger.info(
+                "Successfully renamed Telegram topic via edit_forum_topic (chat_id=%s, thread_id=%s, title=%r)",
+                source.chat_id, source.thread_id, topic_name,
+            )
         except Exception:
-            logger.debug("Failed to rename Telegram topic for auto-generated title", exc_info=True)
+            logger.warning("Failed to rename Telegram topic for auto-generated title", exc_info=True)
 
     # ── /topic command bodies ───────────────────────────────────────────────────────────────
 

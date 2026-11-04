@@ -241,3 +241,47 @@ def test_title_thread_copy_preserves_transport_adapter_ref(monkeypatch):
     assert copied is not source
     assert copied.profile == "runtime-profile"
     assert copied._transport_adapter_ref() is adapter
+
+
+@pytest.mark.asyncio
+async def test_rename_telegram_topic_sync_and_async_session_db():
+    """Verify _rename_telegram_topic_for_session_title handles both sync and async SessionDB."""
+    renamed = []
+
+    class MockAdapter:
+        async def rename_dm_topic(self, chat_id, thread_id, name):
+            renamed.append((chat_id, thread_id, name))
+
+    class SyncDB:
+        def get_telegram_topic_binding(self, *, chat_id, thread_id, profile_name="default"):
+            return {"session_id": "sess-123"}
+
+    class AsyncDB:
+        async def get_telegram_topic_binding(self, *, chat_id, thread_id, profile_name="default"):
+            return {"session_id": "sess-123"}
+
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="12345",
+        chat_type="private",
+        thread_id="42",
+    )
+
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner._is_telegram_topic_lane = lambda s: True
+    runner._telegram_topic_auto_rename_disabled = lambda s: False
+    runner._telegram_topic_profile_name = lambda s: "default"
+    runner._delivery_adapter_for = lambda s: MockAdapter()
+
+    # 1. Sync SessionDB
+    runner._session_db = SyncDB()
+    await runner._rename_telegram_topic_for_session_title(source, "sess-123", "Title Sync")
+    assert renamed[-1] == ("12345", "42", "Title Sync")
+
+    # 2. Async SessionDB
+    runner._session_db = AsyncDB()
+    await runner._rename_telegram_topic_for_session_title(source, "sess-123", "Title Async")
+    assert renamed[-1] == ("12345", "42", "Title Async")
+
+    # 3. chat_type in ('dm', 'private')
+    assert GatewayRunner._is_telegram_dm(source) is True
