@@ -4176,8 +4176,15 @@ class GatewayRunner(
         """Return True when a target is a Telegram private DM topic lane."""
         if platform != Platform.TELEGRAM or thread_id is None:
             return False
-        if chat_type == "dm":
+        if chat_type in ("dm", "private"):
             return True
+        if chat_type is None and chat_id:
+            try:
+                # Telegram user chat IDs are positive integers; groups/supergroups/channels are negative.
+                if int(chat_id) > 0:
+                    return True
+            except (ValueError, TypeError):
+                pass
         # Resolve the lookup on the CLASS, not the instance: getattr() on a MagicMock auto-creates callable
         # children, so an instance lookup would report a DM topic for every test double. Only a dict counts.
         if adapter is not None and chat_id:

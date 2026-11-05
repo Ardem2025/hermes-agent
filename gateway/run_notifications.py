@@ -712,10 +712,22 @@ class GatewayNotificationsMixin(GatewayNotificationOwnershipMixin):
             # adapter.send() catches provider errors (e.g. "Chat not found") and returns
             # SendResult(success=False) rather than raising, so inspect the result before claiming success.
             if _send_failed(result):
-                logger.warning(
-                    "Restart notification to %s:%s was not delivered: %s", platform_str, chat_id, _send_error(result),
-                )
-                return None
+                send_err = _send_error(result)
+                err_lower = str(send_err or "").lower()
+                # If delivery to a topic or thread failed because the thread/anchor was not found,
+                # fall back to delivering the critical restart notice to the root chat so it is not lost.
+                if thread_id and any(m in err_lower for m in ("thread not found", "message to be replied not found", "topic_not_found", "message thread not found")):
+                    logger.warning(
+                        "Restart notification to %s:%s (thread %s) failed (%s); falling back to root chat",
+                        platform_str, chat_id, thread_id, send_err,
+                    )
+                    fallback_meta = _non_conversational_metadata(None, platform=platform)
+                    result = await transport.send(platform, str(chat_id), restart_msg, metadata=fallback_meta)
+                if _send_failed(result):
+                    logger.warning(
+                        "Restart notification to %s:%s was not delivered: %s", platform_str, chat_id, _send_error(result),
+                    )
+                    return None
             logger.info("Sent restart notification to %s:%s", platform_str, chat_id)
             return str(platform_str), str(chat_id), str(thread_id) if thread_id else None
         except Exception as e:
