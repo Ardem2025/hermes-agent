@@ -387,3 +387,117 @@ async def test_shutdown_notifications_are_fully_muted_when_flag_disabled():
     adapter.send.assert_not_awaited()
 
 
+@pytest.mark.asyncio
+async def test_send_restart_notification_telegram_private_dm_topic_metadata(
+    tmp_path, monkeypatch
+):
+    """BDD Scenario 1: Telegram private DM topic with chat_type='private' gets proper reply metadata."""
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+
+    notify_path = tmp_path / ".restart_notify.json"
+    notify_path.write_text(
+        json.dumps(
+            {
+                "platform": "telegram",
+                "chat_id": "139351986",
+                "chat_type": "private",
+                "thread_id": "390702",
+                "message_id": 12345,
+            }
+        )
+    )
+
+    runner, adapter = make_restart_runner()
+    adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="restart-1"))
+
+    delivered = await runner._send_restart_notification()
+
+    assert delivered == ("telegram", "139351986", "390702")
+    adapter.send.assert_awaited_once()
+    chat_id, text = adapter.send.await_args.args
+    assert chat_id == "139351986"
+    metadata = adapter.send.await_args.kwargs["metadata"]
+    assert metadata["thread_id"] == "390702"
+    assert metadata["telegram_dm_topic_reply_fallback"] is True
+    assert metadata["direct_messages_topic_id"] == "390702"
+    assert metadata["telegram_reply_to_message_id"] == "12345"
+    assert not notify_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_send_restart_notification_fallback_on_thread_not_found(
+    tmp_path, monkeypatch, caplog
+):
+    """BDD Scenario 2: When topic delivery returns 'Message thread not found', fall back to root DM."""
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+
+    notify_path = tmp_path / ".restart_notify.json"
+    notify_path.write_text(
+        json.dumps(
+            {
+                "platform": "telegram",
+                "chat_id": "139351986",
+                "chat_type": "private",
+                "thread_id": "390702",
+                "message_id": 12345,
+            }
+        )
+    )
+
+    runner, adapter = make_restart_runner()
+    # First call fails with thread not found, fallback call succeeds
+    adapter.send = AsyncMock(
+        side_effect=[
+            SendResult(success=False, error="Bad Request: Message thread not found"),
+            SendResult(success=True, message_id="restart-fallback"),
+        ]
+    )
+
+    with caplog.at_level("WARNING", logger="gateway.run"):
+        delivered = await runner._send_restart_notification()
+
+    assert delivered == ("telegram", "139351986", "390702")
+    assert adapter.send.await_count == 2
+    # Verify fallback call stripped thread metadata
+    fallback_kwargs = adapter.send.await_args_list[1].kwargs
+    assert fallback_kwargs["metadata"] is None or fallback_kwargs["metadata"] == {}
+    assert not notify_path.exists()
+
+
+def test_is_telegram_dm_topic_target_classification():
+    """BDD Scenario 3: Verify classification across private DMs, supergroups and heuristics."""
+    from gateway.config import Platform
+    from gateway.run import GatewayRunner
+
+    # Scenario 1: Private DM topics
+    assert GatewayRunner._is_telegram_dm_topic_target(
+        Platform.TELEGRAM, "139351986", "390702", chat_type="private"
+    ) is True
+    assert GatewayRunner._is_telegram_dm_topic_target(
+        Platform.TELEGRAM, "139351986", "390702", chat_type="dm"
+    ) is True
+    # Positive chat_id fallback when chat_type is omitted
+    assert GatewayRunner._is_telegram_dm_topic_target(
+        Platform.TELEGRAM, "139351986", "390702", chat_type=None
+    ) is True
+
+    # Scenario 3: Negative chat_id (supergroups/groups)
+    assert GatewayRunner._is_telegram_dm_topic_target(
+        Platform.TELEGRAM, "-1001987654321", "390702", chat_type="supergroup"
+    ) is False
+    assert GatewayRunner._is_telegram_dm_topic_target(
+        Platform.TELEGRAM, "-1001987654321", "390702", chat_type=None
+    ) is False
+
+    # Thread_id is None -> False
+    assert GatewayRunner._is_telegram_dm_topic_target(
+        Platform.TELEGRAM, "139351986", None, chat_type="private"
+    ) is False
+
+    # Other platforms -> False
+    assert GatewayRunner._is_telegram_dm_topic_target(
+        Platform.SLACK, "139351986", "390702", chat_type="private"
+    ) is False
+
+
+
