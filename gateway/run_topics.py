@@ -376,6 +376,12 @@ class GatewayTopicThreadsMixin:
         except Exception as exc:
             logger.warning("telegram topic: failed to mirror opening message %s to thread %s in chat %s: %s",
                            source.message_id, recovered_thread_id, source.chat_id, exc)
+            if any(p in str(exc).lower() for p in ("thread not found", "topic_id_invalid", "topic not found", "message thread not found")):
+                if self._session_db and hasattr(self._session_db, "delete_telegram_topic_binding"):
+                    with suppress(Exception):
+                        await self._session_db.delete_telegram_topic_binding(
+                            chat_id=str(source.chat_id), thread_id=str(recovered_thread_id)
+                        )
 
     # ── title sanitizers ────────────────────────────────────────────────────────────────────
 
@@ -716,8 +722,14 @@ class GatewayTopicThreadsMixin:
                 "Successfully renamed Telegram topic via edit_forum_topic (chat_id=%s, thread_id=%s, title=%r)",
                 source.chat_id, source.thread_id, topic_name,
             )
-        except Exception:
-            logger.warning("Failed to rename Telegram topic for auto-generated title", exc_info=True)
+        except Exception as exc:
+            logger.warning("Failed to rename Telegram topic for auto-generated title: %s", exc, exc_info=True)
+            if any(p in str(exc).lower() for p in ("thread not found", "topic_id_invalid", "topic not found", "message thread not found")):
+                if self._session_db and hasattr(self._session_db, "delete_telegram_topic_binding"):
+                    with suppress(Exception):
+                        await self._session_db.delete_telegram_topic_binding(
+                            chat_id=str(source.chat_id), thread_id=str(source.thread_id)
+                        )
 
     # ── /topic command bodies ───────────────────────────────────────────────────────────────
 

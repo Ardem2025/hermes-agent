@@ -1106,7 +1106,8 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
 
     @staticmethod
     def _is_thread_not_found_error(error: Exception) -> bool:
-        return "thread not found" in str(error).lower()
+        err_msg = str(error).lower()
+        return any(p in err_msg for p in ("thread not found", "topic not found", "topic_id_invalid", "message thread not found"))
 
     def _prune_stale_dm_topic_binding(self, chat_id: Any, thread_id: Any, *, metadata: Optional[dict[str, Any]] = None) -> None:
         """Drop the stale ``telegram_dm_topic_bindings`` row for a topic Telegram confirmed deleted, else
@@ -3564,6 +3565,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
                 if _BadReq and isinstance(send_err, _BadReq):
                     if self._is_thread_not_found_error(send_err) and effective_thread_id is not None:
                         if private_dm_topic_send or (metadata and metadata.get("telegram_dm_topic_created_for_send")):
+                            self._prune_stale_dm_topic_binding(chat_id, effective_thread_id, metadata=metadata)
                             return SendResult(success=False, error=str(send_err), retryable=False)
                         # One-off "thread not found" flakes recover on immediate retry: same thread_id once.
                         if not retried_thread_not_found:

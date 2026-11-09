@@ -60,7 +60,7 @@ MAX_DERIVED_TITLE_CHARS = 48
 _MAX_TITLE_WORDS = 12
 # Output budget for the title call: room for a fenced/prefixed JSON reply and for a reasoning model that
 # thinks despite the thinking-disabled request, without letting a runaway reply burn minutes.
-TITLE_MAX_TOKENS = 512
+TITLE_MAX_TOKENS = 1024
 
 # The example titles shown to the model in the prompt, and the echo-guard
 # set: when the opening message carries little topical signal, a small model
