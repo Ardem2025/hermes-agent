@@ -133,6 +133,33 @@ class GatewayTopicThreadsMixin:
             and str(source.thread_id or "") in self._TELEGRAM_GENERAL_TOPIC_IDS
         )
 
+    async def _maybe_force_create_telegram_dm_topic(self, source: SessionSource, event, text: str = "") -> Optional[int]:
+        """Attempt to force-create a DM forum topic when a message arrives in General.
+        Returns message_thread_id or None if failed/unsupported.
+        """
+        plat = getattr(source, "platform", None)
+        plat_str = plat.value if hasattr(plat, "value") else str(plat or "")
+        if plat_str != "telegram":
+            return None
+        if not self._is_telegram_topic_root_lobby(source):
+            return None
+        adapter = getattr(self, "_delivery_adapter_for", lambda s: None)(source)
+        if not adapter or not hasattr(adapter, "_create_dm_topic"):
+            return None
+
+        raw_title = (text or getattr(event, "text", "") or "").strip().split("\n")[0].strip()
+        topic_title = re.sub(r'[\r\n\t]+', ' ', raw_title)[:64].strip() or "Новый диалог"
+
+        try:
+            chat_id_int = int(source.chat_id)
+            thread_id = await adapter._create_dm_topic(chat_id_int, topic_title)
+            if thread_id is not None:
+                logger.info("[gateway] Force created Telegram DM topic %s ('%s') for chat %s", thread_id, topic_title, source.chat_id)
+                return int(thread_id)
+        except Exception as exc:
+            logger.warning("[gateway] Failed to force create Telegram DM topic in chat %s: %s", source.chat_id, exc)
+        return None
+
     def _is_telegram_topic_lane(self, source: SessionSource) -> bool:
         """True for a user-created Telegram private-chat topic lane."""
         tid = str(source.thread_id or "")
@@ -251,20 +278,7 @@ class GatewayTopicThreadsMixin:
         except Exception:
             logger.debug("topic-recover: recent topic creation check failed", exc_info=True)
 
-        session_db = self._sync_session_db()
-        if session_db is None:
-            return None
-        try:
-            bindings = session_db.list_telegram_topic_bindings_for_chat(
-                chat_id=str(source.chat_id), profile_name=self._telegram_topic_profile_name(source)
-            )
-        except Exception:
-            logger.debug("topic-recover: read failed", exc_info=True)
-            return None
-        for b in bindings or ():  # newest-first
-            if str(b.get("user_id") or "") == str(source.user_id):
-                recovered = str(b.get("thread_id") or "")
-                return recovered if recovered and recovered != inbound else None
+        # General messages remain in General; do not redirect arbitrary messages to old topics
         return None
 
     # ── Telegram topic mode: /topic activation helpers ──────────────────────────────────────
@@ -379,9 +393,11 @@ class GatewayTopicThreadsMixin:
             if any(p in str(exc).lower() for p in ("thread not found", "topic_id_invalid", "topic not found", "message thread not found")):
                 if self._session_db and hasattr(self._session_db, "delete_telegram_topic_binding"):
                     with suppress(Exception):
-                        await self._session_db.delete_telegram_topic_binding(
+                        _del_res = self._session_db.delete_telegram_topic_binding(
                             chat_id=str(source.chat_id), thread_id=str(recovered_thread_id)
                         )
+                        if inspect.isawaitable(_del_res):
+                            await _del_res
 
     # ── title sanitizers ────────────────────────────────────────────────────────────────────
 
@@ -727,9 +743,11 @@ class GatewayTopicThreadsMixin:
             if any(p in str(exc).lower() for p in ("thread not found", "topic_id_invalid", "topic not found", "message thread not found")):
                 if self._session_db and hasattr(self._session_db, "delete_telegram_topic_binding"):
                     with suppress(Exception):
-                        await self._session_db.delete_telegram_topic_binding(
+                        _del_res = self._session_db.delete_telegram_topic_binding(
                             chat_id=str(source.chat_id), thread_id=str(source.thread_id)
                         )
+                        if inspect.isawaitable(_del_res):
+                            await _del_res
 
     # ── /topic command bodies ───────────────────────────────────────────────────────────────
 

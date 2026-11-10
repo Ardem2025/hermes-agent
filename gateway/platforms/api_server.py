@@ -1411,16 +1411,41 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
     def _user_facing_message_text(self, message: Any) -> Optional[str]:
         if not isinstance(message, dict):
             return None
+        role = str(message.get("role", "")).lower()
+        if role not in ("user", "assistant"):
+            return None
+        display_kind = message.get("display_kind")
+        if display_kind in ("internal_notification", "hidden", "session_meta", "async_delegation_complete"):
+            return None
         content = message.get("content")
+        clean: Optional[str] = None
         if isinstance(content, str):
-            return content
-        if isinstance(content, list):
+            clean = content.strip()
+        elif isinstance(content, list):
             parts = []
             for p in content:
                 if isinstance(p, dict) and p.get("type") == "text":
-                    parts.append(p.get("text", ""))
-            return "\n".join(parts)
-        return str(content) if content is not None else None
+                    text_val = p.get("text", "")
+                    if text_val:
+                        parts.append(text_val)
+            joined = "\n".join(parts).strip()
+            clean = joined if joined else None
+
+        if not clean:
+            return None
+
+        # Filter out internal/system payloads stored under role='user'
+        internal_prefixes = (
+            "[ASYNC DELEGATION BATCH COMPLETE",
+            "[CONTEXT COMPACTION",
+            "[INTERNAL NOTIFICATION",
+            "<memory-context>",
+            "[OUT-OF-BAND USER MESSAGE",
+        )
+        if clean.startswith(internal_prefixes):
+            return None
+
+        return clean
 
     def _telegram_sync_text(self, message: Any, text: Optional[str]) -> str:
         res = text or ""
@@ -1450,6 +1475,10 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         _, telegram_adapter = self._telegram_runner_and_adapter()
         if not telegram_adapter:
             return {"status": "unavailable", "error": "telegram_not_connected"}
+
+        role_str = str(role or "").lower()
+        if role_str not in ("user", "assistant"):
+            return {"status": "skipped", "reason": f"non_deliverable_role_{role_str}"}
 
         if not content:
             return {"status": "skipped", "reason": "empty_content"}
@@ -1519,17 +1548,20 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             raw_messages = db.get_messages(resolved_id) if hasattr(db, "get_messages") else []
 
             if checkpoint is None:
-                max_id = max((m.get("id") for m in raw_messages if isinstance(m.get("id"), int)), default=None)
-                if max_id is not None and hasattr(db, "advance_telegram_topic_sync_checkpoint"):
-                    db.advance_telegram_topic_sync_checkpoint(session_id=session_id, message_id=max_id)
-                delivery["skipped"] = len(raw_messages)
-                return delivery
+                checkpoint = 0
 
             for message in raw_messages:
                 message_id = message.get("id")
                 if not isinstance(message_id, int) or (checkpoint is not None and message_id <= checkpoint):
                     continue
                 if message.get("platform_message_id"):
+                    delivery["skipped"] += 1
+                    if hasattr(db, "advance_telegram_topic_sync_checkpoint"):
+                        db.advance_telegram_topic_sync_checkpoint(session_id=session_id, message_id=message_id)
+                    continue
+
+                role = str(message.get("role", "")).lower()
+                if role not in ("user", "assistant") or message.get("tool_name") or message.get("tool_call_id"):
                     delivery["skipped"] += 1
                     if hasattr(db, "advance_telegram_topic_sync_checkpoint"):
                         db.advance_telegram_topic_sync_checkpoint(session_id=session_id, message_id=message_id)
@@ -3450,8 +3482,9 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             is_gen = False
             tool_status = None
             current_tool = None
+            is_ended = bool(session.get("ended_at") or session.get("end_reason"))
             runner = getattr(self, "gateway_runner", None)
-            if runner:
+            if runner and not is_ended:
                 adapters_to_check = list(getattr(runner, "adapters", {}).values())
                 prof_adapters = getattr(runner, "_profile_adapters", {})
                 if isinstance(prof_adapters, dict):
@@ -3961,6 +3994,11 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                     return web.json_response(_openai_error("Session is already bound to another Telegram topic", code="telegram_binding_conflict"), status=409)
                 if "delivery_enabled" in body and hasattr(db, "set_telegram_topic_delivery_enabled"):
                     await asyncio.to_thread(db.set_telegram_topic_delivery_enabled, session_id=session_id, delivery_enabled=delivery_enabled)
+                    if delivery_enabled and str(body.get("backfill") or "").lower() == "all":
+                        try:
+                            await asyncio.shield(self._sync_telegram_history(session_id))
+                        except Exception as sync_exc:
+                            logger.warning("[WebUI] History re-sync failed for session %s: %s", session_id, sync_exc)
                     existing = await asyncio.to_thread(db.get_telegram_topic_binding_by_session, session_id=session_id)
                 return web.json_response(self._telegram_binding_response(session_id, existing))
             if not chat_id:
@@ -3983,12 +4021,18 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             from gateway.session import SessionSource, build_session_key
             source = SessionSource(Platform.TELEGRAM, chat_id, chat_type="dm", user_id=str(body.get("user_id") or chat_id), thread_id=thread_id)
             session_key = runner._session_key_for_source(source) if runner and hasattr(runner, "_session_key_for_source") else build_session_key(source)
+            backfill_pref = str(body.get("backfill") or "all").strip().lower()
             if hasattr(db, "bind_telegram_topic"):
                 await asyncio.to_thread(
                     db.bind_telegram_topic,
                     chat_id=chat_id, thread_id=thread_id, user_id=source.user_id or "",
                     session_key=session_key, session_id=session_id, managed_mode="api", delivery_enabled=delivery_enabled
                 )
+            if delivery_enabled and backfill_pref != "none":
+                try:
+                    await asyncio.shield(self._sync_telegram_history(session_id))
+                except Exception as sync_exc:
+                    logger.warning("[WebUI] Immediate history backfill failed for session %s: %s", session_id, sync_exc)
             binding = await asyncio.to_thread(db.get_telegram_topic_binding_by_session, session_id=session_id)
             return web.json_response(self._telegram_binding_response(session_id, binding), status=201)
         except Exception as e:
@@ -4303,6 +4347,14 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         duplicate_to_telegram = bool(
             ctx["body"].get("duplicate_to_telegram") if "duplicate_to_telegram" in ctx["body"] else self.is_telegram_bound(session_id)
         )
+        if duplicate_to_telegram:
+            db = self._ensure_session_db()
+            binding = db.get_telegram_topic_binding_by_session(session_id=session_id) if (db and hasattr(db, "get_telegram_topic_binding_by_session")) else None
+            if binding and binding.get("last_synced_message_id") is None:
+                raw_msgs = db.get_messages(session_id) if hasattr(db, "get_messages") else []
+                base_cp = max((m.get("id") for m in raw_msgs if isinstance(m.get("id"), int)), default=0)
+                if hasattr(db, "advance_telegram_topic_sync_checkpoint"):
+                    db.advance_telegram_topic_sync_checkpoint(session_id=session_id, message_id=base_cp)
         if duplicate_to_telegram and user_message:
             fwd = await self._forward_to_telegram(session_id, "user", user_message)
             if fwd.get("status") == "sent":
@@ -4324,8 +4376,10 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 with suppress(asyncio.CancelledError, Exception):
                     await heartbeat_task
             if duplicate_to_telegram:
-                with suppress(Exception):
+                try:
                     await asyncio.shield(self._sync_telegram_history(session_id))
+                except Exception as exc:
+                    logger.warning("Telegram sync failed for session %s: %s", session_id, exc, exc_info=True)
         # One policy-gated re-run of a transiently failed turn — the peer-DM transport's half of the
         # retry the local (``tools.bot_mode_dm``) and relayed (``tui_gateway.methods_bot_relay``)
         # delivery lanes already apply (#93091 item 5, #115325). Same policy, same gate: transient
@@ -4417,6 +4471,14 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 self._set_run_status(run_id, "running", last_event="run.started")
                 await queue.put(_event_payload("message.started", {"message": {"id": message_id, "role": "assistant"}}))
                 
+                if duplicate_to_telegram:
+                    db = self._ensure_session_db()
+                    binding = db.get_telegram_topic_binding_by_session(session_id=session_id) if (db and hasattr(db, "get_telegram_topic_binding_by_session")) else None
+                    if binding and binding.get("last_synced_message_id") is None:
+                        raw_msgs = db.get_messages(session_id) if hasattr(db, "get_messages") else []
+                        base_cp = max((m.get("id") for m in raw_msgs if isinstance(m.get("id"), int)), default=0)
+                        if hasattr(db, "advance_telegram_topic_sync_checkpoint"):
+                            db.advance_telegram_topic_sync_checkpoint(session_id=session_id, message_id=base_cp)
                 if duplicate_to_telegram and user_message:
                     fwd = await self._forward_to_telegram(session_id, "user", user_message)
                     if fwd.get("status") == "sent":
@@ -4442,8 +4504,10 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                         with suppress(asyncio.CancelledError, Exception):
                             await heartbeat_task
                     if duplicate_to_telegram:
-                        with suppress(Exception):
+                        try:
                             await asyncio.shield(self._sync_telegram_history(session_id))
+                        except Exception as exc:
+                            logger.warning("Telegram sync failed for session %s: %s", session_id, exc, exc_info=True)
                 is_dict = isinstance(result, dict)
                 final_response = _resolve_media_to_data_urls(result.get("final_response", "") if is_dict else "")
                 effective_session_id = result.get("session_id", session_id) if is_dict else session_id
@@ -4464,6 +4528,11 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                     # GET /v1/runs/{run_id}; POST /v1/runs already records output in `_finish`.
                     output=final_response, usage=usage,
                     last_event=f"run.{status}", **fields)
+                if duplicate_to_telegram:
+                    try:
+                        await asyncio.shield(self._sync_telegram_history(effective_session_id))
+                    except Exception as post_sync_exc:
+                        logger.warning("Post-turn Telegram sync failed for session %s: %s", effective_session_id, post_sync_exc)
             except asyncio.CancelledError:
                 self._set_run_status(run_id, "cancelled", last_event="run.cancelled")
                 raise

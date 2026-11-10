@@ -1328,10 +1328,42 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
         # conversational "yes" would execute a dangerous command.
         if not is_internal:
             if await asyncio.to_thread(self._is_telegram_topic_root_lobby, source):
-                # Debounced so a user who forgets about topic mode doesn't get ten reminders.
-                if self._should_send_telegram_lobby_reminder(source):
-                    return self._telegram_topic_root_lobby_message()
-                return None
+                new_tid = None
+                if hasattr(self, "_maybe_force_create_telegram_dm_topic"):
+                    new_tid = await self._maybe_force_create_telegram_dm_topic(source, event, getattr(event, "text", ""))
+                if new_tid:
+                    source = dataclasses.replace(source, thread_id=str(new_tid))
+                    if hasattr(event, "message_thread_id"):
+                        event.message_thread_id = new_tid
+                    if hasattr(event, "source") and event.source is not None:
+                        event.source = source
+                    _quick_key = self._session_key_for_source(source)
+                    with suppress(Exception):
+                        import inspect
+                        s_key = _quick_key
+                        s_id = getattr(source, "session_id", None) or s_key
+                        if getattr(self, "_session_db", None) is not None and hasattr(self._session_db, "rebind_telegram_topic"):
+                            rebind_call = self._session_db.rebind_telegram_topic(
+                                chat_id=str(source.chat_id),
+                                thread_id=str(new_tid),
+                                user_id=str(source.user_id or ""),
+                                session_key=s_key,
+                                session_id=s_id,
+                                profile_name=getattr(self, "profile_name", "default"),
+                            )
+                            if inspect.isawaitable(rebind_call):
+                                await rebind_call
+                else:
+                    if self._should_send_telegram_lobby_reminder(source):
+                        with suppress(Exception):
+                            adapter = self._delivery_adapter_for(source) if hasattr(self, "_delivery_adapter_for") else None
+                            if adapter and hasattr(adapter, "send"):
+                                affirmation = (
+                                    "🌿 Приветствую! Обрабатываю ваш запрос непосредственно здесь, в основном диалоге. "
+                                    "Все функции, память и сервисы активны в штатном режиме. "
+                                    "При необходимости вы всегда можете продолжить работу в отдельных темах."
+                                )
+                                asyncio.create_task(adapter.send(chat_id=str(source.chat_id), content=affirmation, reply_to=None))
             # External-drain new-turn gate: when NAS engaged an external drain (.drain_request.json,
             # seen by _drain_control_watcher), refuse to START new turns so the in-flight set can
             # only fall to zero. Reversible.

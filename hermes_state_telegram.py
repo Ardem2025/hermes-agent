@@ -371,6 +371,58 @@ class SessionTelegramTopicsMixin:
                     """, (profile_name, chat_id, thread_id, user_id, session_key, session_id, managed_mode, now, now))
         self._execute_write(_do)
 
+    def rebind_telegram_topic(
+        self, *, chat_id: str, thread_id: str, user_id: str, session_key: str,
+        session_id: str, managed_mode: str = "auto", profile_name: str = "default",
+        delivery_enabled: bool = True,
+    ) -> None:
+        """Atomically rebind a session to a new topic without clearing topic mode or raising ValueError."""
+        self.apply_telegram_topic_migration()
+        now = time.time()
+        chat_id, thread_id, user_id = str(chat_id), str(thread_id), str(user_id)
+        session_key, session_id = str(session_key), str(session_id)
+        profile_name = _normalize_telegram_topic_profile_name(profile_name)
+
+        def _do(conn):
+            conn.execute(
+                "DELETE FROM telegram_dm_topic_bindings WHERE profile_name = ? AND session_id = ?",
+                (profile_name, session_id),
+            )
+            cols = {row[1] for row in conn.execute("PRAGMA table_info('telegram_dm_topic_bindings')")}
+            if "delivery_enabled" in cols:
+                conn.execute("""
+                    INSERT INTO telegram_dm_topic_bindings (
+                        profile_name, chat_id, thread_id, user_id, session_key, session_id,
+                        managed_mode, delivery_enabled, linked_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(profile_name, chat_id, thread_id) DO UPDATE SET
+                        user_id = excluded.user_id,
+                        session_key = excluded.session_key,
+                        session_id = excluded.session_id,
+                        managed_mode = excluded.managed_mode,
+                        delivery_enabled = excluded.delivery_enabled,
+                        updated_at = excluded.updated_at
+                """, (profile_name, chat_id, thread_id, user_id, session_key, session_id, managed_mode, 1 if delivery_enabled else 0, now, now))
+            else:
+                conn.execute("""
+                    INSERT INTO telegram_dm_topic_bindings (
+                        profile_name, chat_id, thread_id, user_id, session_key, session_id,
+                        managed_mode, linked_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(profile_name, chat_id, thread_id) DO UPDATE SET
+                        user_id = excluded.user_id,
+                        session_key = excluded.session_key,
+                        session_id = excluded.session_id,
+                        managed_mode = excluded.managed_mode,
+                        updated_at = excluded.updated_at
+                """, (profile_name, chat_id, thread_id, user_id, session_key, session_id, managed_mode, now, now))
+            conn.execute("""
+                INSERT INTO telegram_dm_topic_mode (profile_name, chat_id, user_id, enabled, activated_at, updated_at)
+                VALUES (?, ?, ?, 1, ?, ?)
+                ON CONFLICT(profile_name, chat_id) DO UPDATE SET enabled = 1, updated_at = excluded.updated_at
+            """, (profile_name, chat_id, user_id, now, now))
+        self._execute_write(_do)
+
     def set_telegram_topic_delivery_enabled(self, session_id: str, delivery_enabled: bool) -> bool:
         """Update whether outbound delivery to Telegram is enabled for this session's topic."""
         self.apply_telegram_topic_migration()
