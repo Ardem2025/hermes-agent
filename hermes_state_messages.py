@@ -448,7 +448,8 @@ class SessionMessagesMixin:
                 (session_id, delegation_id, metadata.get("delivery_notice", ""))).fetchone()
             if existing is not None:
                 return existing[0]
-            self._check_transcript_write_guards(conn, session_id, None, reject_active_turn_lease=True)
+            # Internal subagent delivery rows are append-only and deduplicated; do not reject under active turn lease
+            self._check_transcript_write_guards(conn, session_id, None)
             msg_id = conn.execute(_INSERT_MESSAGE_SQL, params).lastrowid
             self._bump_session_counters(conn, session_id, 1, 0, unit=True)
             return msg_id
