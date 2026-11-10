@@ -1432,7 +1432,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
         metadata_reply_to = self._metadata_reply_to_message_id(metadata)
         private_dm_topic_send = self._is_private_dm_topic_send(chat_id, thread_id, metadata)
         dm_topic_reply_to_off = private_dm_topic_send and self._reply_to_mode == "off" and self._dm_topic_fallback(metadata)
-        reply_to_source = reply_to or (str(metadata_reply_to) if private_dm_topic_send and metadata_reply_to is not None else None)
+        reply_to_source = reply_to or (str(metadata_reply_to) if metadata_reply_to is not None else None)
         if private_dm_topic_send:
             should_thread = reply_to_source is not None and self._reply_to_mode != "off"
         else:
@@ -3567,14 +3567,14 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
                         if private_dm_topic_send or (metadata and metadata.get("telegram_dm_topic_created_for_send")):
                             self._prune_stale_dm_topic_binding(chat_id, effective_thread_id, metadata=metadata)
                             return SendResult(success=False, error=str(send_err), retryable=False)
-                        # One-off "thread not found" flakes recover on immediate retry: same thread_id once.
-                        if not retried_thread_not_found:
-                            retried_thread_not_found = True
-                            logger.warning("[%s] Thread %s not found, retrying once with same thread_id", self.name, effective_thread_id)
-                            continue
-                        # Thread is genuinely gone: retry without it and prune the stale binding.
-                        logger.warning("[%s] Thread %s not found, retrying without message_thread_id", self.name, effective_thread_id)
+                        # Thread is genuinely gone: fast-fail fallback immediately to General (no slow retries)
+                        logger.warning("[%s] Thread %s not found, fast-falling back to General without message_thread_id", self.name, effective_thread_id)
                         self._prune_stale_dm_topic_binding(chat_id, effective_thread_id, metadata=metadata)
+                        getattr(self, "_recent_dm_topic_creations", {}).pop(str(chat_id), None)
+                        if reply_to_id is None:
+                            recovered = reply_to or self._metadata_reply_to_message_id(metadata)
+                            if recovered:
+                                reply_to_id = int(recovered)
                         used_thread_fallback = True
                         effective_thread_id = None
                         thread_kwargs = {"message_thread_id": None}
