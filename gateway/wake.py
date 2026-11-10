@@ -254,3 +254,109 @@ async def _self_post_chat_completion(adapter: Any, *, text: str, session_id: str
     raise RuntimeError(
         f"wake self-post gave up for session {session_id} after {attempts} attempts: {last_err}"
     ) from last_err
+
+
+_CONSECUTIVE_AUTO_WAKES: dict[str, int] = {}
+MAX_CONSECUTIVE_AUTO_WAKES: int = 10
+
+
+def get_consecutive_auto_wakes(session_id: str) -> int:
+    return _CONSECUTIVE_AUTO_WAKES.get(str(session_id), 0)
+
+
+def increment_consecutive_auto_wakes(session_id: str) -> int:
+    sid = str(session_id)
+    _CONSECUTIVE_AUTO_WAKES[sid] = _CONSECUTIVE_AUTO_WAKES.get(sid, 0) + 1
+    return _CONSECUTIVE_AUTO_WAKES[sid]
+
+
+def reset_consecutive_auto_wakes(session_id: str) -> None:
+    _CONSECUTIVE_AUTO_WAKES.pop(str(session_id), None)
+
+
+def check_coordinator_wake_eligibility(session_id: str, adapter: Any, evt: Optional[dict] = None) -> bool:
+    """Check if an async_delegation completion event should autonomously wake a coordinator session.
+
+    Conditions for auto-wake:
+    1. Pending human gates (clarifications/choice prompts) MUST be clear.
+    2. Bounded loop protection: consecutive_auto_wakes must be strictly less than MAX_CONSECUTIVE_AUTO_WAKES (10).
+    3. The session must be an active SpDD coordinator (active passport under ~/.hermes/tasks/*/state.json
+       matching session_id or in_progress, or auto_resume_on_delegation=True in session/event metadata).
+    """
+    if not session_id:
+        return False
+
+    sid = str(session_id)
+
+    # 1. Check pending clarify
+    try:
+        from tools import clarify_gateway
+        if clarify_gateway.get_pending_for_session(sid, include_choice_prompts=True) is not None:
+            logger.info("coordinator auto-wake suppressed: pending clarify/choice gate for session %s", sid)
+            return False
+    except Exception as exc:
+        logger.debug("clarify_gateway check error for session %s: %s", sid, exc)
+
+    # 2. Check loop bounds
+    if get_consecutive_auto_wakes(sid) >= MAX_CONSECUTIVE_AUTO_WAKES:
+        logger.warning(
+            "coordinator auto-wake suppressed: reached ceiling of %d consecutive auto-wakes for session %s",
+            MAX_CONSECUTIVE_AUTO_WAKES, sid
+        )
+        return False
+
+    # 3. Check if SpDD coordinator intent
+    # 3a. Event metadata
+    if evt:
+        if evt.get("auto_resume_on_delegation") is True or evt.get("auto_resume") is True:
+            return True
+        meta = evt.get("metadata")
+        if isinstance(meta, dict) and (meta.get("auto_resume_on_delegation") or meta.get("auto_resume")):
+            return True
+
+    # 3b. Session metadata via adapter / SessionDB
+    if adapter is not None:
+        ensure = getattr(adapter, "_ensure_session_db", None)
+        if callable(ensure):
+            try:
+                db_inst: Any = ensure()
+                get_sess = getattr(db_inst, "get_session", None)
+                if callable(get_sess):
+                    row = get_sess(sid)
+                    if row:
+                        smeta = row.get("metadata") or {}
+                        if isinstance(smeta, str):
+                            import json
+                            try:
+                                smeta = json.loads(smeta)
+                            except Exception:
+                                smeta = {}
+                        if smeta.get("auto_resume_on_delegation") or smeta.get("coordinator_role"):
+                            return True
+            except Exception as exc:
+                logger.debug("session metadata check error for session %s: %s", sid, exc)
+
+    # 3c. Active SpDD task passport in ~/.hermes/tasks/*/state.json
+    try:
+        from pathlib import Path
+        import json
+        tasks_dir = Path.home() / ".hermes" / "tasks"
+        if tasks_dir.is_dir():
+            for passport in sorted(tasks_dir.glob("*/state.json")):
+                try:
+                    data = json.loads(passport.read_text(encoding="utf-8"))
+                    p_status = data.get("status")
+                    p_sid = data.get("session_id")
+                    if p_sid == sid:
+                        if p_status in ("in_progress", "active"):
+                            return True
+                    elif p_status in ("in_progress", "active"):
+                        # If active task passport has no explicit session_id bound, or matches coordinator
+                        return True
+                except Exception:
+                    continue
+    except Exception as exc:
+        logger.debug("task passport search error for session %s: %s", sid, exc)
+
+    return False
+

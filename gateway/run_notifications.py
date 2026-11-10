@@ -1048,16 +1048,28 @@ class GatewayNotificationsMixin(GatewayNotificationOwnershipMixin):
     async def _self_post_api_server(self, adapter, synth_text: str, raw_sid: str, evt: dict) -> bool:
         """Deliver to a non-push (api_server) session by raw session id.
 
-        Async-delegation completions are persisted as a durable delivery row — after the parent
-        turn's event.complete the CLIENT owns the next turn on this stateless surface, so never
-        self-post them as a new role=user prompt. Other watch events wake the session via self-post.
+        Async-delegation completions are persisted unconditionally as a durable delivery row
+        for UI presentation and ledger bookkeeping. In addition, if the session is an active
+        SpDD coordinator (and human clarify gates are clear), autonomous wake turn is triggered.
+        Other watch events wake the session via self-post.
         """
-        from gateway.wake import deliver_wake, persist_delegation_delivery
+        from gateway.wake import (
+            deliver_wake,
+            persist_delegation_delivery,
+            check_coordinator_wake_eligibility,
+            increment_consecutive_auto_wakes,
+        )
         scope = contextlib.nullcontext()
         if evt.get("type") == "async_delegation":
-            info = "Async delegation completion — persisting delivery row for api_server session %s (no wake turn)"
+            info = "Async delegation completion — persisting delivery row for api_server session %s"
             fail = "Async delegation delivery persist failed for session %s: %s"
-            deliver = lambda: persist_delegation_delivery(adapter, text=synth_text, session_id=raw_sid, evt=evt)
+            async def _deliver_delegation():
+                await persist_delegation_delivery(adapter, text=synth_text, session_id=raw_sid, evt=evt)
+                if check_coordinator_wake_eligibility(raw_sid, adapter, evt):
+                    logger.info("Coordinator wake eligibility confirmed for session %s — triggering autonomous turn", raw_sid)
+                    increment_consecutive_auto_wakes(raw_sid)
+                    await deliver_wake(adapter, text=_mark_internal_notification(synth_text), session_id=raw_sid)
+            deliver = _deliver_delegation
         else:
             info = "Watch pattern notification — waking api_server session %s via self-post"
             fail = "Watch notification self-post wake failed for session %s: %s"
