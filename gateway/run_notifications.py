@@ -1068,7 +1068,12 @@ class GatewayNotificationsMixin(GatewayNotificationOwnershipMixin):
                 if check_coordinator_wake_eligibility(raw_sid, adapter, evt):
                     logger.info("Coordinator wake eligibility confirmed for session %s — triggering autonomous turn", raw_sid)
                     increment_consecutive_auto_wakes(raw_sid)
-                    await deliver_wake(adapter, text=_mark_internal_notification(synth_text), session_id=raw_sid)
+                    async def _background_wake():
+                        try:
+                            await deliver_wake(adapter, text=_mark_internal_notification(synth_text), session_id=raw_sid)
+                        except Exception as w_exc:
+                            logger.warning("Decoupled coordinator wake failed for session %s: %s", raw_sid, w_exc)
+                    asyncio.create_task(_background_wake())
             deliver = _deliver_delegation
         else:
             info = "Watch pattern notification — waking api_server session %s via self-post"
@@ -1809,48 +1814,97 @@ class GatewayNotificationsMixin(GatewayNotificationOwnershipMixin):
         consumer; both must progress without a later foreground turn.
         """
         await asyncio.sleep(3)  # let platforms finish connecting
+        from collections import deque
         from tools.async_delegation import ORPHAN_SWEEP_INTERVAL_S
         from tools.process_registry import process_registry as _pr
         last_orphan_sweep = None
-        while self._running:
-            with _log_suppressed(logging.DEBUG, "Async delegation watcher error: %s"):
-                # Completions whose owner process died while this gateway runs (#97202).
-                if last_orphan_sweep is None or time.monotonic() - last_orphan_sweep >= ORPHAN_SWEEP_INTERVAL_S:
-                    last_orphan_sweep = time.monotonic()
-                    await asyncio.to_thread(self._sweep_orphaned_completion_ledgers)
-                # Pattern events also need an idle consumer; foreground turns are optional.
-                await self._drain_watch_notifications(_pr.completion_queue)
-                # Process completions remain owned by their per-process watchers.
-                requeue = []
-                async_events = []
-                while not _pr.completion_queue.empty():
-                    try:
-                        evt = _pr.completion_queue.get_nowait()
-                    except Exception:
+        max_workers = 16
+        sem = asyncio.Semaphore(max_workers)
+        route_pending: dict[tuple[str, ...], deque[list[dict]]] = {}
+        route_tasks: dict[tuple[str, ...], asyncio.Task] = {}
+        active_tasks: set[asyncio.Task] = set()
+
+        async def _route_worker(route_key: tuple[str, ...]) -> None:
+            async with sem:
+                while self._running:
+                    pending_queue = route_pending.get(route_key)
+                    if not pending_queue:
                         break
-                    (async_events if evt.get("type") == "async_delegation" else requeue).append(evt)
-                for evt in requeue:
-                    _pr.completion_queue.put(evt)
-                # A fan-out finishing together yields N completions for one session; group by full route +
-                # parent session so each group becomes ONE consolidated turn.
-                # A same-tick drain often carries several completions for the SAME originating session (a
-                # fan-out of background subagents finishing together). Events for different sessions never
-                # coalesce. See #70300.
-                groups: dict[tuple[str, ...], list[dict]] = {}
-                for evt in async_events:
-                    self._enrich_async_delegation_routing(evt)
-                    groups.setdefault(self._event_route_key(evt, self._ASYNC_GROUP_KEY_FIELDS), []).append(evt)
-                for group in groups.values():
+                    group = pending_queue.popleft()
                     try:
                         delivered = await self._deliver_async_delegation_group(group)
                         if delivered is False:
-                            for evt in group:
-                                _pr.completion_queue.put(evt)
+                            # Retain oldest failed group ahead of later groups on retry
+                            pending_queue.appendleft(group)
+                            break
+                    except asyncio.CancelledError:
+                        pending_queue.appendleft(group)
+                        raise
                     except Exception as e:
-                        for evt in group:
-                            _pr.completion_queue.put(evt)
+                        pending_queue.appendleft(group)
                         logger.error("Async delegation injection error: %s", e)
-            await asyncio.sleep(interval)
+                        break
+
+        def _on_route_worker_done(route_key: tuple[str, ...], task: asyncio.Task) -> None:
+            active_tasks.discard(task)
+            if route_tasks.get(route_key) is task:
+                route_tasks.pop(route_key, None)
+            if route_key in route_pending and not route_pending[route_key]:
+                route_pending.pop(route_key, None)
+
+        try:
+            while self._running:
+                with _log_suppressed(logging.DEBUG, "Async delegation watcher error: %s"):
+                    # Completions whose owner process died while this gateway runs (#97202).
+                    if last_orphan_sweep is None or time.monotonic() - last_orphan_sweep >= ORPHAN_SWEEP_INTERVAL_S:
+                        last_orphan_sweep = time.monotonic()
+                        await asyncio.to_thread(self._sweep_orphaned_completion_ledgers)
+                    # Pattern events also need an idle consumer; foreground turns are optional.
+                    await self._drain_watch_notifications(_pr.completion_queue)
+                    # Process completions remain owned by their per-process watchers.
+                    requeue = []
+                    async_events = []
+                    while not _pr.completion_queue.empty():
+                        try:
+                            evt = _pr.completion_queue.get_nowait()
+                        except Exception:
+                            break
+                        (async_events if evt.get("type") == "async_delegation" else requeue).append(evt)
+                    for evt in requeue:
+                        _pr.completion_queue.put(evt)
+
+                    new_groups: dict[tuple[str, ...], list[dict]] = {}
+                    for evt in async_events:
+                        self._enrich_async_delegation_routing(evt)
+                        new_groups.setdefault(self._event_route_key(evt, self._ASYNC_GROUP_KEY_FIELDS), []).append(evt)
+
+                    for route_key, group in new_groups.items():
+                        route_pending.setdefault(route_key, deque()).append(group)
+
+                    for route_key, q in list(route_pending.items()):
+                        if q and route_key not in route_tasks:
+                            t = asyncio.create_task(_route_worker(route_key))
+                            route_tasks[route_key] = t
+                            active_tasks.add(t)
+                            t.add_done_callback(lambda task, rk=route_key: _on_route_worker_done(rk, task))
+
+                await asyncio.sleep(interval)
+        finally:
+            if active_tasks:
+                for t in list(active_tasks):
+                    t.cancel()
+                await asyncio.gather(*active_tasks, return_exceptions=True)
+            for route_key, pending_queue in list(route_pending.items()):
+                while pending_queue:
+                    group = pending_queue.popleft()
+                    for evt in group:
+                        try:
+                            _pr.completion_queue.put(evt)
+                        except Exception:
+                            pass
+            route_pending.clear()
+            route_tasks.clear()
+            active_tasks.clear()
 
     @staticmethod
     def _redacted_output_tail(session, limit: int) -> str:

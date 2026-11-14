@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
@@ -88,6 +89,46 @@ async def admit_internal_event(adapter: Any, event: Any) -> None:
         raise WakeNotAccepted("internal wake not accepted by adapter")
 
 
+def is_session_turn_busy(session_id: str, adapter: Optional[Any] = None) -> bool:
+    """Check if session_id currently holds an active, unexpired turn lease."""
+    if not session_id:
+        return False
+    sid = str(session_id)
+    now = time.time()
+    try:
+        db_inst = None
+        if adapter is not None:
+            ensure = getattr(adapter, "_ensure_session_db", None)
+            if callable(ensure):
+                db_inst = ensure()
+        if db_inst is None:
+            from hermes_state import SessionDB
+            db_inst = SessionDB()
+
+        # Check direct sid match in active turn leases
+        row = db_inst._read_one(
+            "SELECT expires_at FROM session_turn_leases WHERE conversation_id = ? AND expires_at > ?",
+            (sid, now),
+        )
+        if row:
+            return True
+
+        # Check through compression conversation lineage
+        key_fn = getattr(db_inst, "_session_turn_lease_key", None)
+        if callable(key_fn):
+            conv_id = key_fn(sid)
+            if conv_id and conv_id != sid:
+                row = db_inst._read_one(
+                    "SELECT expires_at FROM session_turn_leases WHERE conversation_id = ? AND expires_at > ?",
+                    (conv_id, now),
+                )
+                if row:
+                    return True
+    except Exception as exc:
+        logger.debug("is_session_turn_busy check failed for %s: %s", sid, exc)
+    return False
+
+
 async def deliver_wake(adapter: Any, *, text: str, session_id: str = "", source: Any = None,
                        notification_category: str = "result", profile: Optional[str] = None) -> None:
     """Deliver a wake turn to the session behind ``adapter``. ``session_id`` is the RAW session id
@@ -96,6 +137,9 @@ async def deliver_wake(adapter: Any, *, text: str, session_id: str = "", source:
     names the served profile that canonically owns a non-push destination; a non-default value is
     delivered in-process under the caller's profile scope (see ``_self_post_chat_completion``).
     Raises on failure so the caller can rewind/retry."""
+    if session_id and is_session_turn_busy(session_id, adapter):
+        logger.info("Session %s holds an active turn lease — skipping wake self-post (in-flight turn will consume delivery)", session_id)
+        return
     if adapter_supports_push(adapter):
         if source is None:
             raise ValueError("deliver_wake: push-capable adapter requires a SessionSource")
@@ -205,6 +249,12 @@ async def _self_post_chat_completion(adapter: Any, *, text: str, session_id: str
                 "delivery; refusing to self-post as the default profile")
         await in_process(session_id=session_id, text=text, profile=str(profile),
                          notification_category=notification_category)
+        sync_tg = getattr(adapter, "_sync_telegram_history", None)
+        if callable(sync_tg):
+            try:
+                await asyncio.shield(sync_tg(session_id))
+            except Exception as sync_exc:
+                logger.warning("In-process post-wake Telegram sync failed for session %s: %s", session_id, sync_exc)
         return
     import aiohttp
     host = str(getattr(adapter, "_host", "") or "127.0.0.1")
@@ -246,6 +296,13 @@ async def _self_post_chat_completion(adapter: Any, *, text: str, session_id: str
                         )
                     await resp.read()
                     logger.info("wake self-post delivered for session %s (attempt %d)", session_id, attempt + 1)
+                    # Trigger instant Telegram sync for bound sessions (SpDD task-gateway-wake-telegram-sync-20261112)
+                    sync_tg = getattr(adapter, "_sync_telegram_history", None)
+                    if callable(sync_tg):
+                        try:
+                            await asyncio.shield(sync_tg(session_id))
+                        except Exception as sync_exc:
+                            logger.warning("Post-wake Telegram sync failed for session %s: %s", session_id, sync_exc)
                     return
         except (TimeoutError, aiohttp.ClientError, OSError) as exc:
             last_err = exc
@@ -305,7 +362,12 @@ def check_coordinator_wake_eligibility(session_id: str, adapter: Any, evt: Optio
         )
         return False
 
-    # 3. Check if SpDD coordinator intent
+    # 3. Check active turn lease (busy coordinator)
+    if is_session_turn_busy(sid, adapter):
+        logger.info("coordinator auto-wake suppressed: session %s holds active turn lease (in-flight turn will consume delivery)", sid)
+        return False
+
+    # 4. Check if SpDD coordinator intent
     # 3a. Event metadata
     if evt:
         if evt.get("auto_resume_on_delegation") is True or evt.get("auto_resume") is True:
