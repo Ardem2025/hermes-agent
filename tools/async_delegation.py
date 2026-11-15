@@ -862,6 +862,51 @@ def has_live_for_session(session_key: str = "", origin_ui_session_id: str = "", 
     return bool(_session_records(_LIVE_STATES, session_key, origin_ui_session_id, parent_session_id))
 
 
+def has_active_or_pending_for_session(
+    session_key: str = "",
+    origin_ui_session_id: str = "",
+    parent_session_id: str = ""
+) -> bool:
+    """Whether a session still owns any live (running/stalling/finalizing) delegation
+    or any completed delegation whose result is still pending delivery."""
+    if has_live_for_session(
+        session_key=session_key,
+        origin_ui_session_id=origin_ui_session_id,
+        parent_session_id=parent_session_id,
+    ):
+        return True
+
+    if not _db_path().exists():
+        return False
+
+    where_clauses = []
+    params = []
+    for col, val in (
+        ("origin_ui_session_id", origin_ui_session_id),
+        ("origin_session", session_key),
+        ("parent_session_id", parent_session_id),
+        ("origin_session_id", session_key),
+    ):
+        if val:
+            where_clauses.append(f"{col} = ?")
+            params.append(str(val))
+
+    if not where_clauses:
+        return False
+
+    try:
+        sql = (
+            "SELECT 1 FROM async_delegations "
+            f"WHERE delivery_state = 'pending' AND ({' OR '.join(where_clauses)}) LIMIT 1"
+        )
+        with _DB_LOCK, _transaction() as conn:
+            row = conn.execute(sql, params).fetchone()
+            return bool(row)
+    except Exception as exc:
+        logger.debug("Failed to check pending async delegations for session: %s", exc)
+        return False
+
+
 def _new_delegation_id() -> str:
     return f"deleg_{uuid.uuid4().hex[:8]}"
 

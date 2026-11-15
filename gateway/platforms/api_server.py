@@ -2843,8 +2843,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         active_subagents = self._get_active_subagents_for_session(session_id)
         has_async = False
         try:
-            from tools.async_delegation import has_live_for_session
-            has_async = has_live_for_session(session_key=session_id, origin_ui_session_id=session_id, parent_session_id=session_id)
+            from tools.async_delegation import has_active_or_pending_for_session
+            has_async = has_active_or_pending_for_session(session_key=session_id, origin_ui_session_id=session_id, parent_session_id=session_id)
         except Exception as e:
             logger.debug("Failed to check async delegations for session %s: %s", session_id, e)
         has_active_subagents = bool(active_subagents or has_async)
@@ -3596,7 +3596,11 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         # through the same door as ``bot_relay.deliver`` and the receipt is its admission's.
         if getattr(self.gateway_runner, "session_authority", None) is not None:
             from gateway.platforms.api_server_bot_chat import admit_peer_turn
-            return await admit_peer_turn(self.gateway_runner, session_id, message, author)
+            try:
+                return await admit_peer_turn(self.gateway_runner, session_id, message, author)
+            except (ValueError, Exception) as exc:
+                logger.debug("Failed to admit peer turn to session authority: %s", exc)
+                return None
         db = await self._ensure_session_db_async()
         if db is None:
             return None
@@ -3606,15 +3610,20 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         def _admit() -> Optional[dict[str, Any]]:
             try:
                 owner = find_canonical_live_owner(home)
-            except ValueError:
+                # Only the canonical Bot Chat's own lineage: a peer turn into any other session runs here.
+                if owner is None or db.get_compression_tip(session_id) != owner["session_id"]:
+                    return None
+                return deliver_to_live_owner(home, owner, message, author=author)
+            except (ValueError, Exception) as exc:
                 # No reachable profile authority to hand the chat to: this process runs the turn.
+                logger.debug("Live bot chat admission skipped: %s", exc)
                 return None
-            # Only the canonical Bot Chat's own lineage: a peer turn into any other session runs here.
-            if owner is None or db.get_compression_tip(session_id) != owner["session_id"]:
-                return None
-            return deliver_to_live_owner(home, owner, message, author=author)
 
-        record = await asyncio.to_thread(_admit)
+        try:
+            record = await asyncio.to_thread(_admit)
+        except (ValueError, Exception) as exc:
+            logger.debug("Live bot chat admission thread error: %s", exc)
+            return None
         return None if record is None else (home, record)
 
     async def _answer_through_live_bot_chat(self, ctx: dict[str, Any]) -> Optional[web.Response]:
@@ -3627,7 +3636,11 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         (``tools/bot_mode_dm.py``, ``tui_gateway/methods_bot_relay.py``). This waits for the owner's
         receipt on the same budget as the local path, so the peer still gets the reply on this call.
         """
-        admitted = await self._admit_to_live_bot_chat(ctx["session_id"], ctx["user_message"], ctx["run_kwargs"].get("turn_author"))
+        try:
+            admitted = await self._admit_to_live_bot_chat(ctx["session_id"], ctx["user_message"], ctx["run_kwargs"].get("turn_author"))
+        except (ValueError, Exception) as exc:
+            logger.warning("Error admitting to live bot chat: %s, falling back to local run", exc)
+            return None
         if admitted is None:
             return None
         session_id = admitted[1].get("session_id") or ctx["session_id"]  # a moved-aside API row: the local chat (MSG-21)
@@ -3668,7 +3681,11 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         """``_answer_through_live_bot_chat`` for the SSE sibling route: the owner's settled receipt is
         the run's single ``assistant.completed`` event; a receipt still open at the budget is a
         ``run.queued`` event (the 202 shape), a failed one an ``error`` event carrying the reason."""
-        admitted = await self._admit_to_live_bot_chat(ctx["session_id"], ctx["user_message"], ctx["run_kwargs"].get("turn_author"))
+        try:
+            admitted = await self._admit_to_live_bot_chat(ctx["session_id"], ctx["user_message"], ctx["run_kwargs"].get("turn_author"))
+        except (ValueError, Exception) as exc:
+            logger.warning("Error admitting to live bot chat in stream: %s, falling back to local run", exc)
+            return None
         if admitted is None:
             return None
         session_id = admitted[1].get("session_id") or ctx["session_id"]  # a moved-aside API row: the local chat (MSG-21)

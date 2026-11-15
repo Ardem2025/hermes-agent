@@ -181,6 +181,7 @@ class TelegramFallbackTransport(httpx.AsyncBaseTransport):
             transport_kwargs["proxy"] = proxy_url
         transport_kwargs.setdefault("limits", self._POOL_LIMITS)
         transport_kwargs.setdefault("socket_options", tcp_keepalive_socket_options())
+        transport_kwargs.setdefault("local_address", "0.0.0.0")
         self._transport_kwargs = transport_kwargs
         self._primary = httpx.AsyncHTTPTransport(**transport_kwargs)
         self._primary_lock = asyncio.Lock()
@@ -229,14 +230,14 @@ class TelegramFallbackTransport(httpx.AsyncBaseTransport):
             logger.debug("[Telegram] Error closing fallback transport %s: %s", ip, exc)
 
     def _attempt_order(self) -> list[Optional[str]]:
-        """Sticky path first, then IPv4 literals, dual-stack hostname last (a blackholed IPv6 path never
-        errors — Happy Eyeballs waits on AAAA until the OS TCP timeout and can pin the loop)."""
+        """Sticky path first, then dual-stack hostname (DNS), IPv4 seed literals last as fallback
+        (direct IPs may be DPI-filtered; DNS resolves CDN-friendly addresses instantly)."""
         order: list[Optional[str]] = []
         if self._sticky_ip is not _UNSET:
             order.append(None if self._sticky_ip is None else str(self._sticky_ip))
-        order.extend(ip for ip in self._fallback_ips if ip not in order)
         if None not in order:
             order.append(None)
+        order.extend(ip for ip in self._fallback_ips if ip not in order)
         return order
 
     def _connect_share(self, order: list, index: int, walk_started: float) -> float:
@@ -274,13 +275,10 @@ class TelegramFallbackTransport(httpx.AsyncBaseTransport):
                         failed_path,
                         failure,
                     )
-                if self._sticky_ip is _UNSET or self._sticky_ip != ip:
+                if ip is None and (self._sticky_ip is _UNSET or self._sticky_ip != ip):
                     async with self._sticky_lock:
                         if self._sticky_ip is _UNSET or self._sticky_ip != ip:
-                            self._sticky_ip = ip
-                            if ip is not None:
-                                log = logger.warning if last_error is not None else logger.info
-                                log("[Telegram] Using sticky IPv4 Telegram API path %s (dual-stack hostname tried last — #87015)", ip)
+                            self._sticky_ip = None
                 return response
             except Exception as exc:
                 last_error = exc

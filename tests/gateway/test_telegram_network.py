@@ -101,68 +101,35 @@ class TestRewriteRequestForIp:
 # ═══════════════════════════════════════════════════════════════════════════
 
 class TestFallbackTransport:
-    """IPv4 literals first → hostname last → stick to whichever works."""
+    """Dual-stack hostname first (DPI bypass) → IPv4 fallback literals second."""
 
     @pytest.mark.asyncio
-    async def test_ipv4_literal_tried_before_hostname_and_becomes_sticky(self, monkeypatch):
+    async def test_hostname_tried_before_ipv4_literal(self, monkeypatch):
         calls = []
-        behavior = {"api.telegram.org": "timeout", "149.154.167.220": "ok"}
+        behavior = {"api.telegram.org": "ok", "149.154.167.220": "timeout"}
         monkeypatch.setattr(tnet.httpx, "AsyncHTTPTransport", _fake_transport_factory(calls, behavior))
 
         transport = tnet.TelegramFallbackTransport(["149.154.167.220"])
         resp = await transport.handle_async_request(_telegram_request())
 
         assert resp.status_code == 200
-        assert transport._sticky_ip == "149.154.167.220"
-        assert [c["url_host"] for c in calls] == ["149.154.167.220"]
-        assert calls[0]["host_header"] == "api.telegram.org"
-        assert calls[0]["sni_hostname"] == "api.telegram.org"
-
-        # Second request goes straight to sticky IP
-        calls.clear()
-        resp2 = await transport.handle_async_request(_telegram_request())
-        assert resp2.status_code == 200
-        assert calls[0]["url_host"] == "149.154.167.220"
+        assert transport._sticky_ip is None
+        assert [c["url_host"] for c in calls] == ["api.telegram.org"]
 
     @pytest.mark.asyncio
-    async def test_sticky_ip_tried_first_but_falls_through_if_stale(self, monkeypatch):
-        """If the sticky IP stops working, the transport retries others."""
+    async def test_ipv4_fallback_when_hostname_fails(self, monkeypatch):
+        """When hostname DNS fails, IPv4 fallback literal is tried."""
         calls = []
         behavior = {
             "api.telegram.org": "timeout",
             "149.154.167.220": "ok",
-            "149.154.167.221": "ok",
         }
         monkeypatch.setattr(tnet.httpx, "AsyncHTTPTransport", _fake_transport_factory(calls, behavior))
 
-        transport = tnet.TelegramFallbackTransport(["149.154.167.220", "149.154.167.221"])
-
-        # First request: .220 works immediately (IPv4-first) → becomes sticky
-        await transport.handle_async_request(_telegram_request())
-        assert transport._sticky_ip == "149.154.167.220"
-
-        # Now .220 goes bad too
-        calls.clear()
-        behavior["149.154.167.220"] = "timeout"
-
-        resp = await transport.handle_async_request(_telegram_request())
-        assert resp.status_code == 200
-        # Sticky .220 fails → remaining IPv4 .221 works. Hostname is last
-        # and is never needed.
-        assert [c["url_host"] for c in calls] == ["149.154.167.220", "149.154.167.221"]
-        assert transport._sticky_ip == "149.154.167.221"
-
-    @pytest.mark.asyncio
-    async def test_hostname_tried_last_when_ipv4_fails(self, monkeypatch):
-        """IPv6-only / seed-IP-blocked hosts still reach the hostname last."""
-        calls = []
-        behavior = {"149.154.167.220": "timeout", "api.telegram.org": "ok"}
-        monkeypatch.setattr(tnet.httpx, "AsyncHTTPTransport", _fake_transport_factory(calls, behavior))
         transport = tnet.TelegramFallbackTransport(["149.154.167.220"])
         resp = await transport.handle_async_request(_telegram_request())
         assert resp.status_code == 200
-        assert [c["url_host"] for c in calls] == ["149.154.167.220", "api.telegram.org"]
-        assert transport._sticky_ip is None
+        assert [c["url_host"] for c in calls] == ["api.telegram.org", "149.154.167.220"]
 
 class TestFallbackTransportPassthrough:
     """Requests that don't need fallback behavior."""
