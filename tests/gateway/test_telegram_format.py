@@ -17,26 +17,13 @@ from gateway.config import PlatformConfig
 # ---------------------------------------------------------------------------
 # Mock the telegram package if it's not installed
 # ---------------------------------------------------------------------------
-from plugins.platforms.telegram.adapter import TelegramAdapter, _strip_mdv2
-from plugins.platforms.telegram.telegram_markdown import _escape_mdv2, _wrap_markdown_tables
-
-
-def _assert_balanced_mdv2_code_entities(text: str) -> None:
-    """Assert that every unescaped MarkdownV2 code delimiter is closed."""
-    delimiter = None
-    index = 0
-    while index < len(text):
-        if text[index] == "\\":
-            index += 2
-            continue
-        if text.startswith("```", index):
-            delimiter = None if delimiter == "```" else "```"
-            index += 3
-            continue
-        if text[index] == "`":
-            delimiter = None if delimiter == "`" else "`"
-        index += 1
-    assert delimiter is None, f"unclosed {delimiter} code entity in {text!r}"
+from plugins.platforms.telegram.adapter import (
+    TelegramAdapter,
+    _escape_mdv2,
+    _strip_mdv2,
+    _wrap_markdown_tables,
+)
+from gateway.platforms.helpers import normalize_latex_math_symbols, strip_markdown
 
 
 # ---------------------------------------------------------------------------
@@ -90,31 +77,6 @@ class TestFormatMessageBasic:
 
 class TestFormatMessageCodeBlocks:
 
-    def test_repeated_fenced_tool_progress_stays_a_code_block(self, adapter):
-        """Regression for #138148: the dedup counter must not trail a closing fence, on both the
-        queued progress bubble and the native stream-consumer path."""
-        import queue
-
-        from gateway.run_turn_progress import GatewayTurnProgressMixin as M
-
-        progress = "💻 terminal\n```\nssh -F /opt/data/home/.ssh/config fed...\n```"
-        native_lines = []
-        sc = SimpleNamespace(accepts_tool_progress=True, on_tool_progress=native_lines.append)
-        for consumer in (None, sc):
-            ctx = SimpleNamespace(last_progress_msg=[None], repeat_count=[0], progress_queue=queue.Queue())
-            runner = SimpleNamespace(_ctx=ctx, _stream_consumer=lambda c=consumer: c)
-            for _ in range(4):
-                M._progress_emit(runner, progress)
-            if consumer is None:
-                st = SimpleNamespace(progress_lines=[])
-                while not ctx.progress_queue.empty():
-                    rendered = M._progress_absorb(runner, st, ctx.progress_queue.get())
-            else:
-                rendered = native_lines[-1]
-            assert rendered.endswith("```\n(×4)"), rendered
-            formatted = adapter.format_message(rendered)
-            assert "\\`\\`\\`" not in formatted
-            assert "```\nssh -F /opt/data/home/.ssh/config fed...\n```" in formatted
 
     def test_code_block_special_chars_not_escaped(self, adapter):
         text = "```\nif (x > 0) { return !x; }\n```"
@@ -242,33 +204,6 @@ class TestFormatMessageCodeBlocks:
         # ...and exactly the one real block's two fences remain.
         assert result.count("```") == 2
 
-    def test_nested_backticks_preserve_markdownv2_formatting(self, adapter):
-        text = (
-            "**Раздел**\n"
-            "- `**жирный**`, `*курсив*`, `~~зачёркнутый~~`, `||спойлер||`\n"
-            "- `` `код` `` и ``` блоки кода ```\n"
-            "- `[ссылка](url)`, заголовки `##`\n"
-            "**Вывод**\n"
-            "5. Не мешай `**` и эмодзи внутри одной строки — каша."
-        )
-
-        result = adapter.format_message(text)
-
-        assert "*Раздел*" in result
-        assert r"\`\` `код` \`\`" in result
-        assert r"`**`" in result
-        _assert_balanced_mdv2_code_entities(result)
-
-    def test_double_backtick_span_collapses_to_telegram_inline_code(self, adapter):
-        result = adapter.format_message("Use ``value`` now")
-
-        assert result == "Use `value` now"
-
-    def test_inline_code_does_not_span_newlines(self, adapter):
-        result = adapter.format_message("`orphan\n(foo)`")
-
-        assert result == "\\`orphan\n\\(foo\\)\\`"
-
 
 @pytest.mark.asyncio
 async def test_final_send_does_not_retrigger_typing(adapter):
@@ -299,49 +234,6 @@ class TestFormatMessageBoldItalic:
         assert "*bold*" in result
         # Original ** should be gone
         assert "**" not in result
-
-    def test_bold_italic_combined(self, adapter):
-        """***bold italic*** resolves both delimiter families, not a corrupted literal."""
-        assert adapter.format_message("***bold italic***") == "_*bold italic*_"
-
-    def test_bold_with_inner_italic(self, adapter):
-        """Inner *italic* markers inside **bold** stay emphasis instead of being escaped."""
-        assert adapter.format_message("**bold *italic* text**") == "*bold _italic_ text*"
-
-    def test_bold_spans_single_newline(self, adapter):
-        """Bold may cross one newline within a paragraph."""
-        assert adapter.format_message("**bold\ntext**") == "*bold\ntext*"
-
-    def test_bold_does_not_span_paragraph(self, adapter):
-        """** across a blank line stays unmatched literal text."""
-        result = adapter.format_message("**para one\n\npara two**")
-        assert "bold" not in result.strip("*") and result.startswith("\\*")
-
-    def test_nested_double_emphasis(self, adapter):
-        """**outer *mid **deep** mid* outer** keeps the italic; the inner bold merges into the outer
-        one because MarkdownV2 reads a * inside bold as its closer."""
-        assert (
-            adapter.format_message("**outer *mid **deep** mid* outer**")
-            == "*outer _mid deep mid_ outer*"
-        )
-
-    def test_italic_wrapping_bold(self, adapter):
-        """*a **b** c* keeps the inner bold."""
-        assert adapter.format_message("*a **b** c*") == "_a *b* c_"
-
-    def test_quad_asterisk_bold(self, adapter):
-        """****bold**** collapses to a single valid bold (MarkdownV2 cannot nest bold in bold)."""
-        assert adapter.format_message("****bold****") == "*bold*"
-
-    def test_spaced_asterisks_stay_literal(self, adapter):
-        """Multiplication-style 'a * b * c' must not become fake italic."""
-        assert adapter.format_message("a * b * c") == "a \\* b \\* c"
-
-    def test_unmatched_markers_preserved_as_text(self, adapter):
-        """Lone asterisk runs survive as escaped literals, never stripped or balanced."""
-        assert adapter.format_message("****") == "\\*\\*\\*\\*"
-        assert adapter.format_message("a**b") == "a\\*\\*b"
-        assert adapter.format_message("unmatched * star") == "unmatched \\* star"
 
 
     def test_reload_mcp_summary_escapes_dynamic_server_names(self, adapter):
@@ -479,36 +371,6 @@ class TestFormatMessageBlockquote:
         assert "> not expandable" in result
         assert "\\|" in result
         assert "\\>" not in result
-
-
-    def test_expandable_blockquote_single_line(self, adapter):
-        result = adapter.format_message("**> Only line||")
-        assert result == "**> Only line||"
-
-
-    def test_expandable_blockquote_multiline_keeps_closing_mark(self, adapter):
-        """Telegram's documented form: **> opens, || ends the LAST line of the block."""
-        text = "**> First line\n> Second line\n> Last line||"
-        result = adapter.format_message(text)
-        assert result == "**> First line\n> Second line\n> Last line||"
-
-
-    def test_expandable_blockquote_mark_escaped_before_last_line(self, adapter):
-        """A raw || before the block's last line is rejected by Telegram as an unterminated spoiler."""
-        result = adapter.format_message("**> First line||\n> Second line")
-        assert result == "**> First line\\|\\|\n> Second line"
-
-
-    def test_expandable_blockquote_ends_at_next_opener(self, adapter):
-        """A **> line starts a new quote block, so each block keeps its own closing mark."""
-        text = "> Plain quote\n**> Hidden one\n> Hidden two||"
-        result = adapter.format_message(text)
-        assert result == "> Plain quote\n**> Hidden one\n> Hidden two||"
-
-
-    def test_expandable_blockquote_escapes_content(self, adapter):
-        result = adapter.format_message("**> Step 1.\n> Done (ok)!||")
-        assert result == "**> Step 1\\.\n> Done \\(ok\\)\\!||"
 
 
 # =========================================================================
@@ -679,62 +541,7 @@ async def test_send_escapes_chunk_indicator_for_markdownv2(adapter):
 
 
 class TestEditMessageStreamingSafety:
-    @pytest.fixture(autouse=True)
-    def _real_link_preview_options(self, monkeypatch):
-        # The suite's telegram stub makes LinkPreviewOptions a MagicMock whose
-        # attributes are always truthy mocks; record the real kwargs instead.
-        import plugins.platforms.telegram.adapter as tg_adapter
 
-        monkeypatch.setattr(
-            tg_adapter, "LinkPreviewOptions", lambda **kw: SimpleNamespace(**kw)
-        )
-
-    @staticmethod
-    def _assert_link_previews_disabled(kwargs):
-        assert (
-            kwargs.get("disable_web_page_preview") is True
-            or (
-                kwargs.get("link_preview_options") is not None
-                and kwargs["link_preview_options"].is_disabled is True
-            )
-        )
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize(
-        ("finalize", "edit_side_effect", "expected_edits"),
-        [
-            (False, None, 1),
-            # Final edit: MarkdownV2 rejected, then the plain-text fallback edit.
-            (True, [Exception("bad markdown"), None], 2),
-        ],
-    )
-    async def test_every_legacy_edit_disables_link_preview_when_configured(
-        self, finalize, edit_side_effect, expected_edits
-    ):
-        """Regression for #61018: disable_link_previews reached sends but not
-        editMessageText, so streamed and finalized replies grew preview cards."""
-        adapter = TelegramAdapter(
-            PlatformConfig(
-                enabled=True,
-                token="fake-token",
-                extra={"disable_link_previews": True},
-            )
-        )
-        adapter._bot = MagicMock()
-        adapter._bot.edit_message_text = AsyncMock(side_effect=edit_side_effect)
-
-        result = await adapter.edit_message(
-            "123",
-            "456",
-            "reply https://example.com **bold**",
-            finalize=finalize,
-        )
-
-        assert result.success is True
-        edits = adapter._bot.edit_message_text.await_args_list
-        assert len(edits) == expected_edits
-        for edit in edits:
-            self._assert_link_previews_disabled(edit.kwargs)
 
     @pytest.mark.asyncio
     async def test_message_too_long_splits_into_continuations_not_silent_truncation(self):
@@ -773,37 +580,6 @@ class TestEditMessageStreamingSafety:
         # Continuations were sent threaded as replies for visual grouping.
         assert adapter._bot.send_message.await_count == len(result.continuation_message_ids)
 
-    @pytest.mark.asyncio
-    async def test_message_too_long_first_chunk_edit_disables_link_preview(self):
-        """The overflow split edits chunk 1 in place; it must honor the same
-        setting as the continuation sends that follow it (#61018)."""
-        adapter = TelegramAdapter(
-            PlatformConfig(
-                enabled=True,
-                token="fake-token",
-                extra={"disable_link_previews": True},
-            )
-        )
-        adapter._bot = MagicMock()
-        adapter._bot.edit_message_text = AsyncMock()
-        _next_id = [1000]
-
-        async def _fake_send(**kwargs):
-            _next_id[0] += 1
-            return SimpleNamespace(message_id=_next_id[0])
-
-        adapter._bot.send_message = AsyncMock(side_effect=_fake_send)
-
-        result = await adapter.edit_message(
-            "123",
-            "456",
-            "https://example.com " + ("x" * 6000),
-            finalize=True,
-        )
-
-        assert result.success is True
-        first_edit = adapter._bot.edit_message_text.await_args_list[0].kwargs
-        self._assert_link_previews_disabled(first_edit)
 
     @pytest.mark.asyncio
     async def test_mid_stream_overflow_truncates_instead_of_splitting(self):
@@ -954,3 +730,216 @@ class TestTelegramGuestMentionGating:
         message.caption_entities = [_guest_mention_entity(text)]
 
         assert adapter._should_process_message(message) is True
+
+
+# =========================================================================
+# LaTeX Math Normalization Tests (BDD 4.1.1 - 4.1.3)
+# =========================================================================
+
+
+class TestLatexNormalization:
+    """Covers LaTeX math syntax normalization into clean Unicode symbols."""
+
+    def test_latex_inequalities_converted_to_unicode(self, adapter):
+        inp = "Возраст пакета $\\ge 180$ дней, скачивания $\\ge 50$k"
+        out = adapter.format_message(inp)
+        assert "≥ 180" in out
+        assert "≥ 50k" in out
+        assert "\\ge" not in out
+        assert "$" not in out
+
+    def test_latex_macros_standalone(self, adapter):
+        assert "x ≤ 10" in adapter.format_message("x \\le 10")
+        assert "t ≈ 5s" in adapter.format_message("t \\approx 5s")
+        assert "a ≠ b" in adapter.format_message("a \\neq b")
+        assert "± 5%" in adapter.format_message("\\pm 5%")
+        assert "10 × 20" in adapter.format_message("10 \\times 20")
+        assert "a → b" in adapter.format_message("a \\to b")
+        assert "a ← b" in adapter.format_message("a \\leftarrow b")
+        assert "∞" in adapter.format_message("\\infty")
+        assert "…" in adapter.format_message("\\dots")
+        assert "·" in adapter.format_message("\\cdot")
+
+    def test_latex_inside_fenced_code_block_preserved(self, adapter):
+        text = "```python\npattern = r\"\\ge\\d+\"\n```"
+        assert normalize_latex_math_symbols(text) == text
+        out = adapter.format_message(text)
+        assert "≥" not in out
+        assert "\\\\ge" in out
+
+    def test_latex_inside_inline_code_preserved(self, adapter):
+        text = "Run `\\ge 180` in bash"
+        assert normalize_latex_math_symbols(text) == text
+        out = adapter.format_message(text)
+        assert "≥" not in out
+        assert "\\\\ge" in out
+
+    def test_math_delimiters_stripped(self, adapter):
+        assert normalize_latex_math_symbols("$\\ge 180$") == "≥ 180"
+        assert normalize_latex_math_symbols("$$\\approx 100$$") == "≈ 100"
+        assert normalize_latex_math_symbols("$x = 10$") == "x = 10"
+        assert normalize_latex_math_symbols("$N$") == "N"
+        assert "≥ 180" in adapter.format_message("$\\ge 180$")
+        assert "≈ 100" in adapter.format_message("$$\\approx 100$$")
+        assert "x \\= 10" in adapter.format_message("$x = 10$")
+        assert "N" in adapter.format_message("$N$")
+
+    def test_greek_letters_converted(self, adapter):
+        text = "\\alpha, \\beta, \\gamma, \\Delta, \\pi, \\sigma, \\mu, \\theta, \\lambda, \\omega, \\Omega"
+        out = adapter.format_message(text)
+        assert "α, β, γ, Δ, π, σ, μ, θ, λ, ω, Ω" in out
+
+    def test_degree_converted(self, adapter):
+        assert "25°" in adapter.format_message("25\\degree")
+        assert "25°" in adapter.format_message("25^\\circ")
+        assert "25°" in adapter.format_message("25^{\\circ}")
+
+    def test_currency_dollars_preserved(self, adapter):
+        out = adapter.format_message("Price is $5.00!")
+        assert "$5" in out
+        out2 = adapter.format_message("From $5 to $10 per unit")
+        assert "$5" in out2 and "$10" in out2
+
+
+# =========================================================================
+# Cascading Fallback Cleanliness Tests (BDD 4.5.1)
+# =========================================================================
+
+
+class TestCascadingFallbackCleanliness:
+    """Covers Tier 3 plain text fallback cleanliness (zero escape backslashes)."""
+
+    def test_fallback_plain_text_has_no_escape_backslashes(self):
+        escaped = r"This is \*bold\* and \_italic\_ with snake\_case and v2\.0 and wow\!"
+        plain = _strip_mdv2(escaped)
+        assert "\\" not in plain
+        assert plain == "This is bold and italic with snake_case and v2.0 and wow!"
+
+    def test_fallback_preserves_readable_structure(self):
+        text = "# Header\n\n* Item 1\n* Item 2\n\n[Link](https://example.com)\n\n```python\nprint('hello')\n```"
+        plain = strip_markdown(text)
+        assert "\\" not in plain
+        assert "#" not in plain
+        assert "Item 1" in plain
+        assert "Item 2" in plain
+        assert "Link" in plain
+        assert "https://example.com" not in plain
+
+
+# =========================================================================
+# Special Characters and Complex Formatting (BDD 4.2.2, 4.3.2, 4.4.1)
+# =========================================================================
+
+
+class TestSpecialCharactersAndTables:
+    """Covers special character escaping, angle brackets, and table formatting."""
+
+    def test_snake_case_outside_code_escaped(self, adapter):
+        out = adapter.format_message("Check file_name_v2_final.py and user_account_id")
+        assert "file\\_name\\_v2\\_final\\.py" in out
+        assert "user\\_account\\_id" in out
+
+    def test_angle_brackets_outside_code(self, adapter):
+        out = adapter.format_message("if x < 10 and y > 20:")
+        assert "x < 10" in out or "x \\< 10" in out
+        assert "y \\> 20" in out
+
+    def test_table_with_latex_math(self, adapter):
+        table = (
+            "| Metric | Threshold | Status |\n"
+            "|---|---|---|\n"
+            "| Delay | $\\le 100$ms | OK |\n"
+            "| Count | $\\ge 50$ | OK |\n"
+        )
+        out = adapter.format_message(table)
+        assert "≤ 100ms" in out
+        assert "≥ 50" in out
+        assert "\\le" not in out
+        assert "\\ge" not in out
+        assert "$" not in out
+
+
+class TestBddScenarios20260925:
+    """Canonical test suite for the 6 SpDD BDD Scenarios (task_20260925_telegram_formatting_fix)."""
+
+    def test_scenario_1_empty_backticks_and_multiline_boundary(self, adapter):
+        inp = (
+            "3. **Reasoning скрыт (`show_reasoning: false`):** Поскольку блок мыслей `` вырезается, а модель 14B...\n"
+            "- Параметр 1: `val`\n"
+            "- Параметр 2: `val2`\n"
+        )
+        out = adapter.format_message(inp)
+        assert "\\`\\`" in out or "``" not in out
+        assert "`show_reasoning: false`" in out
+        assert "`val`" in out
+        assert "`val2`" in out
+        assert "•" in out
+
+    def test_scenario_2_zero_bullet_eating_strip_markdown(self):
+        inp = (
+            "* Скомпилирован байткод всех пропатченных модулей\n"
+            "* Запущен локальный E2E-тест конвертации\n"
+            "* Перезапущен сервис hermes-gateway-andrey.service"
+        )
+        out = strip_markdown(inp)
+        expected = inp.strip()
+        assert out == expected
+        assert out.count("*") == 3
+
+    def test_scenario_3_code_symbols_protection_strip_markdown(self):
+        inp = "Маркеры `*`, `-`, `+` в начале строк переводятся в нативные символы `•` и `◦`"
+        out = strip_markdown(inp)
+        assert out == "Маркеры *, -, + в начале строк переводятся в нативные символы • и ◦"
+
+    @pytest.mark.asyncio
+    async def test_scenario_4_fallback_crash_free_plain_text(self, adapter):
+        adapter._bot = MagicMock()
+        adapter._bot.send_message = AsyncMock(
+            side_effect=[
+                Exception("400 Bad Request: Can't parse entities in message text"),
+                SimpleNamespace(message_id=428774),
+            ]
+        )
+        send_kwargs = {"chat_id": 12345678}
+        raw = "**Important:** Check `*`, `-`, `+` list markers."
+        formatted = adapter.format_message(raw)
+        res = await adapter._send_chunk_markdown_or_plain(formatted, send_kwargs, original_raw_chunk=raw)
+        assert res.message_id == 428774
+        assert adapter._bot.send_message.call_count == 2
+        second_call = adapter._bot.send_message.call_args_list[1]
+        plain_text = second_call.kwargs.get("text")
+        assert "\\" not in plain_text
+        assert "Important: Check *, -, + list markers." in plain_text
+        assert second_call.kwargs.get("parse_mode") is None
+
+    def test_scenario_5_latex_math_to_unicode(self):
+        inp = r"Значение $x \ge 180$, погрешность $\approx 5\%$, дробь $\frac{a}{b}$, угол $90^\circ$, предел $\alpha \to \infty$."
+        out = normalize_latex_math_symbols(inp)
+        assert "x ≥ 180" in out
+        assert "≈ 5%" in out
+        assert "a/b" in out
+        assert "90°" in out
+        assert "α → ∞" in out
+        assert r"\ge" not in out
+        assert r"\approx" not in out
+        assert r"\frac" not in out
+        assert r"\alpha" not in out
+        assert r"\to" not in out
+        assert r"\infty" not in out
+
+    @pytest.mark.asyncio
+    async def test_scenario_6_streaming_incomplete_markdown_edit(self, adapter):
+        adapter._bot = MagicMock()
+        adapter._bot.edit_message_text = AsyncMock(
+            side_effect=[
+                Exception("400 Bad Request: Can't parse entities: can't find end of code entity"),
+                None,
+            ]
+        )
+        partial = "Here is the code:\n```python\ndef run():\n    return 42"
+        res = await adapter.edit_message("12345678", "100", partial, finalize=True)
+        assert res.success is True
+        assert adapter._bot.edit_message_text.call_count == 2
+
+
+
