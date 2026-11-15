@@ -1030,7 +1030,8 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
 
     @staticmethod
     def _is_thread_not_found_error(error: Exception) -> bool:
-        return "thread not found" in str(error).lower()
+        err_msg = str(error).lower()
+        return any(p in err_msg for p in ("thread not found", "topic not found", "topic_id_invalid", "message thread not found"))
 
     def _prune_stale_dm_topic_binding(self, chat_id: Any, thread_id: Any, *, metadata: Optional[dict[str, Any]] = None) -> None:
         """Drop the stale ``telegram_dm_topic_bindings`` row for a topic Telegram confirmed deleted, else
