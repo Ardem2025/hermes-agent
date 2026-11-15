@@ -3273,7 +3273,12 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
             _TimedOut = None  # type: ignore[assignment,misc]
         return _NetErr, _BadReq, _TimedOut
 
-    async def _send_chunk_markdown_or_plain(self, chunk: str, send_kwargs: dict[str, Any]):
+    async def _send_chunk_markdown_or_plain(
+        self,
+        chunk: str,
+        send_kwargs: dict[str, Any],
+        original_raw_chunk: Optional[str] = None,
+    ):
         """MarkdownV2 first; on a Bot API entity-parse refusal resend as stripped plain text."""
         def send(text: str, mode: Any):
             return _await_with_thread_deadline(self._bot.send_message(text=text, parse_mode=mode, **send_kwargs),
@@ -3284,7 +3289,8 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
             if not is_entity_parse_error(md_error):  # an HTML 5xx page is no refusal: it may be in the chat
                 raise
             logger.warning("[%s] MarkdownV2 parse failed, falling back to plain text: %s", self.name, md_error)
-            return await send(_strip_mdv2(chunk), None)
+            plain = strip_markdown(original_raw_chunk) if original_raw_chunk else _strip_mdv2(chunk)
+            return await send(plain, None)
 
     async def _send_chunk_with_retries(
         self, chat_id: str, chunk: str, index: int, reply_to: Optional[str], metadata: Optional[dict[str, Any]],

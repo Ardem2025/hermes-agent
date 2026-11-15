@@ -300,6 +300,10 @@ class GatewayTurnProgressMixin:
         return pl if pl > 0 else 40
 
     def _progress_terminal_blocks(self, adapter, tool_name, args, emoji):
+        cmd_enabled = getattr(self.config, 'tool_progress_command', False)
+        friendly_enabled = getattr(self.config, 'friendly_tool_labels', True)
+        if not cmd_enabled or friendly_enabled:
+            return None, None
         """(full, short) fenced blocks for a terminal command on markdown platforms, else (None, None).
 
         No language tag: Slack mrkdwn renders it as a literal first code line. Verbose shows the FULL
