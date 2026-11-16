@@ -175,7 +175,7 @@ def admit_api_steps(adapter, **kwargs):
     # Refuse a foreign-surface target before committing any media for it (a refused
     # admission otherwise retains its image bytes under native-inputs/ forever).
     existing = authority.db.get_session(sid)
-    if existing is not None and existing['source'] not in ('api_server', 'bot_room'):
+    if existing is not None and existing['source'] not in ('api_server', 'bot_room', 'telegram'):
         raise RuntimeStoreError('permission_denied')
     if kwargs.get('turn_author') is not None:
         from agent.turn_author import parse_turn_author
