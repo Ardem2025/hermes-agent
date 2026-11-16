@@ -28,6 +28,8 @@ from gateway.platforms._shared import (
     extra_or_secret as _extra_or_secret, get_scoped_secret as _get_scoped_secret,
     platform_gate_env as _scoped_gate_env,
 )
+from gateway.platforms.helpers import (
+    TABLE_SEPARATOR_RE as _TABLE_SEPARATOR_RE, compile_mention_patterns, strip_markdown)
 
 
 def _redact_telegram_error_text(error: object, proxy_url: str | None = None) -> str:
@@ -348,8 +350,6 @@ def _separate_chunk_indicator_from_fence(text: str) -> str:
 
 
 # MarkdownV2 has no table syntax, so pipe tables become bullet groups via convert_table_to_bullets().
-from gateway.platforms.helpers import (
-    TABLE_SEPARATOR_RE as _TABLE_SEPARATOR_RE, compile_mention_patterns, strip_markdown)
 
 # Rich-message regions whose internal newlines must stay bare (Telegram renders them natively):
 # fenced code blocks OR GFM pipe-table blocks (header row, delimiter row, data rows).
