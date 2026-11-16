@@ -2122,8 +2122,7 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
                     )
                     if getattr(_notify_res, "success", False) and getattr(_notify_res, "message_id", None):
                         _heartbeat_msg_id = str(_notify_res.message_id)
-                        if turn_ctx._cleanup_progress:
-                            turn_ctx._cleanup_msg_ids.append(_heartbeat_msg_id)
+                        turn_ctx._cleanup_msg_ids.append(_heartbeat_msg_id)
             except Exception as _ne:
                 logger.debug("Long-running notification error: %s", _ne)
 
@@ -2231,6 +2230,15 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
                 turn_ctx, progress_task=progress_task, log_task=log_task, interrupt_monitor=interrupt_monitor,
                 _notify_task=_notify_task, tracking_task=tracking_task, stream_task=stream_task,
             )
+            if turn_ctx._cleanup_msg_ids:
+                _adapter = _cleanup_adapter or self._delivery_adapter_for(source)
+                _chat_id = getattr(source, "chat_id", None) or getattr(getattr(turn_ctx, "source", None), "chat_id", None)
+                if _adapter and _chat_id and hasattr(_adapter, "delete_message"):
+                    for _clean_id in turn_ctx._cleanup_msg_ids:
+                        try:
+                            asyncio.create_task(_adapter.delete_message(_chat_id, _clean_id))
+                        except Exception:
+                            pass
 
         await self._run_agent_mark_streamed_delivery(response, turn_ctx)
         self._run_agent_schedule_bubble_cleanup(response, _cleanup_adapter, turn_ctx)

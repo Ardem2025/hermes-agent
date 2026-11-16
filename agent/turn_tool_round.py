@@ -168,6 +168,9 @@ def run_tool_round(
     from agent.prepared_compaction import maybe_prepare
     maybe_prepare(agent, messages, origin="tool-batch")
 
+    if any(tc.function.name == "delegate_task" for tc in assistant_msg.tool_calls or []):
+        agent._emit_interim_assistant_message(assistant_msg)
+
     agent._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
     from hermes_cli.observability.shared_metrics_harness import finish_tool_round
 

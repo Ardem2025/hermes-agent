@@ -3316,7 +3316,25 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
                     "chat_id": normalize_telegram_chat_id(chat_id), "reply_to_message_id": reply_to_id, **thread_kwargs,
                     **self._link_preview_kwargs(), **self._notification_kwargs(metadata)}
                 return await self._send_chunk_markdown_or_plain(chunk, send_kwargs), used_thread_fallback
+            except ((_TimedOut,) if _TimedOut else ()) + (TimeoutError, asyncio.TimeoutError) as send_err:
+                if _send_attempt >= 2:
+                    raise
+                wait = 2 ** _send_attempt
+                logger.warning("[%s] Timeout on send (attempt %d/3), retrying in %ds: %s",
+                               self.name, _send_attempt + 1, wait, _redact_telegram_error_text(send_err))
+                await asyncio.sleep(wait)
+                _send_attempt += 1
+                continue
             except _NetErr as send_err:
+                if (_TimedOut and isinstance(send_err, _TimedOut)) or self._is_timed_out(send_err):
+                    if _send_attempt >= 2:
+                        raise
+                    wait = 2 ** _send_attempt
+                    logger.warning("[%s] Timeout on send (attempt %d/3), retrying in %ds: %s",
+                                   self.name, _send_attempt + 1, wait, _redact_telegram_error_text(send_err))
+                    await asyncio.sleep(wait)
+                    _send_attempt += 1
+                    continue
                 # BadRequest subclasses NetworkError in PTB but is permanent; handle specific cases.
                 if _BadReq and isinstance(send_err, _BadReq):
                     if topic_gone(chat_id, send_err) and (effective_thread_id or (private_chat(chat_id) and thread_kwargs.get("direct_messages_topic_id"))):

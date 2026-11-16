@@ -2789,7 +2789,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             with _active_subagents_lock:
                 for sid, rec in _active_subagents.items():
                     owner_sid = str(rec.get("owner_agent_session_id") or rec.get("owner_session_id") or "")
-                    if owner_sid == session_id:
+                    is_match = (owner_sid == session_id) or (session_id and session_id in owner_sid) or (owner_sid and owner_sid in session_id)
+                    if is_match:
                         started = rec.get("started_at")
                         active.append({
                             "subagent_id": rec.get("subagent_id", sid),
@@ -2910,9 +2911,20 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             payload["current_tool"] = current_tool
 
         payload["has_active_subagents"] = has_active_subagents
-        payload["active_subagents_count"] = len(active_subagents)
+        active_subagents_count = len(active_subagents)
+        payload["active_subagents_count"] = active_subagents_count
         payload["active_subagents"] = active_subagents
         payload["subagents"] = active_subagents
+
+        is_generating = payload.get("is_generating", False)
+        is_gen = bool(is_generating or has_active_subagents or active_subagents_count > 0)
+        if is_gen:
+            status = "running"
+        elif session.get("ended_at") or session.get("end_reason"):
+            status = "completed"
+        else:
+            status = "waiting_input"
+        payload["status"] = status
         return payload
 
     @staticmethod
@@ -3757,6 +3769,22 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         effective_session_id = result.get("session_id") if is_dict else session_id
         final_response = _resolve_media_to_data_urls(
             result.get("final_response", "") if is_dict else "")
+        if self.is_telegram_bound(session_id):
+            _runner, telegram = self._telegram_runner_and_adapter()
+            if telegram and final_response:
+                db = self._ensure_session_db()
+                if db:
+                    binding = db.get_telegram_topic_binding_by_session(session_id=session_id)
+                    if binding and binding.get("delivery_enabled", True):
+                        chat_id = str(binding["chat_id"])
+                        thread_id = binding.get("thread_id") or binding.get("message_thread_id")
+                        metadata = {"thread_id": str(thread_id)} if thread_id else {}
+                        metadata["origin"] = "webui_mirror"
+                        try:
+                            coro = telegram.send(chat_id=chat_id, content=final_response, metadata=metadata)
+                        except TypeError:
+                            coro = telegram.send(chat_id=chat_id, text=final_response, metadata=metadata)
+                        asyncio.create_task(coro)
         headers = self._session_headers(effective_session_id or session_id, gateway_session_key)
         return web.json_response(
             {"object": "hermes.session.chat.completion", "status": _response_status(result),
@@ -3846,6 +3874,22 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 # Terminal status and flags come from the result (interrupted -> cancelled,
                 # unfinished -> failed); a late steer rides along as ``pending_steer`` for replay.
                 status, fields = _api_runs.terminal_run_status(result if is_dict else {})
+                if self.is_telegram_bound(session_id):
+                    _runner, telegram = self._telegram_runner_and_adapter()
+                    if telegram and final_response:
+                        db = self._ensure_session_db()
+                        if db:
+                            binding = db.get_telegram_topic_binding_by_session(session_id=session_id)
+                            if binding and binding.get("delivery_enabled", True):
+                                chat_id = str(binding["chat_id"])
+                                thread_id = binding.get("thread_id") or binding.get("message_thread_id")
+                                metadata = {"thread_id": str(thread_id)} if thread_id else {}
+                                metadata["origin"] = "webui_mirror"
+                                try:
+                                    coro = telegram.send(chat_id=chat_id, content=final_response, metadata=metadata)
+                                except TypeError:
+                                    coro = telegram.send(chat_id=chat_id, text=final_response, metadata=metadata)
+                                asyncio.create_task(coro)
                 await queue.put(_event_payload("assistant.completed", {
                     "session_id": effective_session_id, "message_id": message_id,
                     "content": final_response, **fields, "runtime": effective_runtime}))
