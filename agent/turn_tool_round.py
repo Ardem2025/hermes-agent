@@ -168,7 +168,15 @@ def run_tool_round(
     from agent.prepared_compaction import maybe_prepare
     maybe_prepare(agent, messages, origin="tool-batch")
 
-    if any(tc.function.name == "delegate_task" for tc in assistant_msg.tool_calls or []):
+    tcs = assistant_msg.get("tool_calls") if isinstance(assistant_msg, dict) else getattr(assistant_msg, "tool_calls", None)
+
+    def _is_delegate(tc):
+        fn = tc.get("function", {}) if isinstance(tc, dict) else getattr(tc, "function", None)
+        name = fn.get("name") if isinstance(fn, dict) else getattr(fn, "name", None)
+        return name == "delegate_task"
+
+    has_delegate = any(_is_delegate(tc) for tc in (tcs or []))
+    if has_delegate and not duplicate_previous_interim:
         agent._emit_interim_assistant_message(assistant_msg)
 
     agent._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
