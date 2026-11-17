@@ -106,3 +106,5 @@ class TurnContext:
     _native_slack_task_cards: bool = False
     native_tool_start_callback: Optional[Callable] = None
     native_tool_complete_callback: Optional[Callable] = None
+    _pulse_ticker: Any = None
+    background_tasks: set = field(default_factory=set)

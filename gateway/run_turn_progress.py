@@ -188,6 +188,9 @@ class GatewayTurnProgressMixin:
             except Exception:
                 # Best-effort: a viewer frame never blocks the failure notice below, but a lost one is logged.
                 logger.debug("Local viewer progress publish failed for %s", event_type, exc_info=True)
+        # Subagent Live Pulse (Telegram status card)
+        if event_type in ("subagent.start", "subagent.progress", "subagent.complete"):
+            self._handle_subagent_pulse(event_type, tool_name, preview, args, kwargs)
         # Failed subagent → one clean user-facing notice, handled FIRST, before every progress-queue
         # gate: platforms with tool_progress off must still hear about a dead delegation.
         if event_type == "subagent.complete":
@@ -239,6 +242,60 @@ class GatewayTurnProgressMixin:
         msg = self._progress_build_message(tool_name, preview, args)
         if msg is not None:
             self._progress_emit(msg)
+
+
+    def _handle_subagent_pulse(self, event_type: str, tool_name: str | None, preview: str | None, args: dict | None, kwargs: dict) -> None:
+        """Route subagent events to SubagentPulseTicker for Telegram."""
+        ctx = self._ctx
+        raw_platform = getattr(getattr(ctx, "source", None), "platform", None)
+        platform = getattr(raw_platform, "value", raw_platform)
+        if platform != "telegram":
+            return
+        adapter = getattr(ctx, "_live_status_adapter", None) or getattr(self._runner, "adapter", None)
+        if not adapter:
+            return
+
+        chat_id = getattr(ctx.source, "chat_id", None)
+        if not chat_id:
+            return
+
+        ticker = getattr(ctx, "_pulse_ticker", None)
+        if ticker is None and event_type == "subagent.start":
+            try:
+                from gateway.subagent_pulse_ticker import SubagentPulseTicker
+                metadata = getattr(ctx, "_progress_metadata", None)
+                thread_id = getattr(ctx.source, "thread_id", None)
+                ticker = SubagentPulseTicker(
+                    adapter=adapter,
+                    chat_id=chat_id,
+                    thread_id=thread_id,
+                    turn_context=ctx,
+                    metadata=metadata,
+                )
+                ctx._pulse_ticker = ticker
+                self._schedule(ticker.start(), "subagent pulse ticker start")
+            except Exception as e:
+                logger.debug("Failed to initialize SubagentPulseTicker: %s", e)
+                return
+
+        if ticker is None:
+            return
+
+        task_idx = kwargs.get("task_index", 0)
+        if event_type == "subagent.start":
+            goal = kwargs.get("goal") or preview or ""
+            transcript = kwargs.get("live_transcript") or kwargs.get("transcript_path")
+            ticker.on_subagent_start(task_idx, goal, transcript)
+        elif event_type == "subagent.progress":
+            action = preview or tool_name or ""
+            ticker.on_subagent_progress(task_idx, action)
+        elif event_type == "subagent.complete":
+            status = kwargs.get("status", "completed")
+            summary = kwargs.get("summary") or preview
+            ticker.on_subagent_complete(task_idx, status, summary)
+            active_left = any(t.get("status") == "running" for t in ticker.tasks.values())
+            if not active_left:
+                self._schedule(ticker.stop(status=status, summary=summary), "subagent pulse ticker complete")
 
     def _progress_subagent_notice(self, preview, kwargs: dict) -> None:
         """Only terminal failure statuses render (same notice rail as credit warnings)."""

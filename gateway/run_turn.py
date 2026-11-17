@@ -1868,6 +1868,11 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
             with suppress(Exception):
                 await _stts_finally.wait_complete(timeout=2.0)
 
+        pulse_ticker = getattr(turn_ctx, "_pulse_ticker", None)
+        if pulse_ticker and getattr(pulse_ticker, "active", False):
+            with suppress(Exception):
+                await pulse_ticker.stop(status="interrupted")
+
         tracking_task.cancel()
         if session_key:
             # Release the slot only if this run's generation still owns it (/stop or /new may have
