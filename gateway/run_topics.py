@@ -207,6 +207,45 @@ class GatewayTopicThreadsMixin:
             profile_name=self._telegram_topic_profile_name(source),
             expected_session_id=expected_session_id,
         )
+        adapter = self._delivery_adapter_for(source)
+        pop_fn = getattr(type(adapter), "pop_created_topic_name", None) if adapter is not None else None
+        if callable(pop_fn):
+            try:
+                created_name = pop_fn(adapter, str(source.chat_id), str(source.thread_id))
+            except Exception:
+                created_name = None
+            if isinstance(created_name, str) and created_name.strip():
+                try:
+                    current = session_db.get_session(session_entry.session_id)
+                except Exception:
+                    current = None
+                if current is None or current.get("title") is None or current.get("title_source") != "user":
+                    self._apply_created_topic_title(
+                        session_db, session_entry.session_id, created_name, str(source.thread_id),
+                    )
+
+    @staticmethod
+    def _apply_created_topic_title(session_db, session_id: str, title: str, thread_id: str) -> None:
+        """Persist a user-chosen topic creation name with deterministic conflict fallback."""
+        try:
+            session_db.set_session_title(session_id, title)
+            return
+        except ValueError as exc:
+            if "canonical Bot Chat" in str(exc):
+                logger.warning("Skipped setting created topic title on canonical Bot Chat %s: %s", session_id, exc)
+                return
+            max_len = getattr(session_db, "MAX_TITLE_LENGTH", 100)
+            suffix = f" (#{thread_id})"
+            max_base = max(1, max_len - len(suffix))
+            base = title[:max_base].rstrip()
+            fallback = f"{base}{suffix}" if base else f"#{thread_id}"[:max_len]
+            try:
+                session_db.set_session_title(session_id, fallback)
+            except ValueError as fallback_exc:
+                logger.warning(
+                    "Failed to set created topic title for session %s (thread=%s): %s",
+                    session_id, thread_id, fallback_exc,
+                )
 
     def _sync_telegram_topic_binding(self, source: SessionSource, session_entry, *, reason: str) -> None:
         """Update the topic binding to ``session_entry.session_id``: a stale binding after a mid-turn
@@ -272,7 +311,9 @@ class GatewayTopicThreadsMixin:
         async with keyed_turn(locks, self._telegram_topic_key(source)):
             route = await asyncio.to_thread(self.session_store.peek_session_id, session_entry.session_key)
             if route == session_entry.session_id:
-                await self._rename_telegram_topic_for_session_title(source, session_entry.session_id, title)
+                await self._rename_telegram_topic_for_session_title(
+                    source, session_entry.session_id, title, allow_user_title=True,
+                )
 
     def _bind_telegram_topic_if_route_holds(self, source: SessionSource, session_entry, *, reason: str) -> bool:
         """Bind only while the route still names ``session_entry``: commands dispatch concurrently, and
@@ -665,13 +706,17 @@ class GatewayTopicThreadsMixin:
             "Discord semantic thread rename",
         )
 
-    def _schedule_telegram_topic_title_rename(self, source: SessionSource, session_id: str, title: str) -> None:
+    def _schedule_telegram_topic_title_rename(
+        self, source: SessionSource, session_id: str, title: str, *, allow_user_title: bool = False,
+    ) -> None:
         """Schedule a topic rename from the auto-title background thread."""
         if not title or not self._is_telegram_topic_lane(source) or self._telegram_topic_auto_rename_disabled(source):
             return
         self._schedule_rename_from_title_thread(
             source,
-            lambda copied: self._rename_telegram_topic_for_session_title(copied, session_id, title),
+            lambda copied: self._rename_telegram_topic_for_session_title(
+                copied, session_id, title, allow_user_title=allow_user_title,
+            ),
             "Telegram topic title rename",
         )
 
@@ -682,7 +727,9 @@ class GatewayTopicThreadsMixin:
         platform_cfg = getattr(adapter, "config", None) if adapter is not None else None
         return is_truthy_value((getattr(platform_cfg, "extra", None) or {}).get("disable_topic_auto_rename"))
 
-    async def _rename_telegram_topic_for_session_title(self, source: SessionSource, session_id: str, title: str) -> None:
+    async def _rename_telegram_topic_for_session_title(
+        self, source: SessionSource, session_id: str, title: str, *, allow_user_title: bool = False,
+    ) -> None:
         """Best-effort rename of a Telegram DM topic when Hermes auto-titles a session."""
         if not await asyncio.to_thread(self._is_telegram_topic_lane, source) or not source.chat_id or not source.thread_id:
             return
@@ -712,6 +759,13 @@ class GatewayTopicThreadsMixin:
                 )
                 if binding and str(binding.get("session_id") or "") != str(session_id):
                     return
+                session_row = await session_db.get_session(session_id)
+                if isinstance(session_row, dict):
+                    if not allow_user_title and session_row.get("title_source") == "user":
+                        return
+                    current_title = session_row.get("title")
+                    if current_title is not None and current_title != title:
+                        return
             except Exception:
                 logger.debug("Failed to verify Telegram topic binding before rename", exc_info=True)
                 return
@@ -822,7 +876,7 @@ class GatewayTopicThreadsMixin:
             raise
         title = await db.get_session_title(session_id) or session_id
         # Restored titles bypass auto-titling, so rename the newly bound topic here.
-        await self._rename_telegram_topic_for_session_title(source, session_id, title)
+        await self._rename_telegram_topic_for_session_title(source, session_id, title, allow_user_title=True)
         last_assistant = None
         with suppress(Exception):
             for message in reversed(await db.get_messages(session_id)):

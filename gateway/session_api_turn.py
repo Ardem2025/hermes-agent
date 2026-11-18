@@ -19,6 +19,13 @@ _SETTINGS_PREFIX = 'gateway.api.settings.v1.'
 _OBSERVER_KEYS = ('stream_delta_callback', 'tool_start_callback', 'tool_complete_callback',
                   'reasoning_callback', 'status_callback', 'interim_assistant_callback')
 _TOOL_SINKS = {'tool_start_callback', 'tool_complete_callback'}
+_SUBAGENT_PROGRESS_EVENTS = frozenset({
+    'subagent.start',
+    'subagent.progress',
+    'subagent.complete',
+    'subagent_progress',
+})
+_PROGRESS_EVENTS = frozenset({'tool.started', 'tool.completed'}) | _SUBAGENT_PROGRESS_EVENTS
 _SETTING_KEYS = ('ephemeral_system_prompt', 'requested_model', 'requested_provider',
                  'model_options', 'route', 'session_model', 'confirmed_runtime_lock',
                  'requested_runtime', 'route_source', 'room_dispatch', 'room_execution_policy',
@@ -49,7 +56,21 @@ def check_api_turn(authority, ref, payload):
     live = authority.sessions[ref.session_id]
     if live.source.platform == Platform.API_SERVER:
         restore_api_session(authority, ref.session_id)
-    adapter = authority.runner._adapter_for_source(live.source)
+        adapter = authority.runner._adapter_for_source(live.source)
+    elif live.source.platform == Platform.TELEGRAM:
+        restore_api_session(authority, ref.session_id)
+        from gateway.session import SessionSource
+        from gateway.session_api import _served_profile
+        api_source = SessionSource(
+            platform=Platform.API_SERVER,
+            chat_id=ref.session_id,
+            user_id='api',
+            chat_type='dm',
+            profile=_served_profile(authority),
+        )
+        adapter = authority.runner._adapter_for_source(api_source)
+    else:
+        adapter = authority.runner._adapter_for_source(live.source)
     if adapter is None or getattr(adapter, 'gateway_runner', None) is not authority.runner:
         raise RuntimeStoreError('runtime_draining')
     if 'api_turn_v1' in payload:
@@ -177,6 +198,10 @@ def admit_api_steps(adapter, **kwargs):
     existing = authority.db.get_session(sid)
     if existing is not None and existing['source'] not in ('api_server', 'bot_room', 'telegram'):
         raise RuntimeStoreError('permission_denied')
+    if existing is not None and existing['source'] == 'telegram':
+        from gateway.session_api import _telegram_row_profile_matches
+        if not _telegram_row_profile_matches(authority, existing):
+            raise RuntimeStoreError('permission_denied')
     if kwargs.get('turn_author') is not None:
         from agent.turn_author import parse_turn_author
         author = parse_turn_author(kwargs['turn_author'])
@@ -473,6 +498,21 @@ def _notify_observers(authority, session_id, key, *args, **kwargs):
     return accepted
 
 
+def _session_source_platform(authority, session_id):
+    sessions = getattr(authority, 'sessions', None)
+    if sessions is None:
+        return None
+    try:
+        live = sessions.get(session_id) if hasattr(sessions, 'get') else sessions[session_id]
+    except KeyError:
+        return None
+    source = getattr(live, 'source', None)
+    platform = getattr(source, 'platform', None)
+    if platform is None:
+        return None
+    return getattr(platform, 'value', platform)
+
+
 def wire_api_observers(agent, owner, want_interim):
     """Hand this admission's API observers (Chat/Responses SSE, runs) the agent's reasoning,
     status, commentary and tool progress callbacks, the ones the direct API path gave the agent
@@ -502,8 +542,16 @@ def wire_api_observers(agent, owner, want_interim):
     progress = agent.tool_progress_callback
 
     def tool_progress_callback(event_type, *args, **kwargs):
-        if event_type in ('tool.started', 'tool.completed'):
-            publish_api_tool_progress(authority, session_id, generation, event_type, *args, **kwargs)
+        if event_type in _PROGRESS_EVENTS:
+            if event_type in _SUBAGENT_PROGRESS_EVENTS:
+                forward_kwargs = dict(kwargs)
+                source_platform = _session_source_platform(authority, session_id)
+                if source_platform is not None:
+                    forward_kwargs.setdefault('source_platform', source_platform)
+                    forward_kwargs.setdefault('telegram_pulse_owned', source_platform == Platform.TELEGRAM.value)
+                publish_api_tool_progress(authority, session_id, generation, event_type, *args, **forward_kwargs)
+            else:
+                publish_api_tool_progress(authority, session_id, generation, event_type, *args, **kwargs)
         if progress is not None:
             return progress(event_type, *args, **kwargs)
     agent.reasoning_callback = lambda text: publish('reasoning_callback', text)
@@ -522,6 +570,12 @@ def publish_api_event(authority, session_id, event_type, payload):
 def publish_api_tool_progress(authority, session_id, generation, *args, **kwargs):
     """A ``tool_progress_callback`` tool event as its producer emitted it, for the admission's
     progress-only observers; never inferred again from formatted or bounded result text."""
+    if args and args[0] in _SUBAGENT_PROGRESS_EVENTS:
+        source_platform = _session_source_platform(authority, session_id)
+        if source_platform is not None:
+            kwargs = dict(kwargs)
+            kwargs.setdefault('source_platform', source_platform)
+            kwargs.setdefault('telegram_pulse_owned', source_platform == Platform.TELEGRAM.value)
     with authority.sessions[session_id].event_stream.lock:
         try:
             authority.check_approval_generation(session_id, generation)

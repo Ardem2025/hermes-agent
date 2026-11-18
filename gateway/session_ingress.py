@@ -321,7 +321,11 @@ async def execute_admission(authority, ref, row):
     from gateway.config import Platform
     from gateway.session_api_turn import api_execution, prepare_api_execution
     from gateway.session_results import execution_result
-    is_api = live.source.platform == Platform.API_SERVER
+    is_api = (
+        live.source.platform == Platform.API_SERVER
+        or 'api_turn_v1' in row['payload']
+        or row['principal_id'] == 'api'
+    )
     if not (event.internal or is_api or live.source.platform == Platform.LOCAL):
         # The claim on a chat route (native or a viewer's submit): a /new before the turn resolves
         # its session must not move it onto the fresh conversation (main's /new cancelled its task).
@@ -349,6 +353,7 @@ async def execute_admission(authority, ref, row):
                     event.text = '\n'.join(part['text'] for part in prepared['content'] if part.get('type') == 'text')
                 event.allow_gateway_control = False
                 event.internal = True  # trust comes from the private binding and preclaim, never client JSON
+                event.is_api_user_turn = True
             response = await authority.runner._handle_message(event)
             result = captured.get('terminal_result', captured.get('result'))
             if result is None:

@@ -638,6 +638,9 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
         self._send_path_degraded: bool = False
         self._general_request_drain_lock = asyncio.Lock()
         self._dm_topics: dict[str, int] = {}  # topic_name -> message_thread_id
+        # (chat_id, thread_id) -> (topic_name, monotonic record time) for client-created DM topics
+        # before their first message binds a session in state.db.
+        self._created_topic_names: dict[tuple[str, str], tuple[str, float]] = {}
         # (chat_id, sender_id) -> (new topic id, last Message.date, monotonic record time) for client-created
         # DM topics whose thread-less opener may still arrive (#136567); see TelegramTopicRoutingMixin.
         self._pending_created_topics: dict[tuple[str, str], tuple[str, float, float]] = {}
@@ -2770,6 +2773,9 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
         created_filter = getattr(getattr(filters, "StatusUpdate", None), "FORUM_TOPIC_CREATED", None)
         if created_filter is not None:
             app.add_handler(TelegramMessageHandler(created_filter, self._handle_forum_topic_created))
+        edited_filter = getattr(getattr(filters, "StatusUpdate", None), "FORUM_TOPIC_EDITED", None)
+        if edited_filter is not None:
+            app.add_handler(TelegramMessageHandler(edited_filter, self._handle_forum_topic_edited))
         app.add_handler(CallbackQueryHandler(self._handle_callback_query))
         # Inline command picker; inert until the owner enables inline mode via BotFather /setinline.
         app.add_handler(InlineQueryHandler(self._handle_inline_query))
@@ -6468,6 +6474,136 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
         if cache_key not in self._dm_topics:
             self._dm_topics[cache_key] = int(thread_id)
             logger.info("[%s] Cached DM topic from message: %s -> thread_id=%s", self.name, cache_key, thread_id)
+
+    _CREATED_TOPIC_NAMES_CAP = 256
+    _CREATED_TOPIC_NAMES_TTL_SECONDS = 600.0
+
+    def _store_created_topic_name(self, chat_id: str, thread_id: str, name: str) -> None:
+        """Store a user-chosen topic name until the first message binds a session."""
+        store = self.__dict__.setdefault("_created_topic_names", {})
+        now = time.monotonic()
+        ttl = self._CREATED_TOPIC_NAMES_TTL_SECONDS
+        for stale in [k for k, rec in store.items() if now - rec[1] > ttl]:
+            del store[stale]
+        key = (str(chat_id), str(thread_id))
+        if key not in store:
+            while len(store) >= self._CREATED_TOPIC_NAMES_CAP:
+                del store[min(store, key=lambda k: store[k][1])]
+        store[key] = (name, now)
+
+    def pop_created_topic_name(self, chat_id: str, thread_id: str) -> Optional[str]:
+        """Pop and return a non-expired created topic name for (chat_id, thread_id)."""
+        store = self.__dict__.setdefault("_created_topic_names", {})
+        now = time.monotonic()
+        ttl = self._CREATED_TOPIC_NAMES_TTL_SECONDS
+        for stale in [k for k, rec in store.items() if now - rec[1] > ttl]:
+            del store[stale]
+        rec = store.pop((str(chat_id), str(thread_id)), None)
+        return rec[0] if rec is not None else None
+
+    def _sanitize_topic_title_for_db(self, raw_name: Optional[str]) -> Optional[str]:
+        """Sanitize a Telegram topic name for SessionDB.set_session_title."""
+        if not raw_name or not isinstance(raw_name, str):
+            return None
+        from hermes_state_titles import _TITLE_CONTROL_RE, _TITLE_INVISIBLE_RE, _sanitize_surrogates
+        db = getattr(getattr(self, "_session_store", None), "_db", None)
+        max_len = getattr(db, "MAX_TITLE_LENGTH", 100) if db is not None else 100
+        cleaned = _TITLE_INVISIBLE_RE.sub("", _TITLE_CONTROL_RE.sub("", _sanitize_surrogates(raw_name)))
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
+        if not cleaned:
+            return None
+        if len(cleaned) > max_len:
+            cleaned = cleaned[:max_len].rstrip()
+        return cleaned or None
+
+    def _apply_topic_title_to_session(self, db: Any, session_id: str, title: str, thread_id: str) -> None:
+        """Persist a user-chosen topic title with deterministic conflict fallback."""
+        try:
+            db.set_session_title(session_id, title)
+            return
+        except ValueError as exc:
+            if "canonical Bot Chat" in str(exc):
+                logger.warning(
+                    "[%s] Skipped renaming canonical Bot Chat session %s (thread=%s): %s",
+                    self.name, session_id, thread_id, exc,
+                )
+                return
+            max_len = getattr(db, "MAX_TITLE_LENGTH", 100)
+            suffix = f" (#{thread_id})"
+            max_base = max(1, max_len - len(suffix))
+            base = title[:max_base].rstrip()
+            fallback = f"{base}{suffix}" if base else f"#{thread_id}"[:max_len]
+            try:
+                db.set_session_title(session_id, fallback)
+            except ValueError as fallback_exc:
+                logger.warning(
+                    "[%s] Failed to set topic title for session %s (thread=%s): %s",
+                    self.name, session_id, thread_id, fallback_exc,
+                )
+
+    async def _handle_forum_topic_edited(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Sync user-initiated DM forum topic renames into SessionDB without triggering an agent turn."""
+        msg = getattr(update, "effective_message", None)
+        edited = getattr(msg, "forum_topic_edited", None) if msg is not None else None
+        if msg is None or edited is None:
+            return
+        from_user = getattr(msg, "from_user", None)
+        if from_user is None or getattr(from_user, "is_bot", False) or self._is_own_message(msg):
+            return
+        if not self._is_user_authorized_from_message(msg):
+            self._log_blocked_user(msg, level=logging.DEBUG, what="unauthorized topic edit")
+            return
+        if self._chat_type_str(getattr(msg, "chat", None)) != "private":
+            return
+        thread_id = getattr(msg, "message_thread_id", None)
+        if thread_id is None:
+            return
+        new_name = self._sanitize_topic_title_for_db(getattr(edited, "name", None))
+        if not new_name:
+            return
+        chat_id_str = self._chat_id_str(msg)
+        thread_id_str = str(thread_id)
+        db = getattr(getattr(self, "_session_store", None), "_db", None)
+        if db is None:
+            if (chat_id_str, thread_id_str) in self.__dict__.get("_created_topic_names", {}):
+                self._store_created_topic_name(chat_id_str, thread_id_str, new_name)
+            return
+        profile_name = getattr(self, "_owner_profile", None) or getattr(self, "_hermes_profile_name", None) or "default"
+        try:
+            binding = db.get_telegram_topic_binding(
+                chat_id=chat_id_str, thread_id=thread_id_str, profile_name=profile_name,
+            )
+        except Exception:
+            logger.debug("[%s] Failed to look up topic binding on edit", self.name, exc_info=True)
+            return
+        session_id = binding.get("session_id") if isinstance(binding, dict) else binding
+        if not session_id:
+            self._store_created_topic_name(chat_id_str, thread_id_str, new_name)
+            logger.debug(
+                "[%s] No binding for edited DM topic chat=%s thread=%s; cached pending name",
+                self.name, chat_id_str, thread_id_str,
+            )
+            return
+        self.__dict__.get("_created_topic_names", {}).pop((chat_id_str, thread_id_str), None)
+        self._apply_topic_title_to_session(db, session_id, new_name, thread_id_str)
+        try:
+            tid_int = int(thread_id_str)
+        except (TypeError, ValueError):
+            tid_int = None
+        if tid_int is not None:
+            static_names: set[str] = set()
+            for chat_entry in getattr(self, "_dm_topics_config", []) or []:
+                if str(chat_entry.get("chat_id", "")) == chat_id_str:
+                    for t in chat_entry.get("topics", []) or []:
+                        if t.get("name"):
+                            static_names.add(str(t["name"]))
+            prefix = f"{chat_id_str}:"
+            stale_keys = [
+                k for k, cached_tid in list(self._dm_topics.items())
+                if cached_tid == tid_int and k.startswith(prefix) and k[len(prefix):] not in static_names
+            ]
+            for k in stale_keys:
+                self._dm_topics.pop(k, None)
 
     def _resolve_topic_binding(self, message: Message, chat_type: str, thread_id_str: Optional[str]) -> tuple:
         """Return ``(chat_topic, topic_skill)`` for a DM topic or bound forum topic (else Nones)."""

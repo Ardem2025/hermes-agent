@@ -184,7 +184,11 @@ def display_kind_for_event(event: Any) -> str | None:
         return kind
     if getattr(event, "internal", False) and _producer_card(event):
         return event.metadata["display_kind"]
-    if getattr(event, "internal", False) or getattr(event, "_heartbeat_session_id", None):
+    if getattr(event, "_heartbeat_session_id", None):
+        return INTERNAL_NOTIFICATION_DISPLAY_KIND
+    if getattr(event, "is_api_user_turn", False):
+        return None
+    if getattr(event, "internal", False):
         return INTERNAL_NOTIFICATION_DISPLAY_KIND
     return None
 

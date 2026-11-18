@@ -49,8 +49,47 @@ class TelegramTopicRoutingMixin:
         """Routing signal only, never an agent turn (#136567). The user-chosen name is NOT cached in
         ``_dm_topics``: entries there mark operator-declared topics, which session-title auto-rename skips."""
         message = getattr(update, "effective_message", None)
-        if message is not None and getattr(message, "forum_topic_created", None) is not None:
-            self._admit_topic_follow(message)
+        if message is None:
+            return
+        created = getattr(message, "forum_topic_created", None)
+        if created is None:
+            return
+        self._admit_topic_follow(message)
+        if self._chat_type_str(getattr(message, "chat", None)) != "private":
+            return
+        thread_id = getattr(message, "message_thread_id", None)
+        if thread_id is None:
+            return
+        from_user = getattr(message, "from_user", None)
+        if from_user is None or getattr(from_user, "is_bot", False) or self._is_own_message(message):
+            return
+        if not self._is_user_authorized_from_message(message):
+            return
+        created_name = self._sanitize_topic_title_for_db(getattr(created, "name", None))
+        if not created_name:
+            return
+        chat_id_str = self._chat_id_str(message)
+        thread_id_str = str(thread_id)
+        db = getattr(getattr(self, "_session_store", None), "_db", None)
+        if db is not None:
+            profile_name = getattr(self, "_owner_profile", None) or getattr(self, "_hermes_profile_name", None) or "default"
+            try:
+                binding = db.get_telegram_topic_binding(
+                    chat_id=chat_id_str, thread_id=thread_id_str, profile_name=profile_name,
+                )
+            except Exception:
+                logger.debug("[%s] Failed to look up topic binding on creation", self.name, exc_info=True)
+                binding = None
+            session_id = binding.get("session_id") if isinstance(binding, dict) else binding
+            if session_id:
+                try:
+                    session_row = db.get_session(session_id)
+                except Exception:
+                    session_row = None
+                if session_row is None or session_row.get("title") is None or session_row.get("title_source") != "user":
+                    self._apply_topic_title_to_session(db, session_id, created_name, thread_id_str)
+                return
+        self._store_created_topic_name(chat_id_str, thread_id_str, created_name)
 
     def _adopt_created_topic_thread(self, message: Any, chat_type: str, thread_id: Optional[str]) -> Optional[str]:
         """Thread id of the topic this sender just created, for its thread-less follow-up messages."""

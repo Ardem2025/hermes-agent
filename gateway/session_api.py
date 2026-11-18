@@ -80,6 +80,33 @@ def _served_profile(authority):
     return registry.profile_name(authority) if registry is not None else None
 
 
+def _telegram_row_profile_matches(authority, row):
+    """Return True when a Telegram session row belongs to *authority*'s profile."""
+    if row is None:
+        return True
+    keys = row.keys()
+    row_profile = row['profile_name'] if 'profile_name' in keys else None
+    raw_origin = row['origin_json'] if 'origin_json' in keys else None
+    origin_profile = None
+    if isinstance(raw_origin, str) and raw_origin:
+        try:
+            origin = json.loads(raw_origin)
+        except (TypeError, ValueError):
+            origin = None
+        if isinstance(origin, dict):
+            origin_profile = origin.get('profile')
+    elif isinstance(raw_origin, dict):
+        origin_profile = raw_origin.get('profile')
+    allowed = {authority.profile_id, _served_profile(authority)} - {None, ''}
+    if not allowed:
+        allowed = {'default'}
+    if row_profile and row_profile not in allowed:
+        return False
+    if origin_profile and origin_profile not in allowed:
+        return False
+    return True
+
+
 def _pin_api_identity(runner, source, *, transport_profile=None):
     """Pin the shared-listener identity on an API source: transport = the launch profile whose
     listener received ``/p/<name>/``, runtime = ``source.profile``. Returns the transport profile to
@@ -176,6 +203,8 @@ def bind_api_steps(authority, session_id, *, hosted_dispatch=None, declared_key=
     is_telegram = (existing_row is not None and existing_row['source'] == 'telegram') or (
         session_id in authority.sessions and authority.sessions[session_id].source.platform == Platform.TELEGRAM
     )
+    if is_telegram and existing_row is not None and not _telegram_row_profile_matches(authority, existing_row):
+        raise RuntimeStoreError('permission_denied')
     if is_telegram:
         storage_source = 'telegram'
     if session_id in authority.sessions and not is_history_mount(authority.sessions[session_id]):
@@ -232,10 +261,12 @@ def bind_api_steps(authority, session_id, *, hosted_dispatch=None, declared_key=
                 raise RuntimeStoreError('admission_conflict')
             conn.execute('INSERT INTO state_meta(key,value) VALUES(?,?) ON CONFLICT(key) DO NOTHING',
                          (_DECLARED_PREFIX + declared_key, session_id))
-        row = conn.execute('SELECT source,session_key,title FROM sessions WHERE id=?', (session_id,)).fetchone()
+        row = conn.execute('SELECT source,session_key,title,profile_name,origin_json FROM sessions WHERE id=?', (session_id,)).fetchone()
         if row is not None and row['source'] != storage_source:
             if not (is_telegram and row['source'] == 'telegram'):
                 raise RuntimeStoreError('permission_denied')
+        if row is not None and row['source'] == 'telegram' and not _telegram_row_profile_matches(authority, row):
+            raise RuntimeStoreError('permission_denied')
         if storage_source == 'bot_room':
             if row is not None and row['title'] != title:
                 raise RuntimeStoreError('admission_conflict')
@@ -338,6 +369,8 @@ def restore_api_session(authority, session_id):
     else:
         if (receipt['session_id'] != session_id or entry.session_id != session_id or row is None or row['source'] != 'telegram'):
             raise RuntimeStoreError('admission_conflict')
+        if not _telegram_row_profile_matches(authority, row):
+            raise RuntimeStoreError('permission_denied')
     if receipt.get('storage_source') == 'bot_room':
         identity = receipt['room_identity']
         expected = room_session_id(identity, receipt.get('room_generation', 0))

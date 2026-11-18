@@ -3731,6 +3731,120 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             logger.info("Session SSE client disconnected while a live Bot Chat held the turn")
         return response
 
+    class _TelegramMirrorCoordinator:
+        """Per-turn coordinator for mirroring WebUI commentary and final replies to Telegram."""
+
+        def __init__(
+            self,
+            adapter: "APIServerAdapter",
+            *,
+            session_id: str,
+            loop: asyncio.AbstractEventLoop,
+            enabled: bool,
+        ) -> None:
+            self._adapter = adapter
+            self.session_id = session_id
+            self.loop = loop
+            self.enabled = bool(enabled)
+            self.mirror_lock = asyncio.Lock()
+            self.pending_mirror_tasks: list[asyncio.Task] = []
+            self.sent_mirror_texts: set[str] = set()
+
+        @staticmethod
+        def _norm(text: str) -> str:
+            return " ".join(text.split()).strip()
+
+        async def _send_telegram_mirror(self, text: str) -> None:
+            async with self.mirror_lock:
+                try:
+                    _runner, telegram = self._adapter._telegram_runner_and_adapter()
+                    if not telegram:
+                        return
+                    db = self._adapter._ensure_session_db()
+                    if not db:
+                        return
+                    if hasattr(db, "apply_telegram_topic_migration"):
+                        db.apply_telegram_topic_migration()
+                    binding = db.get_telegram_topic_binding_by_session(session_id=self.session_id)
+                    if not binding or not binding.get("delivery_enabled", True):
+                        return
+                    chat_id = binding.get("chat_id")
+                    if not chat_id:
+                        return
+                    thread_id = binding.get("thread_id") or binding.get("message_thread_id")
+                    metadata = {"thread_id": str(thread_id)} if thread_id else {}
+                    metadata["origin"] = "webui_mirror"
+                    try:
+                        await telegram.send(chat_id=str(chat_id), content=text, metadata=metadata)
+                    except TypeError:
+                        await telegram.send(chat_id=str(chat_id), text=text, metadata=metadata)
+                except Exception:
+                    logger.warning(
+                        "Failed to mirror WebUI message to Telegram for session %s (non-fatal)",
+                        self.session_id,
+                        exc_info=True,
+                    )
+
+        def _schedule_telegram_mirror(self, text: str) -> None:
+            if not self.enabled or not (isinstance(text, str) and text.strip()):
+                return
+            norm = self._norm(text)
+            if not norm or norm in self.sent_mirror_texts:
+                return
+            self.sent_mirror_texts.add(norm)
+            task = self.loop.create_task(self._send_telegram_mirror(text))
+            self.pending_mirror_tasks.append(task)
+
+        def enqueue_commentary(self, text: str) -> None:
+            if not self.enabled or not (isinstance(text, str) and text.strip()):
+                return
+            try:
+                running_loop = asyncio.get_running_loop()
+            except RuntimeError:
+                running_loop = None
+            if running_loop is self.loop:
+                self._schedule_telegram_mirror(text)
+            else:
+                try:
+                    self.loop.call_soon_threadsafe(self._schedule_telegram_mirror, text)
+                except RuntimeError:
+                    logger.debug(
+                        "Event loop closed while scheduling Telegram commentary mirror for session %s",
+                        self.session_id,
+                        exc_info=True,
+                    )
+
+        async def drain(self) -> None:
+            await asyncio.sleep(0)
+            while self.pending_mirror_tasks:
+                tasks = list(self.pending_mirror_tasks)
+                self.pending_mirror_tasks.clear()
+                await asyncio.gather(*tasks, return_exceptions=True)
+
+        async def send_final(self, final_response: str) -> None:
+            await self.drain()
+            if not self.enabled or not (isinstance(final_response, str) and final_response.strip()):
+                return
+            norm = self._norm(final_response)
+            if not norm or norm in self.sent_mirror_texts:
+                return
+            self.sent_mirror_texts.add(norm)
+            await self._send_telegram_mirror(final_response)
+
+    def _new_telegram_mirror(
+        self,
+        *,
+        session_id: str,
+        loop: asyncio.AbstractEventLoop,
+        enabled: bool,
+    ) -> "_TelegramMirrorCoordinator":
+        return self._TelegramMirrorCoordinator(
+            self,
+            session_id=session_id,
+            loop=loop,
+            enabled=enabled,
+        )
+
     @_admit_api_agent_request
     async def _handle_session_chat(self, request: web.Request) -> web.Response:
         """POST /api/sessions/{session_id}/chat — one synchronous agent turn (plus the delivery lanes'
@@ -3751,40 +3865,50 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             return handed_off
         gateway_session_key = ctx["gateway_session_key"]
         session_id = ctx["session_id"]
-        history = await self._conversation_history_for_session(session_id)
-        result, usage = await self._run_agent(conversation_history=history, **ctx["run_kwargs"])
-        # One policy-gated re-run of a transiently failed turn — the peer-DM transport's half of the
-        # retry the local (``tools.bot_mode_dm``) and relayed (``tui_gateway.methods_bot_relay``)
-        # delivery lanes already apply (#93091 item 5, #115325). Same policy, same gate: transient
-        # classes (429 / 5xx) re-run the SAME session once, a context overflow lets the re-run's
-        # pre-API compaction shrink the transcript first, and auth/quota/config/model never re-run. The
-        # store is read again first: the failed attempt's turn-start persist left the DM as the
-        # transcript's unanswered tail row, and the re-run resumes that row instead of appending a
-        # second copy of it. A turn that fails again reaches the peer client exactly as before.
-        if result_retry_action(result) != RETRY_NONE:
+        duplicate_to_telegram = bool(
+            ctx["body"].get("duplicate_to_telegram")
+            if "duplicate_to_telegram" in ctx["body"]
+            else self.is_telegram_bound(session_id)
+        )
+        loop = asyncio.get_running_loop()
+        mirror = self._new_telegram_mirror(session_id=session_id, loop=loop, enabled=duplicate_to_telegram)
+
+        def _commentary(text: str, *, already_streamed: bool = False) -> None:
+            mirror.enqueue_commentary(text)
+
+        try:
             history = await self._conversation_history_for_session(session_id)
             result, usage = await self._run_agent(
-                conversation_history=history, resume_unanswered_turn=True, **ctx["run_kwargs"])
+                conversation_history=history,
+                interim_assistant_callback=_commentary,
+                **ctx["run_kwargs"],
+            )
+            # One policy-gated re-run of a transiently failed turn — the peer-DM transport's half of the
+            # retry the local (``tools.bot_mode_dm``) and relayed (``tui_gateway.methods_bot_relay``)
+            # delivery lanes already apply (#93091 item 5, #115325). Same policy, same gate: transient
+            # classes (429 / 5xx) re-run the SAME session once, a context overflow lets the re-run's
+            # pre-API compaction shrink the transcript first, and auth/quota/config/model never re-run. The
+            # store is read again first: the failed attempt's turn-start persist left the DM as the
+            # transcript's unanswered tail row, and the re-run resumes that row instead of appending a
+            # second copy of it. A turn that fails again reaches the peer client exactly as before.
+            if result_retry_action(result) != RETRY_NONE:
+                history = await self._conversation_history_for_session(session_id)
+                result, usage = await self._run_agent(
+                    conversation_history=history,
+                    resume_unanswered_turn=True,
+                    interim_assistant_callback=_commentary,
+                    **ctx["run_kwargs"],
+                )
+        finally:
+            try:
+                await mirror.drain()
+            except Exception:
+                logger.debug("Telegram mirror drain failed in _handle_session_chat (non-fatal)", exc_info=True)
         is_dict = isinstance(result, dict)
         effective_session_id = result.get("session_id") if is_dict else session_id
         final_response = _resolve_media_to_data_urls(
             result.get("final_response", "") if is_dict else "")
-        if self.is_telegram_bound(session_id):
-            _runner, telegram = self._telegram_runner_and_adapter()
-            if telegram and final_response:
-                db = self._ensure_session_db()
-                if db:
-                    binding = db.get_telegram_topic_binding_by_session(session_id=session_id)
-                    if binding and binding.get("delivery_enabled", True):
-                        chat_id = str(binding["chat_id"])
-                        thread_id = binding.get("thread_id") or binding.get("message_thread_id")
-                        metadata = {"thread_id": str(thread_id)} if thread_id else {}
-                        metadata["origin"] = "webui_mirror"
-                        try:
-                            coro = telegram.send(chat_id=chat_id, content=final_response, metadata=metadata)
-                        except TypeError:
-                            coro = telegram.send(chat_id=chat_id, text=final_response, metadata=metadata)
-                        asyncio.create_task(coro)
+        await mirror.send_final(final_response)
         headers = self._session_headers(effective_session_id or session_id, gateway_session_key)
         return web.json_response(
             {"object": "hermes.session.chat.completion", "status": _response_status(result),
@@ -3821,6 +3945,175 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         preserve_on_disconnect = bool(
             duplicate_to_telegram or self.is_telegram_bound(session_id) or ctx["body"].get("preserve_on_disconnect")
         )
+        loop = asyncio.get_running_loop()
+        mirror = self._new_telegram_mirror(session_id=session_id, loop=loop, enabled=duplicate_to_telegram)
+        _subagent_pulse_events = frozenset({
+            "subagent.start",
+            "subagent.progress",
+            "subagent.complete",
+            "subagent_progress",
+        })
+        _subagent_failure_statuses = ("failed", "error", "timeout", "cancelled")
+        pulse_state: dict[str, Any] = {
+            "ticker": None,
+            "starting": False,
+            "stopped": False,
+            "start_task": None,
+            "stop_task": None,
+            "terminal_status": None,
+            "terminal_summary": "",
+        }
+
+        async def _start_pulse_ticker(target_ticker: Any, prev_stop_task: Optional[asyncio.Task]) -> None:
+            try:
+                if prev_stop_task is not None and not prev_stop_task.done():
+                    try:
+                        await prev_stop_task
+                    except Exception:
+                        logger.debug("Previous pulse ticker stop_task failed (non-fatal)", exc_info=True)
+                await target_ticker.start()
+            except Exception:
+                logger.debug("Failed to start SubagentPulseTicker (non-fatal)", exc_info=True)
+            finally:
+                if pulse_state["ticker"] is target_ticker:
+                    pulse_state["starting"] = False
+
+        async def _stop_pulse_ticker(
+            target_ticker: Any,
+            target_start_task: Optional[asyncio.Task],
+            status: str,
+            summary: str,
+        ) -> None:
+            if target_start_task is not None and not target_start_task.done():
+                try:
+                    await target_start_task
+                except Exception:
+                    logger.debug("Pulse ticker start_task failed before stop (non-fatal)", exc_info=True)
+            if target_ticker.active or target_ticker.ticker_task is not None:
+                await target_ticker.stop(status=status, summary=summary)
+
+        def _handle_pulse_event(
+            event_type: str,
+            tool_name: str | None,
+            preview: str | None,
+            args: Any,
+            kwargs: dict[str, Any],
+        ) -> None:
+            if not duplicate_to_telegram:
+                return
+            source_platform = kwargs.get("source_platform")
+            if kwargs.get("telegram_pulse_owned") or source_platform in (
+                Platform.TELEGRAM,
+                Platform.TELEGRAM.value,
+                "telegram",
+            ):
+                return
+            task_idx = kwargs.get("task_index", 0)
+            if event_type == "subagent.start":
+                ticker = pulse_state["ticker"]
+                need_new_ticker = (
+                    ticker is None
+                    or pulse_state["stopped"]
+                    or (not ticker.active and not pulse_state["starting"])
+                )
+                if need_new_ticker:
+                    try:
+                        _runner, telegram = self._telegram_runner_and_adapter()
+                        if not telegram:
+                            return
+                        db = self._ensure_session_db()
+                        if not db:
+                            return
+                        if hasattr(db, "apply_telegram_topic_migration"):
+                            db.apply_telegram_topic_migration()
+                        binding = db.get_telegram_topic_binding_by_session(session_id=session_id)
+                        if not binding or not binding.get("delivery_enabled", True):
+                            return
+                        chat_id = binding.get("chat_id")
+                        if not chat_id:
+                            return
+                        thread_id = binding.get("thread_id") or binding.get("message_thread_id")
+                        metadata = {"thread_id": str(thread_id)} if thread_id else {}
+                        from gateway.subagent_pulse_ticker import SubagentPulseTicker
+                        ticker = SubagentPulseTicker(
+                            adapter=telegram,
+                            chat_id=chat_id,
+                            thread_id=thread_id,
+                            metadata=metadata,
+                        )
+                    except Exception:
+                        logger.debug("Failed to initialize SubagentPulseTicker for session %s", session_id, exc_info=True)
+                        return
+                    prev_stop_task = pulse_state["stop_task"]
+                    pulse_state["ticker"] = ticker
+                    pulse_state["starting"] = True
+                    pulse_state["stopped"] = False
+                    pulse_state["stop_task"] = None
+                    pulse_state["terminal_status"] = None
+                    pulse_state["terminal_summary"] = ""
+                    pulse_state["start_task"] = asyncio.create_task(_start_pulse_ticker(ticker, prev_stop_task))
+                goal = kwargs.get("goal") or preview or ""
+                transcript = kwargs.get("live_transcript") or kwargs.get("transcript_path")
+                ticker.on_subagent_start(task_idx, goal, transcript)
+            elif event_type in ("subagent.progress", "subagent_progress"):
+                ticker = pulse_state["ticker"]
+                if ticker is None or pulse_state["stopped"]:
+                    return
+                action = kwargs.get("action") or preview or tool_name or ""
+                ticker.on_subagent_progress(task_idx, action)
+            elif event_type == "subagent.complete":
+                ticker = pulse_state["ticker"]
+                if ticker is None or pulse_state["stopped"]:
+                    return
+                status = kwargs.get("status") or "completed"
+                summary = kwargs.get("summary") or preview
+                ticker.on_subagent_complete(task_idx, status, summary)
+                active_left = any(t.get("status") == "running" for t in ticker.tasks.values())
+                if not active_left:
+                    failed_task = next(
+                        (t for t in ticker.tasks.values() if t.get("status") in _subagent_failure_statuses),
+                        None,
+                    )
+                    if failed_task is not None:
+                        terminal_status = str(failed_task.get("status"))
+                        terminal_summary = str(failed_task.get("summary") or summary or "")
+                    else:
+                        terminal_status = status if status in _subagent_failure_statuses else "completed"
+                        terminal_summary = str(summary or "")
+                    pulse_state["terminal_status"] = terminal_status
+                    pulse_state["terminal_summary"] = terminal_summary
+                    pulse_state["stopped"] = True
+                    if (ticker.active or pulse_state["starting"]) and pulse_state["stop_task"] is None:
+                        pulse_state["stop_task"] = asyncio.create_task(
+                            _stop_pulse_ticker(ticker, pulse_state["start_task"], terminal_status, terminal_summary)
+                        )
+
+        async def _finalize_pulse_ticker(fallback_status: str) -> None:
+            stop_task = pulse_state["stop_task"]
+            if stop_task is not None:
+                try:
+                    await stop_task
+                except Exception:
+                    logger.debug("Pulse ticker stop_task failed (non-fatal)", exc_info=True)
+                return
+            ticker = pulse_state["ticker"]
+            if ticker is None or pulse_state["stopped"]:
+                return
+            start_task = pulse_state["start_task"]
+            if not ticker.active and not pulse_state["starting"] and (start_task is None or start_task.done()):
+                return
+            pulse_state["stopped"] = True
+            final_status = pulse_state["terminal_status"] or fallback_status
+            final_summary = pulse_state["terminal_summary"]
+            stop_task = asyncio.create_task(
+                _stop_pulse_ticker(ticker, start_task, final_status, final_summary)
+            )
+            pulse_state["stop_task"] = stop_task
+            try:
+                await stop_task
+            except Exception:
+                logger.debug("Pulse ticker stop failed (non-fatal)", exc_info=True)
+
         # Claim ownership inside the request's profile scope before any run-keyed state
         # exists, so /v1/runs/{id}* control is confined to the starting profile.
         # See #93689.
@@ -3842,6 +4135,24 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                     else event_type
                 )
                 events.enqueue(event_name, {"message_id": message_id, "tool_name": tool_name, "preview": preview, "args": args})
+            elif event_type in _subagent_pulse_events:
+                if not duplicate_to_telegram:
+                    return
+                source_platform = kwargs.get("source_platform")
+                if kwargs.get("telegram_pulse_owned") or source_platform in (
+                    Platform.TELEGRAM,
+                    Platform.TELEGRAM.value,
+                    "telegram",
+                ):
+                    return
+                try:
+                    running_loop = asyncio.get_running_loop()
+                except RuntimeError:
+                    running_loop = None
+                if running_loop is loop:
+                    _handle_pulse_event(event_type, tool_name, preview, args, dict(kwargs))
+                else:
+                    loop.call_soon_threadsafe(_handle_pulse_event, event_type, tool_name, preview, args, dict(kwargs))
 
         def _commentary(text: str, *, already_streamed: bool = False) -> None:
             # Mid-turn assistant commentary (Codex ``phase="commentary"``, text beside tool calls)
@@ -3849,10 +4160,13 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             if isinstance(text, str) and text.strip():
                 events.enqueue("assistant.commentary", {
                     "message_id": message_id, "text": text, "already_streamed": bool(already_streamed)})
+                mirror.enqueue_commentary(text)
 
         approval_notify = self._register_session_stream_approval(run_id, events, message_id)
 
         async def _run_and_signal() -> None:
+            turn_cancelled = False
+            turn_failed = False
             try:
                 await queue.put(_event_payload("run.started", {
                     "user_message": {"role": "user", "content": user_message},
@@ -3874,22 +4188,9 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 # Terminal status and flags come from the result (interrupted -> cancelled,
                 # unfinished -> failed); a late steer rides along as ``pending_steer`` for replay.
                 status, fields = _api_runs.terminal_run_status(result if is_dict else {})
-                if self.is_telegram_bound(session_id):
-                    _runner, telegram = self._telegram_runner_and_adapter()
-                    if telegram and final_response:
-                        db = self._ensure_session_db()
-                        if db:
-                            binding = db.get_telegram_topic_binding_by_session(session_id=session_id)
-                            if binding and binding.get("delivery_enabled", True):
-                                chat_id = str(binding["chat_id"])
-                                thread_id = binding.get("thread_id") or binding.get("message_thread_id")
-                                metadata = {"thread_id": str(thread_id)} if thread_id else {}
-                                metadata["origin"] = "webui_mirror"
-                                try:
-                                    coro = telegram.send(chat_id=chat_id, content=final_response, metadata=metadata)
-                                except TypeError:
-                                    coro = telegram.send(chat_id=chat_id, text=final_response, metadata=metadata)
-                                asyncio.create_task(coro)
+                await mirror.drain()
+                await _finalize_pulse_ticker(status or "completed")
+                await mirror.send_final(final_response)
                 await queue.put(_event_payload("assistant.completed", {
                     "session_id": effective_session_id, "message_id": message_id,
                     "content": final_response, **fields, "runtime": effective_runtime}))
@@ -3903,14 +4204,21 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                     output=final_response, usage=usage,
                     last_event=f"run.{status}", **fields)
             except asyncio.CancelledError:
+                turn_cancelled = True
                 self._set_run_status(run_id, "cancelled", last_event="run.cancelled")
                 raise
             except Exception as exc:
+                turn_failed = True
                 logger.exception("[api_server] session chat stream failed")
                 self._set_run_status(
                     run_id, "failed", error=_redact_api_error_text(exc), last_event="run.failed")
                 await queue.put(_event_payload("error", {"message": _redact_api_error_text(exc)}))
             finally:
+                try:
+                    await mirror.drain()
+                except Exception:
+                    logger.debug("Telegram mirror drain failed in finally (non-fatal)", exc_info=True)
+                await _finalize_pulse_ticker("cancelled" if turn_cancelled else "failed" if turn_failed else "completed")
                 self._active_run_agents.pop(run_id, None)
                 self._run_approval_sessions.pop(run_id, None)
                 self._release_run_owner_if_forgotten(run_id)
