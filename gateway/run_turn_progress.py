@@ -357,16 +357,39 @@ class GatewayTurnProgressMixin:
         return pl if pl > 0 else 40
 
     def _progress_terminal_blocks(self, adapter, tool_name, args, emoji):
-        cmd_enabled = getattr(self.config, 'tool_progress_command', False)
-        friendly_enabled = getattr(self.config, 'friendly_tool_labels', True)
-        if not cmd_enabled or friendly_enabled:
-            return None, None
         """(full, short) fenced blocks for a terminal command on markdown platforms, else (None, None).
 
         No language tag: Slack mrkdwn renders it as a literal first code line. Verbose shows the FULL
         command; "all"/"new" truncate to one line capped at ``tool_preview_length``. Consecutive
         terminal calls drop the repeated header so back-to-back commands render as adjacent blocks.
         """
+        ctx = getattr(self, "_ctx", None)
+        user_config = getattr(ctx, "user_config", None)
+        if isinstance(user_config, dict):
+            plat = getattr(getattr(ctx, "source", None), "platform", None)
+            plat_str = str(getattr(plat, "value", plat) or "").lower()
+            if plat == Platform.LOCAL or plat_str == "local":
+                platform_key = "cli"
+            else:
+                platform_key = plat_str
+            resolver = getattr(ctx, "resolve_display_setting", None)
+            if callable(resolver) and platform_key:
+                raw_cmd = resolver(user_config, platform_key, "tool_progress_command", False)
+                raw_friendly = resolver(user_config, platform_key, "friendly_tool_labels", True)
+            elif platform_key:
+                from gateway.display_config import resolve_display_setting
+                raw_cmd = resolve_display_setting(user_config, platform_key, "tool_progress_command", False)
+                raw_friendly = resolve_display_setting(user_config, platform_key, "friendly_tool_labels", True)
+            else:
+                raw_cmd = cfg_get(user_config, "display", "tool_progress_command", default=False)
+                raw_friendly = cfg_get(user_config, "display", "friendly_tool_labels", default=True)
+            cmd_enabled = is_truthy_value(raw_cmd, default=False)
+            friendly_enabled = is_truthy_value(raw_friendly, default=True)
+        else:
+            cmd_enabled = False
+            friendly_enabled = True
+        if not cmd_enabled or friendly_enabled:
+            return None, None
         if not (
             getattr(adapter, "supports_code_blocks", False) and tool_name == "terminal" and isinstance(args, dict)
             and isinstance(args.get("command"), str) and args["command"].strip()
