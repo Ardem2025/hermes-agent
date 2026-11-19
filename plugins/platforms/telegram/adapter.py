@@ -22,6 +22,7 @@ from hermes_cli import setup_platforms
 logger = logging.getLogger(__name__)
 
 from agent.deadline import run_bounded_async
+from agent.retry_utils import coerce_retry_after_seconds
 from agent.ssl_verify import platform_ssl_context
 from gateway.platforms._shared import (
     decode_json_list_literal as _decode_json_list_literal,
@@ -1431,9 +1432,11 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
             if self._rich_rejected(exc, "sendRichMessage", "MarkdownV2"):
                 return None
             # Honor Telegram's flood-control retry_after over the base retry schedule.
-            _retry_after = getattr(exc, "retry_after", None)
+            _retry_after = coerce_retry_after_seconds(getattr(exc, "retry_after", None))
             if _retry_after is None:
-                _m = re.search(r"retry\s+(?:in\s+)?(\d+)", str(exc).lower(), re.IGNORECASE)
+                _retry_after = coerce_retry_after_seconds(str(exc))
+            if _retry_after is None:
+                _m = re.search(r"retry\s+(?:in\s+)?(\d+(?:\.\d+)?)", str(exc), re.IGNORECASE)
                 if _m:
                     _retry_after = float(_m.group(1))
             return self._rich_transient_result(exc, "sendRichMessage", retry_after=_retry_after)
@@ -3383,9 +3386,13 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
                 await asyncio.sleep(wait)
                 _send_attempt += 1
             except Exception as send_err:
-                retry_after = getattr(send_err, "retry_after", None)
-                if retry_after is not None or "retry after" in str(send_err).lower():
-                    wait = float(retry_after) if retry_after is not None else 1.0
+                raw_retry_after = getattr(send_err, "retry_after", None)
+                wait = coerce_retry_after_seconds(raw_retry_after)
+                if wait is None:
+                    wait = coerce_retry_after_seconds(str(send_err))
+                if wait is not None or raw_retry_after is not None or "retry after" in str(send_err).lower():
+                    if wait is None:
+                        wait = 1.0
                     safe_send_error = _redact_telegram_error_text(send_err)
                     # Never sleep a long server RetryAfter verbatim — it once pinned send() for 97 minutes.
                     # Mirror the edit path: a RetryAfter past a few seconds is not something to hold this
@@ -3639,6 +3646,12 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
         continuations, and return the final chunk's id as the next edit target."""
         if not self._bot:
             return await self._edit_via_replacement(chat_id, message_id, content, finalize=finalize, metadata=metadata)
+        cooldown = self._send_flood_cooldown_remaining(chat_id)
+        if cooldown is not None and cooldown > 0:
+            logger.warning(
+                "[%s] Telegram flood control still active for chat %s (%.0fs left); refusing edit locally without an API call",
+                self.name, chat_id, cooldown)
+            return _flood_cap_result(cooldown)
         # Shared per-chat budget (#116312): an interim (preview) edit is SKIPPED when the slot is busy —
         # the text it would show is shown by the next edit anyway, so a burst of edits can't trip flood
         # control. A final edit is never gated (the completed answer is always delivered). Sends wait for
@@ -3722,15 +3735,19 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
                 self._last_overflow_preview[_preview_key] = truncated
                 return SendResult(success=True, message_id=message_id)
             # Flood control: short waits retry inline; long ones fail closed (``flood_control:<s>``) to the caller.
-            retry_after = getattr(e, "retry_after", None)
-            if retry_after is not None or "retry after" in err_str:
-                wait = retry_after if retry_after else 1.0
+            raw_retry_after = getattr(e, "retry_after", None)
+            wait = coerce_retry_after_seconds(raw_retry_after)
+            if wait is None:
+                wait = coerce_retry_after_seconds(str(e))
+            if wait is not None or raw_retry_after is not None or "retry after" in err_str:
+                if wait is None:
+                    wait = 1.0
                 if wait > _FLOOD_INLINE_WAIT_CAP_SECS:
                     # Log AFTER the cap check: "waiting 33.0s" followed by no wait misled an investigation.
                     logger.warning(
                         "[%s] Telegram flood control, refusing edit (retry_after %.1fs > %.0fs inline cap)",
                         self.name, wait, _FLOOD_INLINE_WAIT_CAP_SECS)
-                    return _flood_cap_result(wait)
+                    return self._record_send_flood_cooldown(chat_id, wait)
                 logger.warning("[%s] Telegram flood control, waiting %.1fs", self.name, wait)
                 await asyncio.sleep(wait)
                 try:
@@ -3739,14 +3756,17 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
                 except Exception as retry_err:
                     safe_retry_error = _redact_telegram_error_text(retry_err)
                     logger.error("[%s] Edit retry failed after flood wait: %s", self.name, safe_retry_error)
-                    retry_wait = getattr(retry_err, "retry_after", None)
-                    if retry_wait is not None or "retry after" in str(retry_err).lower():
+                    raw_retry_wait = getattr(retry_err, "retry_after", None)
+                    retry_wait = coerce_retry_after_seconds(raw_retry_wait)
+                    if retry_wait is None:
+                        retry_wait = coerce_retry_after_seconds(str(retry_err))
+                    if retry_wait is not None or raw_retry_wait is not None or "retry after" in str(retry_err).lower():
                         # Still flooded after the inline wait, and typically for much longer than the
                         # first refusal asked for. Fail closed canonically so the ledger arms its
                         # timer on this delay rather than storing the platform's raw wording, which
                         # it would read as an ordinary failure and never redeliver.
-                        return _flood_cap_result(
-                            float(retry_wait) if retry_wait is not None else wait)
+                        final_wait = retry_wait if retry_wait is not None else wait
+                        return self._record_send_flood_cooldown(chat_id, final_wait)
                     return SendResult(success=False, error=safe_retry_error)
             safe_error = _redact_telegram_error_text(e)
             # Transient network errors must not permanently disable progress-message editing.
@@ -5175,10 +5195,10 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
         """Suppress Telegram typing refreshes for this chat after transient failures."""
         if not hasattr(self, "_telegram_typing_cooldown_until"):
             self._telegram_typing_cooldown_until = {}
-        retry_after = getattr(exc, "retry_after", None)
-        try:
-            delay = float(retry_after) if retry_after is not None else self._telegram_typing_cooldown_seconds
-        except (TypeError, ValueError):
+        delay = coerce_retry_after_seconds(getattr(exc, "retry_after", None))
+        if delay is None:
+            delay = coerce_retry_after_seconds(str(exc))
+        if delay is None:
             delay = self._telegram_typing_cooldown_seconds
         self._telegram_typing_cooldown_until[str(chat_id)] = asyncio.get_running_loop().time() + max(1.0, min(delay, 300.0))
 

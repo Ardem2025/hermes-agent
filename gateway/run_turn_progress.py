@@ -46,15 +46,13 @@ def _note_flood(st, result) -> bool:
     """True when a failed progress edit was refused by flood control; arms ``st.flood_until`` from
     the result's ``retry_after``, else the wait stated in its error text (default 30s), so no
     progress call fires into the open window. The edit is owed: ``st.flood_pending`` is set."""
+    from agent.retry_utils import coerce_retry_after_seconds
     from gateway.delivery_ledger import flood_wait_seconds, is_flood_error
     error = getattr(result, "error", "") or ""
     if not (is_flood_error(error) or "flood" in error.lower() or "retry after" in error.lower()):
         return False
-    try:
-        wait = float(getattr(result, "retry_after", None) or 0.0)
-    except (TypeError, ValueError):
-        wait = 0.0
-    if wait <= 0:
+    wait = coerce_retry_after_seconds(getattr(result, "retry_after", None))
+    if wait is None or wait <= 0:
         # Raw platform wording (the Telegram overflow-split path forwards the exception text with
         # no retry_after): honour the stated wait, or a 185 s penalty becomes a 30 s window.
         wait = flood_wait_seconds(error, default=30.0)

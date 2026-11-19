@@ -4,11 +4,12 @@ Jittered delays (vs. fixed exponential) prevent thundering-herd retry spikes
 when many sessions hit the same rate-limited provider concurrently.
 """
 
+import math
 import random
 import re
 import threading
 import time
-from datetime import datetime, timezone, UTC
+from datetime import datetime, timedelta, timezone, UTC
 from email.utils import parsedate_to_datetime
 from typing import Any, Optional
 
@@ -62,6 +63,76 @@ def parse_retry_after_seconds(value_or_headers: Any) -> Optional[float]:
     if when.tzinfo is None:
         when = when.replace(tzinfo=UTC)
     return max(0.0, (when - datetime.now(UTC)).total_seconds())
+
+
+_HMS_DURATION_RE = re.compile(
+    r"^(?:(\d+)\s+days?,\s*)?(\d+):([0-5]?\d):([0-5]?\d(?:\.\d+)?)$",
+    re.IGNORECASE,
+)
+_RETRY_IN_HMS_RE = re.compile(
+    r"\bretry\s+(?:in|after)\s+(?:(\d+)\s+days?,\s*)?(\d+):([0-5]?\d):([0-5]?\d(?:\.\d+)?)(?![\d.])",
+    re.IGNORECASE,
+)
+_RETRY_IN_NUM_RE = re.compile(
+    r"\bretry\s+(?:in|after)\s+(-?\d+(?:\.\d+)?)(?![\d.])",
+    re.IGNORECASE,
+)
+
+
+def _hms_match_to_seconds(match: re.Match[str]) -> Optional[float]:
+    days = int(match.group(1) or 0)
+    hours = int(match.group(2))
+    minutes = int(match.group(3))
+    seconds = float(match.group(4))
+    total = days * 86400.0 + hours * 3600.0 + minutes * 60.0 + seconds
+    return total if math.isfinite(total) and total >= 0.0 else None
+
+
+def coerce_retry_after_seconds(value: Any) -> Optional[float]:
+    """Normalize a retry-after value (``timedelta``, ``int``, ``float``, numeric string,
+    ``H:MM:SS``, or ``Retry in H:MM:SS`` / ``Retry in N`` text) into non-negative finite
+    seconds as ``float``, or ``None`` when absent, boolean, negative, non-finite, or unparseable.
+    Never raises ``TypeError`` or ``ValueError``.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, timedelta):
+        secs = value.total_seconds()
+        return float(secs) if math.isfinite(secs) and secs >= 0.0 else None
+    if isinstance(value, (int, float)):
+        secs = float(value)
+        return secs if math.isfinite(secs) and secs >= 0.0 else None
+    if not isinstance(value, str):
+        return None
+
+    text = value.strip()
+    if not text:
+        return None
+
+    try:
+        secs = float(text)
+    except (TypeError, ValueError):
+        secs = None
+    if secs is not None:
+        return secs if math.isfinite(secs) and secs >= 0.0 else None
+
+    hms_match = _HMS_DURATION_RE.match(text)
+    if hms_match:
+        return _hms_match_to_seconds(hms_match)
+
+    retry_hms_match = _RETRY_IN_HMS_RE.search(text)
+    if retry_hms_match:
+        return _hms_match_to_seconds(retry_hms_match)
+
+    retry_num_match = _RETRY_IN_NUM_RE.search(text)
+    if retry_num_match:
+        try:
+            parsed = float(retry_num_match.group(1))
+        except (TypeError, ValueError):
+            return None
+        return parsed if math.isfinite(parsed) and parsed >= 0.0 else None
+
+    return None
 
 
 # Free-text "reset" grammars providers put in error bodies, tried in order. One table so the

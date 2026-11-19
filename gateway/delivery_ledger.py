@@ -79,18 +79,20 @@ FLOOD_RETRY_SLACK_SECONDS = 2.0
 # adopting it until its deadline, spending the one attempt inside the penalty that caused it.
 # Matching requires the "flood control" wording as well as the delay, so an unrelated error that
 # merely suggests retrying is never mistaken for a flood.
-_RAW_FLOOD_RE = re.compile(r"flood control exceeded.*?retry in\s+(\d+(?:\.\d+)?)", re.IGNORECASE)
+_RAW_FLOOD_RE = re.compile(
+    r"flood control exceeded.*?retry in\s+(\d+:[0-5]?\d:[0-5]?\d(?:\.\d+)?|\d+(?:\.\d+)?)",
+    re.IGNORECASE,
+)
 
 
 def _raw_flood_wait(text: str) -> Optional[float]:
     """Seconds asked for by a flood error still carrying the platform's own wording, else ``None``."""
+    from agent.retry_utils import coerce_retry_after_seconds
+
     match = _RAW_FLOOD_RE.search(text or "")
     if not match:
         return None
-    try:
-        return float(match.group(1))
-    except (TypeError, ValueError):
-        return None
+    return coerce_retry_after_seconds(match.group(1))
 
 
 def is_reconnect_only(error: Any) -> bool:
@@ -110,10 +112,10 @@ def flood_wait_seconds(error: Any, default: float = FLOOD_RETRY_DEFAULT_SECONDS)
     text = str(error or "").strip().lower()
     wait = default
     if text.startswith(FLOOD_ERROR_PREFIX):
-        try:
-            wait = float(text[len(FLOOD_ERROR_PREFIX):].strip())
-        except ValueError:
-            wait = default
+        from agent.retry_utils import coerce_retry_after_seconds
+
+        parsed = coerce_retry_after_seconds(text[len(FLOOD_ERROR_PREFIX):].strip())
+        wait = parsed if parsed is not None else default
     else:
         # A row still carrying the platform's own flood wording states its delay just as precisely,
         # and the deadline must use it rather than the generic default.

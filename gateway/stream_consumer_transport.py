@@ -585,11 +585,15 @@ class StreamTransportMixin:
         # after _MAX_FLOOD_STRIKES in a row.
         immediate_final_fallback = False
         if self._is_flood_error(result):
+            from agent.retry_utils import coerce_retry_after_seconds
+
             self._flood_strikes += 1
             backoff = min(self._current_edit_interval * 2, 10.0)
-            retry_after = getattr(result, "retry_after", None)
-            if isinstance(retry_after, (int, float)) and retry_after > 0:
-                backoff = max(backoff, min(float(retry_after), _MAX_EDIT_BACKOFF_SECS))
+            retry_after = coerce_retry_after_seconds(getattr(result, "retry_after", None))
+            if retry_after is None:
+                retry_after = coerce_retry_after_seconds(getattr(result, "error", None))
+            if retry_after is not None and retry_after > 0:
+                backoff = max(backoff, min(retry_after, _MAX_EDIT_BACKOFF_SECS))
             self._current_edit_interval = backoff
             logger.debug("Flood control on edit (strike %d/%d), backoff interval → %.1fs",
                          self._flood_strikes, self._MAX_FLOOD_STRIKES, self._current_edit_interval)

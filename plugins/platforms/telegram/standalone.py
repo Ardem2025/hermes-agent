@@ -14,6 +14,7 @@ import re
 from types import SimpleNamespace
 
 from agent.redact import redact_sensitive_text
+from agent.retry_utils import coerce_retry_after_seconds
 from plugins.platforms.telegram.telegram_markdown import _MD_CODE_RE
 from plugins.platforms.telegram.telegram_send_errors import SAME_REQUEST_ATTEMPTS, is_entity_parse_error
 from pm import install_hint
@@ -62,6 +63,9 @@ def _media_caption_split(text, media_files):
     return stripped, ""
 
 
+MAX_RETRY_WAIT_SECS = 30.0
+
+
 def _telegram_retry_delay(exc: Exception, attempt: int) -> float | None:
     """Retry delay in seconds, or None when final, from ``telegram_send_errors.send_error_kind``:
     ``retry_after`` wins; a connect or pool failure (the request never left) and Telegram's own 5xx
@@ -70,10 +74,14 @@ def _telegram_retry_delay(exc: Exception, attempt: int) -> float | None:
     from plugins.platforms.telegram import telegram_send_errors as kinds
     kind = kinds.send_error_kind(exc)
     if kind == kinds.FLOOD:
-        try:
-            return max(float(exc.retry_after), 0.0)
-        except (TypeError, ValueError):
+        wait = coerce_retry_after_seconds(getattr(exc, "retry_after", None))
+        if wait is None:
+            wait = coerce_retry_after_seconds(str(exc))
+        if wait is None:
             return 1.0
+        if wait > MAX_RETRY_WAIT_SECS:
+            return None
+        return wait
     return kinds.same_request_backoff(attempt) if kind in (kinds.UNSENT, kinds.SERVER_ERROR) else None
 
 

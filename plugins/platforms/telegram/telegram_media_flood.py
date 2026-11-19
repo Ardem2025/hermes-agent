@@ -14,17 +14,15 @@ import asyncio
 import contextlib
 import logging
 import os
-import re
 import shutil
 import tempfile
 from contextvars import ContextVar
 from typing import Any, Awaitable, Callable, Optional
 
+from agent.retry_utils import coerce_retry_after_seconds
 from gateway.platforms.base import SendResult
 
 logger = logging.getLogger("plugins.platforms.telegram.adapter")
-
-_FLOOD_TEXT_RE = re.compile(r"retry\s+(?:in|after)\s+(\d+(?:\.\d+)?)", re.IGNORECASE)
 
 # How far the current upload has already gone through flood recovery: 0 fresh, 1 inline retry
 # done, 2 running as the deferred re-upload. Context-local, so a nested media call (send_voice →
@@ -42,14 +40,10 @@ def flood_wait_seconds(error: Exception) -> Optional[float]:
     """Seconds Telegram asked this call to wait (``RetryAfter``), or ``None`` for any other error."""
     retry_after: Any = getattr(error, "retry_after", None)
     if retry_after is not None:
-        if hasattr(retry_after, "total_seconds"):  # newer PTB hands out a timedelta
-            retry_after = retry_after.total_seconds()
-        try:
-            return float(retry_after)
-        except (TypeError, ValueError):
-            return None
-    match = _FLOOD_TEXT_RE.search(str(error))
-    return float(match.group(1)) if match else None
+        coerced = coerce_retry_after_seconds(retry_after)
+        if coerced is not None:
+            return coerced
+    return coerce_retry_after_seconds(str(error))
 
 
 def _keep_private_copy(path: str) -> Optional[str]:

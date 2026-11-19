@@ -293,9 +293,12 @@ class StreamFallbackMixin:
         """Return a bounded retry delay for a fallback send, if safe to retry."""
         if not self._is_flood_error(result):
             return None
-        try:
-            delay = float(getattr(result, "retry_after", None) or 3.0)
-        except (TypeError, ValueError):
+        from agent.retry_utils import coerce_retry_after_seconds
+
+        delay = coerce_retry_after_seconds(getattr(result, "retry_after", None))
+        if delay is None:
+            delay = coerce_retry_after_seconds(getattr(result, "error", None))
+        if delay is None or delay <= 0:
             delay = 3.0
         if delay > self._max_fallback_flood_retry_seconds:
             logger.debug("Flood control requests %.1fs; leaving final delivery to the gateway",
