@@ -16,7 +16,7 @@ from typing import Any, Iterator
 from urllib.parse import urlsplit
 
 from utils import safe_json_loads
-from agent.i18n import t
+from agent.i18n import get_language, t
 from agent.redact import redact_sensitive_text, sanitize_command_for_display
 from agent.tool_result_classification import (
     shape_failure_error, file_mutation_result_landed, has_failure_marker, is_guardrail_refusal)
@@ -536,14 +536,17 @@ _TOOL_VERB_TOOLS: frozenset[str] = frozenset({
 _TOOL_VERBS_RU: dict[str, str] = {
     "web_search": "Поиск в сети", "web_extract": "Чтение страницы",
     "browser_navigate": "Браузер", "browser_click": "Браузер", "browser_type": "Браузер",
+    "browser_exec": "Браузер",
     "read_file": "Чтение файла", "write_file": "Создание файла", "patch": "Редактирование файла",
     "search_files": "Поиск файлов", "terminal": "Выполнение команды", "execute_code": "Выполнение скрипта",
+    "process_manage": "Управление процессом",
     "image_generate": "Генерация изображения", "video_generate": "Генерация видео",
     "text_to_speech": "Синтез речи", "vision_analyze": "Анализ изображения",
     "session_search": "Поиск по истории",
     "skill_view": "Работа со скиллами", "skills_list": "Список скиллов", "skill_manage": "Обновление скилла",
     "delegate_task": "Делегирование задачи", "cronjob_manage": "Планирование задачи", "clarify": "Уточнение вопроса",
     "memory": "Обновление памяти", "todo_list": "Работа с задачами",
+    "tool_search": "Поиск инструментов", "tool_describe": "Описание инструмента", "tool_call": "Вызов инструмента",
     "obsidian_search": "Поиск в базе знаний", "mem0_search": "Поиск в памяти",
     "mem0_remember": "Запоминание факта", "mem0_profile": "Чтение профиля",
 }
@@ -598,22 +601,25 @@ def get_tool_verb(tool_name: str) -> str | None:
     callers compose ``f"{verb}{tool_verb_connector(tool)}{preview}"`` themselves."""
     if not _friendly_tool_labels:
         return None
-    ru = _TOOL_VERBS_RU.get(tool_name)
-    if ru:
-        return ru
+    if get_language() == "ru":
+        ru = _TOOL_VERBS_RU.get(tool_name)
+        if ru:
+            return ru
     return _tool_verb(tool_name)
 
 
 def tool_verb_connector(tool_name: str) -> str:
     """Return the connector between a verb and its preview (" for " or " ")."""
-    if tool_name in _TOOL_VERBS_RU:
+    if get_language() == "ru" and tool_name in _TOOL_VERBS_RU:
         return ": "
     return t("display.verb_connector.search" if tool_name in _TOOL_VERBS_FOR_CONNECTOR else "display.verb_connector.default")
 
 
 def verb_drops_preview(tool_name: str) -> bool:
     """Whether the verb should render alone, without the argument preview."""
-    return tool_name in _TOOL_VERBS_NO_PREVIEW or tool_name in _TOOL_VERBS_RU_NO_PREVIEW
+    if get_language() == "ru" and tool_name in _TOOL_VERBS_RU_NO_PREVIEW:
+        return True
+    return tool_name in _TOOL_VERBS_NO_PREVIEW
 
 
 def build_status_phrase(tool_name: str, args: dict | None, max_len: int = 49) -> str | None:
@@ -643,7 +649,7 @@ def build_tool_label(tool_name: str, args: dict, max_len: int | None = None) -> 
         extra = f" +{len(labels) - 1}" if len(labels) > 1 else ""
         return f"{label.text}{f' {preview}' if preview else ''}{extra}"
     verb = get_tool_verb(tool_name)
-    if verb and tool_name in _TOOL_VERBS_NO_PREVIEW:
+    if verb and verb_drops_preview(tool_name):
         return verb
     preview = build_tool_preview(tool_name, args, max_len=max_len)
     if not verb:

@@ -389,6 +389,20 @@ class GatewayTurnProgressMixin:
         pl = get_tool_preview_max_len()
         return pl if pl > 0 else 40
 
+    def _tool_progress_command_enabled(self) -> bool:
+        cfg_obj = getattr(self, "config", None)
+        if cfg_obj is not None and hasattr(cfg_obj, "tool_progress_command"):
+            return is_truthy_value(getattr(cfg_obj, "tool_progress_command", False), default=False)
+        from gateway.display_config import resolve_display_setting
+        ctx = self._ctx
+        raw_platform = getattr(getattr(ctx, "source", None), "platform", None)
+        platform_key = getattr(raw_platform, "value", raw_platform) or ""
+        user_cfg = getattr(ctx, "user_config", None) or {}
+        return is_truthy_value(
+            resolve_display_setting(user_cfg, platform_key, "tool_progress_command", False),
+            default=False,
+        )
+
     def _progress_terminal_blocks(self, adapter, tool_name, args, emoji):
         """(full, short) fenced blocks for a terminal command on markdown platforms, else (None, None).
 
@@ -396,32 +410,7 @@ class GatewayTurnProgressMixin:
         command; "all"/"new" truncate to one line capped at ``tool_preview_length``. Consecutive
         terminal calls drop the repeated header so back-to-back commands render as adjacent blocks.
         """
-        ctx = getattr(self, "_ctx", None)
-        user_config = getattr(ctx, "user_config", None)
-        if isinstance(user_config, dict):
-            plat = getattr(getattr(ctx, "source", None), "platform", None)
-            plat_str = str(getattr(plat, "value", plat) or "").lower()
-            if plat == Platform.LOCAL or plat_str == "local":
-                platform_key = "cli"
-            else:
-                platform_key = plat_str
-            resolver = getattr(ctx, "resolve_display_setting", None)
-            if callable(resolver) and platform_key:
-                raw_cmd = resolver(user_config, platform_key, "tool_progress_command", False)
-                raw_friendly = resolver(user_config, platform_key, "friendly_tool_labels", True)
-            elif platform_key:
-                from gateway.display_config import resolve_display_setting
-                raw_cmd = resolve_display_setting(user_config, platform_key, "tool_progress_command", False)
-                raw_friendly = resolve_display_setting(user_config, platform_key, "friendly_tool_labels", True)
-            else:
-                raw_cmd = cfg_get(user_config, "display", "tool_progress_command", default=False)
-                raw_friendly = cfg_get(user_config, "display", "friendly_tool_labels", default=True)
-            cmd_enabled = is_truthy_value(raw_cmd, default=False)
-            friendly_enabled = is_truthy_value(raw_friendly, default=True)
-        else:
-            cmd_enabled = False
-            friendly_enabled = True
-        if not cmd_enabled or friendly_enabled:
+        if not self._tool_progress_command_enabled():
             return None, None
         if not (
             getattr(adapter, "supports_code_blocks", False) and tool_name == "terminal" and isinstance(args, dict)
@@ -477,7 +466,8 @@ class GatewayTurnProgressMixin:
         verb = get_tool_verb(tool_name)
         if not verb:
             return t("gateway.progress.tool_preview", emoji=emoji, tool=tool_name, preview=preview)
-        return f"{emoji} {verb}" if verb_drops_preview(tool_name) else f"{emoji} {verb}{tool_verb_connector(tool_name)}{preview}"
+        drop_preview = verb_drops_preview(tool_name) and not (tool_name == "terminal" and self._tool_progress_command_enabled())
+        return f"{emoji} {verb}" if drop_preview else f"{emoji} {verb}{tool_verb_connector(tool_name)}{preview}"
 
     def _progress_emit(self, msg: str) -> None:
         """Dedup consecutive identical lines (execute_code boilerplate), then route to the native
@@ -730,6 +720,7 @@ class GatewayTurnProgressMixin:
         flood_pending: bool = False
         # (message_id, text) of bubbles a content reset closed while their update was flood-held.
         owed_bubbles: list = dataclasses.field(default_factory=list)
+        replace_mode: bool = False
 
     def _progress_edit_state(self, adapter) -> TurnRunner._ProgressEditState:
         ctx = self._ctx
@@ -753,6 +744,7 @@ class GatewayTurnProgressMixin:
             _PROGRESS_TEXT_LIMIT=max(1, raw_limit - (64 if raw_limit > 128 else 0)),
             # Overflow edits pass metadata (Telegram topic/thread routing) only when edit_message takes it.
             _edit_accepts_metadata=bool(ctx._progress_metadata) and _accepts_keyword(adapter.edit_message, "metadata"),
+            replace_mode=ctx.progress_grouping == "replace",
         )
 
     async def _edit_progress_message(self, st, message_id: str, content: str):
@@ -844,7 +836,10 @@ class GatewayTurnProgressMixin:
                 return base_msg
             st.progress_lines[-1] = _append_progress_repeat_count(base_msg, count + 1)
             return st.progress_lines[-1]
-        st.progress_lines.append(raw)
+        if getattr(st, "replace_mode", False):
+            st.progress_lines[:] = [raw]
+        else:
+            st.progress_lines.append(raw)
         return raw
 
     async def _flush_progress_edit(self, st) -> None:

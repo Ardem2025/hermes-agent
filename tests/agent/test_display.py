@@ -326,3 +326,51 @@ class TestBuildStatusPhrase:
             assert build_status_phrase("terminal", {"command": "ls"}) is None
         finally:
             set_friendly_tool_labels(True)
+
+
+class TestToolVerbLocalization:
+    """BDD 2.3: RU tool verbs and get_language() gating."""
+
+    def test_ru_verbs_include_browser_exec_process_manage_tool_search(self, monkeypatch):
+        from agent.display import (
+            get_tool_verb,
+            set_friendly_tool_labels,
+            tool_verb_connector,
+            verb_drops_preview,
+        )
+
+        set_friendly_tool_labels(True)
+        monkeypatch.setattr("agent.display.get_language", lambda: "ru")
+
+        assert get_tool_verb("browser_exec") == "Браузер"
+        assert get_tool_verb("process_manage") == "Управление процессом"
+        assert get_tool_verb("tool_search") == "Поиск инструментов"
+        assert get_tool_verb("tool_describe") == "Описание инструмента"
+        assert get_tool_verb("tool_call") == "Вызов инструмента"
+
+        for tool in ("browser_exec", "process_manage", "tool_search"):
+            assert tool_verb_connector(tool) == ": "
+            assert verb_drops_preview(tool) is False
+
+        assert get_tool_verb("terminal") == "Выполнение команды"
+        assert verb_drops_preview("terminal") is True
+
+    def test_non_ru_language_skips_ru_verbs_and_no_preview(self, monkeypatch):
+        from agent.display import (
+            get_tool_verb,
+            set_friendly_tool_labels,
+            tool_verb_connector,
+            verb_drops_preview,
+        )
+
+        set_friendly_tool_labels(True)
+        monkeypatch.setattr("agent.display.get_language", lambda: "en")
+        monkeypatch.setenv("HERMES_LANGUAGE", "en")
+
+        assert get_tool_verb("terminal") == "Running"
+        assert get_tool_verb("web_search") == "Searching the web"
+        assert tool_verb_connector("web_search") == " for "
+        assert tool_verb_connector("terminal") == " "
+        assert verb_drops_preview("terminal") is False
+        assert verb_drops_preview("execute_code") is False
+        assert get_tool_verb("browser_exec") is None

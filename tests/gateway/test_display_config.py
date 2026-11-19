@@ -271,3 +271,40 @@ class TestCleanupProgress:
                 }
             }
             assert resolve_display_setting(config, "telegram", "cleanup_progress") is True, val
+
+
+class TestSummaryAndReplaceModes:
+    """BDD 2.1: summary and replace are accepted without silent fallback."""
+
+    def test_summary_and_replace_accepted_globally_and_per_platform(self):
+        from gateway.display_config import resolve_display_setting, resolve_tool_progress
+
+        cfg = {
+            "display": {
+                "tool_progress": "summary",
+                "tool_progress_grouping": "replace",
+                "platforms": {
+                    "telegram": {
+                        "tool_progress": "summary",
+                        "tool_progress_grouping": "replace",
+                    }
+                },
+            }
+        }
+        assert resolve_display_setting(cfg, "telegram", "tool_progress") == "summary"
+        assert resolve_tool_progress(cfg, "telegram") == ("summary", True)
+        assert resolve_display_setting(cfg, "telegram", "tool_progress_grouping") == "replace"
+        assert resolve_display_setting({"display": {"tool_progress": "summary"}}, "discord", "tool_progress") == "summary"
+        assert resolve_display_setting({"display": {"tool_progress_grouping": "replace"}}, "discord", "tool_progress_grouping") == "replace"
+
+    def test_existing_modes_and_groupings_remain_compatible(self):
+        from gateway.display_config import resolve_display_setting, resolve_tool_progress
+
+        for mode in ("off", "new", "all", "verbose", "log", "summary"):
+            cfg = {"display": {"platforms": {"telegram": {"tool_progress": mode}}}}
+            assert resolve_display_setting(cfg, "telegram", "tool_progress") == mode
+            assert resolve_tool_progress(cfg, "telegram") == (mode, True)
+
+        for grouping in ("accumulate", "separate", "replace"):
+            cfg = {"display": {"platforms": {"telegram": {"tool_progress_grouping": grouping}}}}
+            assert resolve_display_setting(cfg, "telegram", "tool_progress_grouping") == grouping
