@@ -296,6 +296,7 @@ class GatewayTurnProgressMixin:
                     thread_id=thread_id,
                     turn_context=ctx,
                     metadata=metadata,
+                    cleanup_progress=bool(getattr(ctx, "_cleanup_progress", False)),
                 )
                 ctx._pulse_ticker = ticker
                 self._schedule(ticker.start(), "subagent pulse ticker start")

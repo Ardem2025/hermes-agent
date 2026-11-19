@@ -3610,10 +3610,12 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
                     classified, list(undelivered)[len(delivered) - prior:], delivered, tail_certain=classified.retryable)
 
     async def send_or_update_status(
-        self, chat_id: str, status_key: str, content: str, *, metadata: Optional[dict[str, Any]] = None) -> SendResult:
+        self, chat_id: str, status_key: str, content: str,
+        *, metadata: Optional[dict[str, Any]] = None, finalize: bool = True,
+    ) -> SendResult:
         """Send or edit the status bubble owned by ``(chat_id, status_key)``."""
         from .telegram_status import send_or_update_status
-        return await send_or_update_status(self, chat_id, status_key, content, metadata=metadata)
+        return await send_or_update_status(self, chat_id, status_key, content, metadata=metadata, finalize=finalize)
 
     async def _edit_text(self, chat_id: str, message_id: str, text: str, parse_mode: Any = None) -> None:
         """``editMessageText`` (normalized ids, ``disable_link_previews`` honoured); ``parse_mode=None`` = plain."""

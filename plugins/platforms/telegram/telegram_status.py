@@ -11,7 +11,7 @@ if TYPE_CHECKING:
 
 async def send_or_update_status(
     adapter: "TelegramAdapter", chat_id: str, status_key: str, content: str,
-    *, metadata: dict[str, Any] | None = None,
+    *, metadata: dict[str, Any] | None = None, finalize: bool = True,
 ) -> SendResult:
     """Coalesce one key without lending its cached message to overlapping sends."""
     key = (str(chat_id), str(status_key))
@@ -24,7 +24,7 @@ async def send_or_update_status(
     async with lock:
         cached_id = adapter._status_message_ids.get(key)
         if cached_id is not None:
-            result = await adapter.edit_message(chat_id, cached_id, content, finalize=True, metadata=metadata)
+            result = await adapter.edit_message(chat_id, cached_id, content, finalize=finalize, metadata=metadata)
             if result.success:
                 # Only write back if nobody evicted/replaced this key during the await.
                 if result.message_id and adapter._status_message_ids.get(key) == cached_id:

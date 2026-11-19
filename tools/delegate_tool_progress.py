@@ -305,6 +305,11 @@ class _ChildProgressRelay:
         self.batch: list[str] = []
         self.parent_scope: Any = None  # owning parent agent; set by _build_child_progress_callback
         self.tool_count = 0  # per-subagent running counter
+        try:
+            from hermes_constants import get_hermes_home_override
+            self._hermes_home_override = get_hermes_home_override()
+        except Exception:
+            self._hermes_home_override = None
 
     def _prefix(self) -> str:
         # The batch tag is resolved lazily from session_ref: the relay is built
@@ -343,7 +348,34 @@ class _ChildProgressRelay:
     def _flush(self) -> None:
         """Flush remaining batched tool names to the gateway."""
         if self.parent_cb and self.batch:
-            self._relay("subagent.progress", preview=f"🔀 {self._prefix()}{', '.join(self.batch)}")
+            token = None
+            reset_fn = None
+            if getattr(self, "_hermes_home_override", None) is not None:
+                try:
+                    from hermes_constants import (
+                        get_hermes_home_override,
+                        reset_hermes_home_override,
+                        set_hermes_home_override,
+                    )
+                    if get_hermes_home_override() is None:
+                        token = set_hermes_home_override(self._hermes_home_override)
+                        reset_fn = reset_hermes_home_override
+                except Exception:
+                    token = None
+            try:
+                from agent.display import get_tool_verb
+                counts: dict[str, int] = {}
+                for raw_name in self.batch:
+                    label = get_tool_verb(raw_name) or raw_name
+                    counts[label] = counts.get(label, 0) + 1
+                parts = [
+                    f"{label} ×{cnt}" if cnt > 1 else label
+                    for label, cnt in counts.items()
+                ]
+            finally:
+                if token is not None and reset_fn is not None:
+                    reset_fn(token)
+            self._relay("subagent.progress", preview=f"🔀 {self._prefix()}{', '.join(parts)}")
             self.batch.clear()
 
     # ── Lifecycle events emitted by the orchestrator itself ──

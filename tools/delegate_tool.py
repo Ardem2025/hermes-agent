@@ -411,7 +411,11 @@ def _run_single_child(
     _child_close_deferred = False
     try:
         heartbeat.start()
-        _safe_progress(child_progress_cb, "subagent.start", preview=goal)
+        _live_transcript = getattr(child, "_live_transcript_path", None)
+        _start_kwargs: dict[str, Any] = {}
+        if isinstance(_live_transcript, str) and _live_transcript:
+            _start_kwargs["live_transcript"] = _live_transcript
+        _safe_progress(child_progress_cb, "subagent.start", preview=goal, **_start_kwargs)
         run.seed_workspace()
         result, failure_entry, _child_close_deferred = run.await_child()
         if failure_entry is not None:

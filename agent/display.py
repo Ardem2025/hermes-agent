@@ -16,7 +16,24 @@ from typing import Any, Iterator
 from urllib.parse import urlsplit
 
 from utils import safe_json_loads
-from agent.i18n import get_language, t
+import agent.i18n as _i18n
+
+_ORIG_GET_LANGUAGE = _i18n.get_language
+_ORIG_T = _i18n.t
+get_language = _ORIG_GET_LANGUAGE
+t = _ORIG_T
+
+
+def _get_language() -> str:
+    if get_language is not _ORIG_GET_LANGUAGE:
+        return get_language()
+    return _i18n.get_language()
+
+
+def _t(*args: Any, **kwargs: Any) -> str:
+    if t is not _ORIG_T:
+        return t(*args, **kwargs)
+    return _i18n.t(*args, **kwargs)
 from agent.redact import redact_sensitive_text, sanitize_command_for_display
 from agent.tool_result_classification import (
     shape_failure_error, file_mutation_result_landed, has_failure_marker, is_guardrail_refusal)
@@ -314,7 +331,7 @@ def summarize_shell_command(command: str) -> str:
     count = len(core) - 1
     if not count:
         return core[0]
-    return t("display.preview.shell_plus_one" if count == 1 else "display.preview.shell_plus_many", first=core[0], count=count)
+    return _t("display.preview.shell_plus_one" if count == 1 else "display.preview.shell_plus_many", first=core[0], count=count)
 
 
 def _read_file_line_label(args: dict) -> str:
@@ -383,8 +400,8 @@ def _preview_delegate_task(args: dict, max_len: int) -> str | None:
         return _tail_trunc(action_preview, max_len)
     if tasks and isinstance(tasks, list):
         goals = _delegate_task_goals(tasks, per_goal_len=40)
-        preview = (t("display.preview.delegate_tasks", count=len(goals), goals=" | ".join(goals)) if goals
-                   else t("display.preview.delegate_parallel_tasks", count=len(tasks)))
+        preview = (_t("display.preview.delegate_tasks", count=len(goals), goals=" | ".join(goals)) if goals
+                   else _t("display.preview.delegate_parallel_tasks", count=len(tasks)))
         return _tail_trunc(preview, max_len)
     goal = args.get("goal", "")
     return None if goal is None else _tail_trunc(_oneline(str(goal)), max_len) or None
@@ -399,8 +416,8 @@ def _preview_process_manage(args: dict, _max_len: int) -> str | None:
 
 def _preview_todo_list(args: dict, _max_len: int) -> str:
     todos_arg = args.get("todos")
-    verb = t("display.preview.todo_verb_updating" if args.get("merge", False) else "display.preview.todo_verb_planning")
-    return t("display.preview.todo_reading") if todos_arg is None else t("display.preview.todo_tasks", verb=verb, count=len(todos_arg))
+    verb = _t("display.preview.todo_verb_updating" if args.get("merge", False) else "display.preview.todo_verb_planning")
+    return _t("display.preview.todo_reading") if todos_arg is None else _t("display.preview.todo_tasks", verb=verb, count=len(todos_arg))
 
 
 def _preview_shell(key: str):
@@ -425,7 +442,7 @@ def _memory_first_op(args: dict) -> tuple[dict, str]:
     if not isinstance(ops, list) or not ops:
         return args, ""
     first = ops[0] if isinstance(ops[0], dict) else {}
-    return first, (f" ({t('cli.shared.n_more', count=len(ops) - 1)})" if len(ops) > 1 else "")
+    return first, (f" ({_t('cli.shared.n_more', count=len(ops) - 1)})" if len(ops) > 1 else "")
 
 
 def _preview_memory(args: dict, _max_len: int) -> str:
@@ -434,13 +451,13 @@ def _preview_memory(args: dict, _max_len: int) -> str:
     if action == "add":
         return f"+{target}: \"{_clip(_oneline(op.get('content') or op.get('new_text') or ''), 25)}\"{more}"
     if action in ("replace", "patch", "remove"):
-        old = _oneline(op.get("old_text") or "") or t("display.preview.missing_old_text")
+        old = _oneline(op.get("old_text") or "") or _t("display.preview.missing_old_text")
         return f"{'-' if action == 'remove' else '~'}{target}: \"{old[:20]}\"{more}"
     return action
 
 
 def _preview_send_message(args: dict, _max_len: int) -> str:
-    return t("display.preview.send_message_to", target=args.get("target", "?"),
+    return _t("display.preview.send_message_to", target=args.get("target", "?"),
              message=_tail_trunc(_oneline(args.get("message", "")), 20))
 
 
@@ -477,7 +494,7 @@ _PREVIEW_BUILDERS = {
     "terminal": _preview_shell("command"), "execute_code": _preview_shell("code"),
     "read_file": _preview_read_file, "memory": _preview_memory, "send_message": _preview_send_message,
     "skill_view": _preview_skill_view, "clarify": _preview_clarify,
-    "session_search": lambda args, _m: t("display.preview.session_search_recall", query=_clip(_oneline(args.get("query", "")), 25)),
+    "session_search": lambda args, _m: _t("display.preview.session_search_recall", query=_clip(_oneline(args.get("query", "")), 25)),
     "tool_call": _preview_bridge_call("tool_call"),
     "tool_search": _preview_bridge_call("tool_search"),
     "tool_describe": _preview_bridge_call("tool_describe"),
@@ -557,7 +574,7 @@ _TOOL_VERBS_RU_NO_PREVIEW: frozenset[str] = frozenset({
 
 
 def _tool_verb(tool_name: str) -> str | None:
-    return t(f"display.verb.{tool_name}") if tool_name in _TOOL_VERB_TOOLS else None
+    return _t(f"display.verb.{tool_name}") if tool_name in _TOOL_VERB_TOOLS else None
 
 
 # Verbs that read better without the argument preview appended.
@@ -571,7 +588,7 @@ _BRIDGE_GENERATING_TOOLS: frozenset[str] = frozenset({"tool_call", "tool_search"
 def bridge_generating_phrase(tool_name: str) -> str | None:
     if not _friendly_tool_labels or tool_name not in _BRIDGE_GENERATING_TOOLS:
         return None
-    return t(f"display.bridge_generating.{tool_name}")
+    return _t(f"display.bridge_generating.{tool_name}")
 
 
 def tool_labels_for_call(tool_name: str, args: dict | None) -> list:
@@ -601,7 +618,7 @@ def get_tool_verb(tool_name: str) -> str | None:
     callers compose ``f"{verb}{tool_verb_connector(tool)}{preview}"`` themselves."""
     if not _friendly_tool_labels:
         return None
-    if get_language() == "ru":
+    if _get_language() == "ru":
         ru = _TOOL_VERBS_RU.get(tool_name)
         if ru:
             return ru
@@ -610,14 +627,14 @@ def get_tool_verb(tool_name: str) -> str | None:
 
 def tool_verb_connector(tool_name: str) -> str:
     """Return the connector between a verb and its preview (" for " or " ")."""
-    if get_language() == "ru" and tool_name in _TOOL_VERBS_RU:
+    if _get_language() == "ru" and tool_name in _TOOL_VERBS_RU:
         return ": "
-    return t("display.verb_connector.search" if tool_name in _TOOL_VERBS_FOR_CONNECTOR else "display.verb_connector.default")
+    return _t("display.verb_connector.search" if tool_name in _TOOL_VERBS_FOR_CONNECTOR else "display.verb_connector.default")
 
 
 def verb_drops_preview(tool_name: str) -> bool:
     """Whether the verb should render alone, without the argument preview."""
-    if get_language() == "ru" and tool_name in _TOOL_VERBS_RU_NO_PREVIEW:
+    if _get_language() == "ru" and tool_name in _TOOL_VERBS_RU_NO_PREVIEW:
         return True
     return tool_name in _TOOL_VERBS_NO_PREVIEW
 
@@ -632,8 +649,8 @@ def build_status_phrase(tool_name: str, args: dict | None, max_len: int = 49) ->
     if not tool_name or tool_name == "_thinking" or not _friendly_tool_labels:
         return None
     verb = _tool_verb(tool_name)
-    phrase = (t("display.status_phrase.verb", verb=f"{verb[0].lower()}{verb[1:]}") if verb
-              else t("display.status_phrase.using_tool", tool=tool_name))
+    phrase = (_t("display.status_phrase.verb", verb=f"{verb[0].lower()}{verb[1:]}") if verb
+              else _t("display.status_phrase.using_tool", tool=tool_name))
     with_preview = args and verb and tool_name not in _TOOL_VERBS_NO_PREVIEW
     preview = build_tool_preview(tool_name, args, max_len=None) if with_preview else None
     if preview:  # previews can contain newlines (terminal commands); keep the first line
@@ -777,7 +794,7 @@ def _emit_inline_diff(diff_text: str, print_fn) -> bool:
     if print_fn is None or not diff_text:
         return False
     try:
-        for line in [t("display.diff.review_header"), *diff_text.rstrip("\n").splitlines()]:
+        for line in [_t("display.diff.review_header"), *diff_text.rstrip("\n").splitlines()]:
             print_fn(line)
         return True
     except Exception:
@@ -843,9 +860,9 @@ def _summarize_rendered_diff_sections(
             omitted_lines += len(_render_inline_unified_diff(leftover))
         break
     if omitted_files or omitted_lines:
-        summary = t("display.diff.omitted_lines", count=omitted_lines)
+        summary = _t("display.diff.omitted_lines", count=omitted_lines)
         if omitted_files:
-            summary += t("display.diff.omitted_files", count=omitted_files)
+            summary += _t("display.diff.omitted_files", count=omitted_files)
         rendered.append(f"{_diff_ansi()['hunk']}{summary}{_ANSI_RESET}")
     return rendered
 
@@ -904,7 +921,7 @@ class KawaiiSpinner:
     get_thinking_faces = classmethod(lambda cls: cls._skin_spinner_list("thinking_faces", cls.KAWAII_THINKING))
     @classmethod
     def _catalog_thinking_verbs(cls) -> list[str]:
-        verbs = [v.strip() for v in t("display.thinking_verbs").split(",") if v.strip()]
+        verbs = [v.strip() for v in _t("display.thinking_verbs").split(",") if v.strip()]
         return verbs if verbs and verbs != ["display.thinking_verbs"] else cls.THINKING_VERBS
 
     get_thinking_verbs = classmethod(lambda cls: cls._skin_spinner_list("thinking_verbs", cls._catalog_thinking_verbs()))
@@ -954,7 +971,7 @@ class KawaiiSpinner:
         tty = self._is_tty
         # Non-TTY (Docker, systemd, pipe): log once instead of spamming frames.
         if not tty:
-            self._write(t("display.spinner.tool_line", message=self.message), flush=True)
+            self._write(_t("display.spinner.tool_line", message=self.message), flush=True)
         # Under patch_stdout the \r animation would overdraw the TUI status bar.
         if not tty or self._is_patch_stdout_proxy():
             while self.running:
@@ -1002,7 +1019,7 @@ class KawaiiSpinner:
             self._write(f"\r{self._clear_line_blanks()}\r", end='', flush=True)
         if final_message:
             elapsed = f" ({time.time() - self.start_time:.1f}s)" if self.start_time else ""
-            self._write(f"  {final_message}" if is_tty else t("display.spinner.done_line", message=final_message, elapsed=elapsed), flush=True)
+            self._write(f"  {final_message}" if is_tty else _t("display.spinner.done_line", message=final_message, elapsed=elapsed), flush=True)
 
     def __enter__(self):
         self.start()
@@ -1026,13 +1043,13 @@ def _trim_error(msg: str) -> str:
     if "File not found:" in msg:
         tail = msg.partition("File not found:")[2].strip()
         if "/" in tail:
-            msg = t("display.failure.file_not_found", name=tail.rsplit("/", 1)[-1])
+            msg = _t("display.failure.file_not_found", name=tail.rsplit("/", 1)[-1])
     return _tail_trunc(msg, _ERROR_SUFFIX_MAX_LEN)
 
 
 def _degraded_suffix(data: dict) -> str:
     """`` [<reason> — <retry_hint>]`` for a ``status: degraded`` terminal result (hint omitted when empty)."""
-    reason = str(data.get("reason") or data.get("error") or t("display.failure.terminal_backend_unavailable")).strip()
+    reason = str(data.get("reason") or data.get("error") or _t("display.failure.terminal_backend_unavailable")).strip()
     hint = str(data.get("retry_hint") or "").strip()
     text = f"{reason} — {hint}" if hint else reason
     return f" [{_tail_trunc(text, _DEGRADED_SUFFIX_MAX_LEN)}]"
@@ -1083,13 +1100,13 @@ def _detect_tool_failure(tool_name: str, result: Any) -> tuple[bool, str]:
         if data.get("status") == "degraded":
             return True, _degraded_suffix(data)
         err_msg = data.get("error")
-        return True, f" [{_trim_error(str(err_msg))}]" if err_msg else t("display.failure.exit_code", code=exit_code)
+        return True, f" [{_trim_error(str(err_msg))}]" if err_msg else _t("display.failure.exit_code", code=exit_code)
 
     if isinstance(data, dict):
         failed = data.get("success") is False
         # Memory: distinguish "store full" from real errors.
         if tool_name == "memory" and failed and "exceed the limit" in data.get("error", ""):
-            return True, t("display.failure.memory_full")
+            return True, _t("display.failure.memory_full")
         err = data.get("error") or data.get("message")
         if err and (failed or "error" in data):
             return True, f" [{_trim_error(str(err))}]"
@@ -1101,7 +1118,7 @@ def _detect_tool_failure(tool_name: str, result: Any) -> tuple[bool, str]:
         return False, ""
     # Multimodal results (dicts) are successes; failures arrive as JSON-encoded strings.
     if isinstance(result, str) and has_failure_marker(result):
-        return True, t("display.failure.generic")
+        return True, _t("display.failure.generic")
     return False, ""
 
 
@@ -1142,7 +1159,7 @@ class _CuteRow(str):
 
 def _cute_row(emoji: str, verb: str, detail: str = "") -> str:
     """``┊ {emoji} {verb:9} {detail}`` -- verb column from ``display.cute.verb.<verb>`` (9 cells wide)."""
-    label = t(f'display.cute.verb.{verb}')
+    label = _t(f'display.cute.verb.{verb}')
     return _CuteRow(f"┊ {emoji} {label:9} {detail}", emoji, label, detail)
 
 
@@ -1183,7 +1200,7 @@ def _cute_web_extract(a: dict, _r) -> str:
     urls = a.get("urls", [])
     url = _display_url(urls[0] if isinstance(urls, list) else urls) if urls else ""
     if not url:
-        return _cute_row("📄", "fetch", t("display.cute.fetch_pages"))
+        return _cute_row("📄", "fetch", _t("display.cute.fetch_pages"))
     extra = f" +{len(urls)-1}" if isinstance(urls, list) and len(urls) > 1 else ""
     return _cute_row("📄", "fetch", f"{_cute_trunc(_domain(url))}{extra}")
 
@@ -1196,14 +1213,14 @@ def _cute_todo_list(a: dict, result) -> str:
         total, done = summary.get("total", 0), summary.get("completed", 0)
     except Exception:
         pass
-    progress = t("display.cute.todo_progress", done=done, total=total)
+    progress = _t("display.cute.todo_progress", done=done, total=total)
     if todos_arg is None:
-        detail = progress if total > 0 else t("display.cute.todo_reading")
+        detail = progress if total > 0 else _t("display.cute.todo_reading")
     elif a.get("merge", False):
-        detail = (t("display.cute.todo_update_progress", done=done, total=total) if total > 0 and done > 0
-                  else t("display.cute.todo_update_count", count=len(todos_arg)))
+        detail = (_t("display.cute.todo_update_progress", done=done, total=total) if total > 0 and done > 0
+                  else _t("display.cute.todo_update_count", count=len(todos_arg)))
     else:
-        detail = progress if total > 0 and done > 0 else t("display.cute.todo_count", count=len(todos_arg))
+        detail = progress if total > 0 and done > 0 else _t("display.cute.todo_count", count=len(todos_arg))
     return _cute_row("📋", "plan", detail)
 
 
@@ -1214,7 +1231,7 @@ def _cute_memory(a: dict, _r) -> str:
         content = op.get("content") or op.get("new_text") or ""
         return _cute_row("🧠", "memory", f"+{target}: \"{_cute_trunc(content)}\"{more}")
     if action in ("replace", "patch", "remove"):
-        old = op.get("old_text") or t("display.preview.missing_old_text")
+        old = op.get("old_text") or _t("display.preview.missing_old_text")
         return _cute_row("🧠", "memory", f"{'-' if action == 'remove' else '~'}{target}: \"{_cute_trunc(old)}\"{more}")
     return _cute_row("🧠", "memory", str(action))
 
@@ -1229,10 +1246,10 @@ def _cute_cronjob(a: dict, _r) -> str:
     action = a.get("action", "?")
     if action == "create":
         skills = a.get("skills") or ([a.get("skill")] if a.get("skill") else [])
-        label = a.get("name") or (skills[0] if skills else None) or a.get("prompt", t("display.cute.cron_task_fallback"))
-        return _cute_row("⏰", "cron", t("display.cute.cron_create", label=_cute_trunc(label)))
+        label = a.get("name") or (skills[0] if skills else None) or a.get("prompt", _t("display.cute.cron_task_fallback"))
+        return _cute_row("⏰", "cron", _t("display.cute.cron_create", label=_cute_trunc(label)))
     if action == "list":
-        return _cute_row("⏰", "cron", t("display.cute.cron_listing"))
+        return _cute_row("⏰", "cron", _t("display.cute.cron_listing"))
     return _cute_row("⏰", "cron", f"{action} {a.get('job_id', '')}")
 
 
@@ -1254,14 +1271,14 @@ def _cute_delegate(a: dict, _r) -> str:
         return _cute_row("🔀", "delegate", _cute_trunc(action_preview))
     if tasks and isinstance(tasks, list):
         goals = _delegate_task_goals(tasks, per_goal_len=30)
-        joined = _cute_trunc(" | ".join(goals) if goals else t("display.cute.delegate_parallel"))
+        joined = _cute_trunc(" | ".join(goals) if goals else _t("display.cute.delegate_parallel"))
         return _cute_row("🔀", "delegate", f"{len(goals) or len(tasks)}x: {joined}")
     return _cute_row("🔀", "delegate", _cute_trunc(a.get("goal", "")))
 
 
 def _cute_process_manage(a: dict, _r) -> str:
     action, sid = a.get("action", "?"), a.get("session_id", "")[:12]
-    return _cute_row("⚙️ ", "proc", t("display.cute.process_list") if action == "list" else f"{action} {sid}")
+    return _cute_row("⚙️ ", "proc", _t("display.cute.process_list") if action == "list" else f"{action} {sid}")
 
 
 _SCROLL_ARROWS = {"down": "↓", "up": "↑", "right": "→", "left": "←"}
@@ -1269,7 +1286,7 @@ _SCROLL_ARROWS = {"down": "↓", "up": "↑", "right": "→", "left": "←"}
 
 def _cute_scroll(a: dict, _r) -> str:
     direction = a.get("direction", "down")
-    label = t(f"display.cute.scroll.{direction}") if direction in _SCROLL_ARROWS else str(direction)
+    label = _t(f"display.cute.scroll.{direction}") if direction in _SCROLL_ARROWS else str(direction)
     return _cute_row(f"{_SCROLL_ARROWS.get(direction, '↓')} ", "scroll", label)
 
 
@@ -1284,18 +1301,18 @@ _CUTE_LINES = {
     "patch": lambda a, r: _cute_row("🔧", "patch", _cute_path(a.get("path", ""))),
     "search_files": lambda a, r: _cute_row("🔎", "find" if a.get("target", "content") == "files" else "grep", _cute_trunc(a.get("pattern", ""))),
     "browser_navigate": lambda a, r: _cute_row("🌐", "navigate", _cute_trunc(_domain(a.get("url", "")))),
-    "browser_snapshot": lambda a, r: _cute_row("📸", "snapshot", t("display.cute.snapshot_full" if a.get("full") else "display.cute.snapshot_compact")),
+    "browser_snapshot": lambda a, r: _cute_row("📸", "snapshot", _t("display.cute.snapshot_full" if a.get("full") else "display.cute.snapshot_compact")),
     "browser_click": lambda a, r: _cute_row("👆", "click", str(a.get("ref", "?"))),
     "browser_type": lambda a, r: _cute_row("⌨️ ", "type", f"\"{_cute_trunc(a.get('text', ''))}\""),
     "browser_scroll": _cute_scroll,
     "browser_back": lambda a, r: _cute_row("◀️ ", "back"),
     "browser_press": lambda a, r: _cute_row("⌨️ ", "press", str(a.get("key", "?"))),
-    "browser_get_images": lambda a, r: _cute_row("🖼️ ", "images", t("display.cute.images_extracting")),
-    "browser_vision": lambda a, r: _cute_row("👁️ ", "vision", t("display.cute.vision_analyzing_page")),
+    "browser_get_images": lambda a, r: _cute_row("🖼️ ", "images", _t("display.cute.images_extracting")),
+    "browser_vision": lambda a, r: _cute_row("👁️ ", "vision", _t("display.cute.vision_analyzing_page")),
     "todo_list": _cute_todo_list,
     "session_search": lambda a, r: _cute_row("🔍", "recall", f"\"{_cute_trunc(a.get('query', ''))}\""),
     "memory": _cute_memory,
-    "skills_list": lambda a, r: _cute_row("📚", "skills", t("display.cute.skills_list", category=a.get("category") or t("display.cute.skills_all"))),
+    "skills_list": lambda a, r: _cute_row("📚", "skills", _t("display.cute.skills_list", category=a.get("category") or _t("display.cute.skills_all"))),
     "skill_view": _cute_skill_view,
     "image_generate": lambda a, r: _cute_row("🎨", "create", _cute_trunc(a.get("prompt", ""))),
     "text_to_speech": lambda a, r: (
@@ -1327,7 +1344,7 @@ def _entry_failure_suffix(entry: Any) -> str:
         return ""
     error = entry.get("error")
     if isinstance(error, dict):
-        return f" [{_trim_error(str(error.get('message') or error.get('code') or t('display.failure.generic_word')))}]"
+        return f" [{_trim_error(str(error.get('message') or error.get('code') or _t('display.failure.generic_word')))}]"
     if not (error or entry.get("success") is False):
         return ""
     return _detect_tool_failure(str(entry.get("name") or ""), entry)[1]
@@ -1372,7 +1389,7 @@ def get_cute_tool_message(tool_name: str, args: dict, duration: float, result: s
         return _get_cute_tool_message(tool_name, args, duration, result=result)
     except Exception as exc:
         logger.debug("Tool completion label failed for %s: %s", tool_name, exc)
-        safe_name = tool_name[:9] if isinstance(tool_name, str) and tool_name else t("display.cute.fallback_tool_name")
-        safe_duration = f"{duration:.1f}s" if isinstance(duration, (int, float)) else t("display.cute.fallback_done")
-        return t("display.cute.completed", tool=f"{safe_name:9}", duration=safe_duration)
+        safe_name = tool_name[:9] if isinstance(tool_name, str) and tool_name else _t("display.cute.fallback_tool_name")
+        safe_duration = f"{duration:.1f}s" if isinstance(duration, (int, float)) else _t("display.cute.fallback_done")
+        return _t("display.cute.completed", tool=f"{safe_name:9}", duration=safe_duration)
 

@@ -11,7 +11,7 @@ Verifies that:
 import io
 import sys
 import pytest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from agent.display import KawaiiSpinner
 from tools.delegate_tool import _build_child_progress_callback
@@ -158,8 +158,8 @@ class TestBatchFlush:
     """Tests for gateway batch flush on subagent completion."""
 
     def test_flush_sends_remaining_batch(self):
-        """_flush should send a final subagent.progress summary of any unsent
-        tool names in the batch (less than BATCH_SIZE)."""
+        """_flush should send a final subagent.progress summary in both raw and friendly modes with ×N grouping."""
+        # Mode 1: friendly_tool_labels=False -> raw tool names + ×N grouping
         parent = MagicMock()
         parent._delegate_spinner = None
         parent_cb = MagicMock()
@@ -167,22 +167,39 @@ class TestBatchFlush:
 
         cb = _build_child_progress_callback(0, "test goal", parent)
 
-        # Send 3 tools (below batch size of 5) — each relays subagent.tool
+        # Send 4 tools (below batch size of 5) — each relays subagent.tool
         cb("tool.started", "web_search", "query1", {})
-        cb("tool.started", "read_file", "file.txt", {})
+        cb("tool.started", "read_file", "file1.txt", {})
+        cb("tool.started", "read_file", "file2.txt", {})
         cb("tool.started", "write_file", "out.txt", {})
         events = [c.args[0] for c in parent_cb.call_args_list]
-        assert events == ["subagent.tool"] * 3  # per-tool relays so far
+        assert events == ["subagent.tool"] * 4  # per-tool relays so far
         assert "subagent.progress" not in events  # no batch-size summary yet
 
-        # Flush should send the remaining 3 as a summary
-        cb._flush()
+        with patch("agent.display._friendly_tool_labels", False):
+            cb._flush()
         events = [c.args[0] for c in parent_cb.call_args_list]
         assert events[-1] == "subagent.progress"
         summary_call = parent_cb.call_args_list[-1]
         summary_text = summary_call.kwargs.get("preview") or summary_call.args[2]
         assert "web_search" in summary_text
+        assert "read_file ×2" in summary_text
         assert "write_file" in summary_text
+
+        # Mode 2: friendly_tool_labels=True (ru) -> localized verbs + ×N grouping
+        parent_cb.reset_mock()
+        cb("tool.started", "read_file", "a.py", {})
+        cb("tool.started", "read_file", "b.py", {})
+        cb("tool.started", "terminal", "pytest -q", {})
+        with (
+            patch("agent.display._friendly_tool_labels", True),
+            patch("agent.i18n.get_language", return_value="ru"),
+        ):
+            cb._flush()
+        summary_call_ru = parent_cb.call_args_list[-1]
+        summary_text_ru = summary_call_ru.kwargs.get("preview") or summary_call_ru.args[2]
+        assert "Чтение файла ×2" in summary_text_ru
+        assert "Выполнение команды" in summary_text_ru
 
     def test_flush_noop_when_batch_empty(self):
         """_flush should not send anything when batch is empty."""

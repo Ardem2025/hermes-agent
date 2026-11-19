@@ -3028,7 +3028,17 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             if not is_gen and has_active_subagents:
                 is_gen = True
                 if active_subagents and active_subagents[0].get("last_tool"):
-                    tool_status = f"Подзадача выполняет {active_subagents[0]['last_tool']}..."
+                    last_tool = str(active_subagents[0]["last_tool"])
+                    verb = None
+                    try:
+                        from agent.display import get_tool_verb
+                        verb = get_tool_verb(last_tool)
+                    except Exception:
+                        verb = None
+                    if verb:
+                        tool_status = f"Подзадача: {verb}..."
+                    else:
+                        tool_status = f"Подзадача выполняет {last_tool}..."
                 elif active_subagents:
                     tool_status = f"Выполняются подзадачи ({len(active_subagents)} в работе)..."
                 else:

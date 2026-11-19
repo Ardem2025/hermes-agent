@@ -220,6 +220,8 @@ def wrap_progress_callback(inner_cb, writer: LiveTranscriptWriter):
         with _best_effort("observe"):
             writer.observe(event_type, tool_name, preview, args, **kwargs)
         if inner_cb is not None:
+            if event_type == "subagent.start" and "live_transcript" not in kwargs and writer.path is not None:
+                kwargs["live_transcript"] = str(writer.path)
             inner_cb(event_type, tool_name, preview, args, **kwargs)
 
     def _flush():

@@ -579,3 +579,39 @@ async def test_bdd7_sse_disconnect_preserves_turn_and_delivers_telegram_pulse(tm
         for c in telegram.calls
     )
     db.close()
+
+
+def test_session_response_subagent_tool_status_localization(tmp_path):
+    """BDD 4 & 5: _session_response() formats active subagent tool_status via get_tool_verb (ru/en/raw/unknown)."""
+    _assert_sandbox_imports()
+    db = _make_bound_db(tmp_path, "sess_tool_status", delivery_enabled=False)
+    adapter = _make_adapter(db, None)
+    adapter._get_active_subagents_for_session = lambda _sid: [{"last_tool": "read_file", "status": "running"}]
+    session_row = {"id": "sess_tool_status", "source": "api_server"}
+
+    with (
+        patch("agent.display._friendly_tool_labels", True),
+        patch("agent.i18n.get_language", return_value="ru"),
+    ):
+        res_ru = adapter._session_response(session_row)
+    assert res_ru["tool_status"] == "Подзадача: Чтение файла..."
+
+    with (
+        patch("agent.display._friendly_tool_labels", True),
+        patch("agent.i18n.get_language", return_value="en"),
+    ):
+        res_en = adapter._session_response(session_row)
+    assert res_en["tool_status"] == "Подзадача: Reading..."
+
+    with patch("agent.display._friendly_tool_labels", False):
+        res_raw = adapter._session_response(session_row)
+    assert res_raw["tool_status"] == "Подзадача выполняет read_file..."
+
+    adapter._get_active_subagents_for_session = lambda _sid: [{"last_tool": "custom_unknown_tool", "status": "running"}]
+    with (
+        patch("agent.display._friendly_tool_labels", True),
+        patch("agent.i18n.get_language", return_value="ru"),
+    ):
+        res_unk = adapter._session_response(session_row)
+    assert res_unk["tool_status"] == "Подзадача выполняет custom_unknown_tool..."
+    db.close()
