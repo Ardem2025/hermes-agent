@@ -99,10 +99,17 @@ def _stop_after_sleeps(monkeypatch, runner, count, *, minutes_apart=False):
     """``minutes_apart``: each watcher tick is a minute later, so a refused retry's backoff is due."""
     sleep_calls = 0
     clock = install_module_clock(monkeypatch, run_notifications) if minutes_apart else None
+    real_sleep = asyncio.sleep
 
     async def _bounded_sleep(_delay):
         nonlocal sleep_calls
         sleep_calls += 1
+        current = asyncio.current_task()
+        other = [t for t in asyncio.all_tasks() if t is not current and not t.done()]
+        if other:
+            await asyncio.wait(other, timeout=2.0)
+        else:
+            await real_sleep(0)
         if clock is not None:
             clock.now += 60
         if sleep_calls >= count:
@@ -1003,3 +1010,57 @@ def test_watch_drain_retries_transport_failure(monkeypatch, isolated_registry):
     asyncio.run(runner._async_delegation_watcher(interval=0))
     assert adapter.handle_message.await_count == 2
     assert isolated_registry.completion_queue.empty()
+
+
+
+@pytest.mark.asyncio
+async def test_session_automation_async_fold_preserves_identities_and_local_display_text(tmp_path, monkeypatch):
+    from gateway.config import GatewayConfig
+    from gateway.platforms.event import MessageEvent, MessageType
+    from gateway.run import GatewayRunner
+    from gateway.session_authority import SessionAuthority, initialize_session_authority
+    from gateway.session_automation import admit_process_notice, completion_admission
+    from gateway.session_contract import SessionActor
+    from gateway.session_local import create_local_session
+    from hermes_state import AsyncSessionDB, SessionDB
+    from hermes_state_runtime import list_session_admissions
+    from tools.process_registry_notifications import async_delegation_batch_display_text
+
+    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
+    monkeypatch.setattr(SessionAuthority, '_schedule', lambda self, ref: None)
+    runner = GatewayRunner(GatewayConfig(sessions_dir=tmp_path / 'sessions'))
+    db = SessionDB(tmp_path / 'state.db')
+    runner.session_store._db = db
+    runner._session_db = AsyncSessionDB(db)
+    authority = await initialize_session_authority(runner, profile_id='default', instance_id='local-fold', db=db)
+    actor = SessionActor('test-owner', 'default', frozenset({'session:create', 'session:submit', 'session:read'}), 'fixture')
+    ref = create_local_session(authority, actor, dict(request_id='local-fold', source='gui', model='fixture', toolsets=[]))
+    live = authority.sessions[ref.session_id]
+    source = live.source
+    key = live.route
+    sid = ref.session_id
+    adapter = runner._adapter_for_source(source)
+    for idx in range(2):
+        did = f'local-deleg-{idx}'
+        evt = {'type': 'async_delegation', 'delegation_id': did, 'session_key': key, 'parent_session_id': sid}
+        msg = MessageEvent(
+            text=f'result {did}',
+            source=source,
+            message_type=MessageType.TEXT,
+            internal=True,
+            metadata={
+                'gateway_session_id': sid,
+                'gateway_session_key': key,
+                'display_kind': 'async_delegation_complete',
+                'display_text': f'Subagent Task Completed: {did}',
+            },
+        )
+        await admit_process_notice(runner, authority, adapter, msg, evt)
+
+    queued = [r for r in list_session_admissions(authority.db, session_id=sid, pending_only=False) if r['status'] == 'queued']
+    assert len(queued) == 1
+    descriptor = queued[0]['payload']['local_automation_v1']
+    assert len(descriptor['identities']) == 2
+    assert descriptor['display_text'] == async_delegation_batch_display_text(2)
+    for idx in range(2):
+        assert completion_admission(runner, {'type': 'async_delegation', 'delegation_id': f'local-deleg-{idx}', 'session_key': key}) is not None

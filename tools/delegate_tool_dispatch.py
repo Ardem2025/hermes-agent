@@ -385,13 +385,8 @@ _BACKGROUND_NOTES = {
         "poll transcripts or artifacts to wait for them."
     ),
     "control_hint": (
-        "While a child runs you can orchestrate it live with this same tool: delegate_task(action='list') to see live "
-        "children, action='steer' with subagent_id + message to redirect one, action='stop' with subagent_id to end "
-        "one early."
-    ),
-    "live_transcripts_hint": (
-        "Each subagent streams a human-readable transcript of its operations to the file listed above (append-only, "
-        "one per task). Read or `tail -f` these paths at any time to watch a child work while it runs."
+        "Use action='steer' (subagent_id + message) or action='stop' (subagent_id) only if the user asks to "
+        "redirect/cancel a running child or it appears stuck. Do NOT call action='list' to poll progress."
     ),
 }
 
@@ -415,9 +410,6 @@ def _dispatched_payload(batch: _Batch, units: list[tuple[_Batch, str]]) -> dict:
         payload["control_hint"] = _BACKGROUND_NOTES["control_hint"]
     if batch.refused:
         payload["refused"] = batch.refused
-    if batch.live_paths:
-        payload["live_transcripts"] = list(batch.live_paths)
-        payload["live_transcripts_hint"] = _BACKGROUND_NOTES["live_transcripts_hint"]
     return payload
 
 def _units_of(batch: _Batch) -> list[_Batch]:

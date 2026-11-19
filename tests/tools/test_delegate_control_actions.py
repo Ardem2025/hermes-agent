@@ -112,8 +112,8 @@ def test_list_shows_only_own_children():
         assert entry["subagent_id"] == "sid-ctl-list-1"
         assert entry["goal"] == "test goal"
         assert entry["accepting_steer"] is True
-        assert entry["live_transcript"] == "/tmp/live/task-0.log"
         # Internal fields must not leak
+        assert "live_transcript" not in entry
         assert "agent" not in entry
         assert "owner_transport" not in entry
     finally:

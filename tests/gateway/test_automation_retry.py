@@ -46,6 +46,11 @@ async def test_coalesced_siblings_survive_lost_ack_and_owner_restart(tmp_path, m
     assert await runner._deliver_async_delegation_group([duplicate]) is True
     rows_after = list_session_admissions(authority.db, session_id=sid, pending_only=False)
     assert len(rows_after) == len(rows), rows_after
+    # Once the earlier batch row has started running, a fresh sibling queues separately without mixing.
+    authority.db._write_sql(
+        "UPDATE session_admissions SET status='started', owner_epoch=1, generation=1 WHERE admission_id=?",
+        (rows[-1]['admission_id'],),
+    )
     fresh = dict(pending(key, 'fresh-sibling'), parent_session_id=sid)
     assert await runner._deliver_async_delegation_group([events[0], fresh]) is True
     final = list_session_admissions(authority.db, session_id=sid, pending_only=False)
@@ -54,6 +59,53 @@ async def test_coalesced_siblings_survive_lost_ack_and_owner_restart(tmp_path, m
     for event in [*events, fresh]:
         assert delegation.get_durable_delegation(event['delegation_id'])['delivery_state'] == 'delivered'
     await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+async def test_queued_async_delegation_coalesces_without_duplicating_seen_sibling(tmp_path, monkeypatch):
+    from gateway.config import GatewayConfig, Platform, PlatformConfig
+    from gateway.platforms.event import MessageEvent
+    from gateway.run import GatewayRunner
+    from gateway.session_authority import initialize_session_authority, SessionAuthority
+    from gateway.session_ingress_context import native_callback
+    from hermes_constants import get_hermes_home
+    from hermes_state_runtime import list_session_admissions
+    from plugins.platforms.discord.adapter import DiscordAdapter
+    from tests.gateway.test_completion_admission import pending
+    from tools import async_delegation as delegation
+
+    monkeypatch.setattr(SessionAuthority, '_schedule', lambda self, ref: None)
+    runner = GatewayRunner(GatewayConfig())
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token='fixture-token', typing_indicator=False))
+    runner.adapters = {Platform.DISCORD: adapter}
+    authority = await initialize_session_authority(runner, profile_id='default', instance_id='queued-fold')
+    runner._wire_adapter_handlers(adapter)
+    source = adapter.build_source(chat_id='42', chat_type='dm', user_id='42')
+    monkeypatch.setenv('DISCORD_ALLOWED_USERS', '42')
+    human = MessageEvent(text='human', source=source, message_id='human')
+    with native_callback(runner, human, get_hermes_home()):
+        await authority.admit_native(human)
+    key = runner.session_store._generate_session_key(source)
+    sid = runner.session_store.peek_session_id(key)
+    human_rows = list_session_admissions(authority.db, session_id=sid, pending_only=False)
+    authority.db._write_sql(
+        "UPDATE session_admissions SET status='started', owner_epoch=1, generation=1 WHERE admission_id=?",
+        (human_rows[0]['admission_id'],),
+    )
+    events = [dict(pending(key, 'queued-sibling-' + str(i)), parent_session_id=sid) for i in range(2)]
+    assert await runner._deliver_async_delegation_group(events) is True
+    fresh = dict(pending(key, 'queued-fresh'), parent_session_id=sid)
+    assert await runner._deliver_async_delegation_group([events[0], fresh]) is True
+    queued_rows = [r for r in list_session_admissions(authority.db, session_id=sid, pending_only=False) if r['status'] == 'queued']
+    assert len(queued_rows) == 1
+    text = queued_rows[0]['payload']['text']
+    assert text.count('[ASYNC DELEGATION COMPLETE — queued-sibling-0]') == 1
+    assert text.count('queued-sibling-0') == 2
+    assert 'queued-sibling-1' in text and 'queued-fresh' in text
+    identities = queued_rows[0]['payload']['native_text_v1']['automation']['identities']
+    assert len(identities) == 3
+    for event in [*events, fresh]:
+        assert delegation.get_durable_delegation(event['delegation_id'])['delivery_state'] == 'delivered'
 
 
 @pytest.mark.asyncio

@@ -1397,6 +1397,61 @@ def _children_activity_from_token(token: Any, now: float) -> Optional[list]:
     return out
 
 
+def list_active_delegations_for_session(
+    session_key: Optional[str],
+    parent_session_id: Optional[str] = None,
+    exclude_delegation_id: Optional[str] = None,
+) -> list[dict[str, Any]]:
+    """Read-only snapshot of active (running/stalling) async delegations scoped strictly to one session."""
+    norm_key = str(session_key or "").strip()
+    norm_parent = str(parent_session_id or "").strip()
+    if not norm_key and not norm_parent:
+        return []
+    now = time.time()
+    matched: list[dict[str, Any]] = []
+    with _records_lock:
+        for r in _records.values():
+            if r.get("status") not in _ACTIVE_STATES:
+                continue
+            deleg_id = r.get("delegation_id")
+            if exclude_delegation_id and deleg_id == exclude_delegation_id:
+                continue
+            rec_key = str(r.get("session_key") or "").strip()
+            rec_parent = str(r.get("parent_session_id") or "").strip()
+            if norm_key:
+                if rec_key != norm_key:
+                    continue
+            else:
+                if rec_key or rec_parent != norm_parent:
+                    continue
+            dispatched_at = r.get("dispatched_at")
+            elapsed_s = round(max(0.0, now - float(dispatched_at)), 1) if isinstance(dispatched_at, (int, float)) else None
+            raw_goal = " ".join(str(r.get("goal") or "").split())
+            goal = raw_goal[:117] + "..." if len(raw_goal) > 120 else raw_goal
+            matched.append({
+                "delegation_id": deleg_id,
+                "subagent_ids": [],
+                "started_at": dispatched_at,
+                "elapsed_s": elapsed_s,
+                "goal": goal,
+            })
+    if matched:
+        try:
+            from tools.delegate_tool_registry import _active_subagents, _active_subagents_lock
+            by_deleg: dict[str, list[str]] = {}
+            with _active_subagents_lock:
+                for rec in _active_subagents.values():
+                    did = rec.get("delegation_id")
+                    sid = rec.get("subagent_id")
+                    if did and sid:
+                        by_deleg.setdefault(did, []).append(sid)
+            for item in matched:
+                item["subagent_ids"] = by_deleg.get(item["delegation_id"], [])
+        except Exception:
+            pass
+    return matched
+
+
 def list_async_delegations() -> list[dict[str, Any]]:
     """Snapshot of async delegations (running + recently completed) without callables or private
     monitor bookkeeping; adds computed live fields for UIs (``seconds_since_progress``,

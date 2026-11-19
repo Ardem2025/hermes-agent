@@ -628,7 +628,6 @@ def delegate_task(
         if dup_matches and all(dup is not None for _, dup in dup_matches):
             dups = [dup for _, dup in dup_matches]
             sids = [d["subagent_id"] for d in dups if d.get("subagent_id")]
-            transcripts = [d["live_transcript"] for d in dups if d.get("live_transcript")]
             payload: dict[str, Any] = {
                 "status": "dispatched",
                 "mode": "background",
@@ -644,8 +643,6 @@ def delegate_task(
             }
             if len(dups) == 1:
                 payload["subagent_id"] = dups[0].get("subagent_id")
-            if transcripts:
-                payload["live_transcripts"] = transcripts
             return json.dumps(payload, ensure_ascii=False)
         if any(dup is not None for _, dup in dup_matches):
             task_list = [t for t, dup in dup_matches if dup is None]
@@ -889,10 +886,11 @@ DELEGATE_TASK_SCHEMA = {
             "action": _p(
                 "string",
                 "Default 'spawn'. Live control of running children: "
-                "'list' = ids/goals/status/transcripts; 'steer' = queue "
+                "'list' = ids/goals/status (do NOT use to poll progress); 'steer' = queue "
                 "course-correction text into one child (subagent_id + "
                 "message) without stopping it; 'stop' = end one child "
                 "early (subagent_id; partial result still returns). "
+                "Use steer/stop only when the user asks or a child appears stuck. "
                 "Control actions return immediately; goal/tasks are ignored unless spawning.",
                 enum=["spawn", "list", "steer", "stop"],
             ),

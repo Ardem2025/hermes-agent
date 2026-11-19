@@ -1355,14 +1355,37 @@ class AIAgent(
         # unless the session's delegate_task is the joined variant (one-shot, delegation.gateway_mode inline).
         # An ORCHESTRATOR SUBAGENT (depth > 0) stays synchronous — it needs results in-turn and owns no gateway
         # session. The schema-level `background` param is intentionally ignored.
-        return _delegate_task(
+        action = function_args.get("action")
+        raw_result = _delegate_task(
             goal=function_args.get("goal"), context=function_args.get("context"),
             tasks=_strip_model_hidden_task_fields(function_args.get("tasks")),
             max_iterations=function_args.get("max_iterations"), role=function_args.get("role"),
             background=not (getattr(self, "_delegate_depth", 0) > 0), images=function_args.get("images"),
-            action=function_args.get("action"),
+            action=action,
             subagent_id=function_args.get("subagent_id"), message=function_args.get("message"), parent_agent=self,
         )
+        if action not in ("list", "steer", "stop"):
+            import json as _json
+            try:
+                parsed = _json.loads(raw_result)
+            except (TypeError, ValueError):
+                parsed = None
+            if isinstance(parsed, dict) and parsed.get("status") == "dispatched" and not parsed.get("deduplicated"):
+                dispatched = getattr(self, "_turn_dispatched_delegations", None)
+                if not isinstance(dispatched, list):
+                    dispatched = []
+                    self._turn_dispatched_delegations = dispatched
+                if dispatched:
+                    parsed["same_turn_warning"] = (
+                        "Another background delegation was already dispatched in this same turn. "
+                        "Do NOT dispatch dependent phases (audit, review, fix, plan, synthesis) in this turn — "
+                        "END YOUR TURN now and wait for completion notifications."
+                    )
+                    raw_result = _json.dumps(parsed, ensure_ascii=False)
+                deleg_id = parsed.get("delegation_id")
+                if deleg_id:
+                    dispatched.append(deleg_id)
+        return raw_result
 
     _invoke_tool = _forward("agent.agent_runtime_helpers", "invoke_tool")
 

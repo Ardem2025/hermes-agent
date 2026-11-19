@@ -86,17 +86,19 @@ async def admit_process_notice(runner, authority, adapter, event, evt):
     """Admit a process notice. A completion and the withdrawal of its process's waiting ticks hold
     the heartbeat lock together; a tick already holds it (``deliver_heartbeat``)."""
     identity = producer_identity(runner, evt)
-    if evt.get('type') == 'heartbeat':
+    evt_type = evt.get('type')
+    if evt_type == 'heartbeat':
         # The tick's raw output rides its stored admission: a later tick folds from the ledger.
         event.metadata['heartbeat_tick'] = {'output': str(evt.get('output') or ''),
                                             'omitted': int(evt.get('omitted') or 0)}
         if evt.get('_replaces'):
             return await authority.admit_automation(adapter, event, identity, replaces=evt['_replaces'])
-    if evt.get('type') != 'completion':
+    if evt_type not in ('completion', 'async_delegation') or evt.get('task_failure_notice'):
         return await authority.admit_automation(adapter, event, identity)
     async with _heartbeat_lock(runner):
         receipt = await _admit_folded_completion(authority, adapter, event, evt, identity)
-        await withdraw_process_ticks(runner, evt)
+        if evt_type == 'completion':
+            await withdraw_process_ticks(runner, evt)
         return receipt
 
 
@@ -121,26 +123,35 @@ async def _admit_folded_completion(authority, adapter, event, evt, identity):
 
 
 def _waiting_completion(authority, evt, event):
-    """The route's own completion row that is the LAST queued input of the session, or None. Only the
-    tail folds: a completion never jumps ahead of, or behind, a prompt queued after it. The finishing
+    """The route's own completion/async_delegation row that is the LAST queued input of the session, or None.
+    Only the tail folds: a completion never jumps ahead of, or behind, a prompt queued after it. The finishing
     process's own queued liveness ticks do not count as the tail: this completion withdraws them
     (``withdraw_process_ticks``); their admission ids ride the row as ``_skip`` for the write guard."""
     from gateway.session_detached import route_entry
+    incoming_kind = evt.get('type')
+    if incoming_kind not in ('completion', 'async_delegation') or evt.get('task_failure_notice'):
+        return None
     entry = route_entry(authority, str(evt.get('session_key') or ''))
     if entry is None:
         return None
     queued = [row for row in list_session_admissions(authority.db, session_id=_route_owner(authority, entry))
               if row['status'] == 'queued']
-    process = str(evt.get('session_id') or '')
     skip = []
-    while queued and _queued_tick(queued[-1], process, entry.session_key):
-        skip.append(queued.pop()['admission_id'])
+    if incoming_kind == 'completion':
+        process = str(evt.get('session_id') or '')
+        while queued and _queued_tick(queued[-1], process, entry.session_key):
+            skip.append(queued.pop()['admission_id'])
     tail = queued[-1] if queued else None
     if tail is None or tail['principal_id'] != 'automation:' + entry.session_key:
         return None
-    if [identity[0] for identity in _identities([tail['request_id']])] != ['completion']:
+    tail_identities = _identities([tail['request_id']])
+    if len(tail_identities) != 1 or tail_identities[0][0] != incoming_kind:
         return None
     descriptor = _descriptor(tail['payload'])
+    all_tail_identities = _identities(descriptor.get('identities') or [tail['request_id']])
+    if any(ident[0] != incoming_kind or (len(ident) > 2 and isinstance(ident[2], str) and ident[2].startswith('task_failure:'))
+           for ident in all_tail_identities):
+        return None
     if (descriptor.get('notification_category', 'result') != event.metadata.get('notification_category', 'result')
             or descriptor.get('display_kind') != event.metadata.get('display_kind')):
         return None
@@ -152,24 +163,41 @@ _FOLD_HEADER = ('[IMPORTANT: {count} background process results arrived while th
                 'actionable results.]')
 _FOLD_HEADER_RE = re.compile(r'\[IMPORTANT: \d+ background process results arrived while this session was busy\.'
                              r'[^\]]*\]\n\n')
+_ASYNC_FOLD_HEADER = ('[IMPORTANT: {count} background subagent delegations completed for this session. '
+                      'Treat these results as one completion batch and send at most one consolidated '
+                      'user-facing response. If a result does not change the current conclusion, absorb it silently.]')
+_ASYNC_FOLD_HEADER_RE = re.compile(r'\[IMPORTANT: \d+ background subagent delegations completed for this session\.'
+                                   r'[^\]]*\]\n\n')
 
 
 def _fold_completion(event, waiting, identity):
     from gateway.run_notifications import INTERNAL_NOTIFICATION_FOOTER, _mark_internal_notification
-    from tools.process_registry_notifications import process_completion_display_text
+    from tools.process_registry_notifications import (
+        async_delegation_batch_display_text, process_completion_display_text)
     descriptor = _descriptor(waiting['payload'])
     identities = sorted({*(descriptor.get('identities') or [waiting['request_id']]),
                          *(event.metadata.get('automation_identities') or [identity])})
+    parsed = _identities([identity])
+    kind = parsed[0][0] if parsed else 'completion'
+    header_tpl, header_re = (
+        (_ASYNC_FOLD_HEADER, _ASYNC_FOLD_HEADER_RE)
+        if kind == 'async_delegation'
+        else (_FOLD_HEADER, _FOLD_HEADER_RE)
+    )
 
     def body(text):
         text = text.rstrip().removesuffix(INTERNAL_NOTIFICATION_FOOTER).rstrip()
-        folded = _FOLD_HEADER_RE.match(text)
+        folded = header_re.match(text)
         return text[folded.end():] if folded else text
     event.text = _mark_internal_notification('\n\n'.join((
-        _FOLD_HEADER.format(count=len(identities)), body(waiting['payload']['text']), body(event.text))))
+        header_tpl.format(count=len(identities)), body(waiting['payload']['text']), body(event.text))))
     event.metadata['automation_identities'] = identities
     if 'display_text' in event.metadata:
-        event.metadata['display_text'] = process_completion_display_text([{}] * len(identities))
+        event.metadata['display_text'] = (
+            async_delegation_batch_display_text(len(identities))
+            if kind == 'async_delegation'
+            else process_completion_display_text([{}] * len(identities))
+        )
 
 
 async def prepare_heartbeat(runner, event):

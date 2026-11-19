@@ -261,7 +261,6 @@ def _find_active_duplicate_subagent(parent_agent: Any, goal: Any) -> Optional[di
                 "goal": r.get("goal"),
                 "status": r.get("status") or "running",
                 "elapsed_seconds": round(time.time() - started, 1) if isinstance(started, (int, float)) else None,
-                "live_transcript": getattr(agent, "_live_transcript_path", None),
             }
     return None
 
@@ -285,7 +284,6 @@ def _list_payload(parent_agent: Any) -> dict[str, Any]:
             "running_seconds": elapsed,
             "elapsed_seconds": elapsed,
             "accepting_steer": bool(r.get("accepting_steer", False)),
-            "live_transcript": getattr(r.get("agent"), "_live_transcript_path", None),
         })
     payload: dict[str, Any] = {"action": "list", "count": len(entries), "subagents": entries}
     if not entries:
@@ -293,6 +291,11 @@ def _list_payload(parent_agent: Any) -> dict[str, Any]:
             "No live subagents right now. Children that already finished "
             "have delivered (or will deliver) their results as normal "
             "completion messages — there is nothing to steer or stop."
+        )
+    else:
+        payload["note"] = (
+            "Do NOT use action='list' to poll progress; completion results arrive automatically. "
+            "On a wake turn while waiting, reply with NO_REPLY if no user update is needed."
         )
     return payload
 

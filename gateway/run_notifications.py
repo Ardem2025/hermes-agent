@@ -1724,9 +1724,18 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                     if not pending_queue:
                         break
                     head = pending_queue[0]
-                    if max(((evt.get("_watch_next_retry_at") or 0.0) for evt in head), default=0.0) > time.monotonic():
+                    now = time.monotonic()
+                    if max(((evt.get("_watch_next_retry_at") or 0.0) for evt in head), default=0.0) > now:
                         break
-                    group = pending_queue.popleft()
+                    group = list(pending_queue.popleft())
+                    if not any(evt.get("origin_session_id") for evt in group):
+                        while pending_queue:
+                            nxt = pending_queue[0]
+                            if max(((evt.get("_watch_next_retry_at") or 0.0) for evt in nxt), default=0.0) > now:
+                                break
+                            if any(evt.get("origin_session_id") for evt in nxt):
+                                break
+                            group.extend(pending_queue.popleft())
                     try:
                         delivered = await self._deliver_async_delegation_group(group)
                         if delivered is False:

@@ -69,8 +69,17 @@ os._exit(0)
                            text=True, capture_output=True, timeout=30, check=False)
     assert first.returncode == 0, first.stdout + first.stderr
     handle = json.loads(handle_path.read_text(encoding="utf-8"))
-    transcripts = handle["live_transcripts"]
-    assert all(Path(path).is_file() for path in transcripts)
+    assert "live_transcripts" not in handle
+    assert "live_transcripts_hint" not in handle
+    unit_ids = [u["delegation_id"] for u in handle.get("units", [])] or [handle["delegation_id"]]
+    import sqlite3
+    with sqlite3.connect(tmp_path / "state.db") as conn:
+        rows = [conn.execute("SELECT task_json FROM async_delegations WHERE delegation_id=?", (d,)).fetchone() for d in unit_ids]
+    transcripts = []
+    for row in rows:
+        if row and row[0]:
+            transcripts.extend((json.loads(row[0]) or {}).get("task_transcripts", {}).values())
+    assert transcripts and all(Path(path).is_file() for path in transcripts)
     consumer = r'''
 import json, queue
 from tools import async_delegation as ad
