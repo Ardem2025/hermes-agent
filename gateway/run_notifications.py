@@ -79,6 +79,16 @@ def _refusal_retry_at(step: int) -> float:
         step, base_delay=_WATCH_INJECTION_RETRY_BASE_DELAY,
         max_delay=_COMPLETION_INJECTION_RETRY_MAX_DELAY, jitter_ratio=0.0)
 
+
+def _back_off_refused_completions(group: list[dict]) -> None:
+    """Space out an undelivered async group's retries instead of re-offering it every 2 s pass.
+    The backoff only paces; the durable ledger decides when a row gives up (a permanent refusal
+    spends a delivery attempt there, so the count survives restarts) (#141153)."""
+    for evt in group:
+        step = int(evt.get("_watch_retry_step") or 0) + 1
+        evt["_watch_retry_step"] = step
+        evt["_watch_next_retry_at"] = _refusal_retry_at(step)
+
 # Durable async-delegation claim transitions: kind -> (tools.async_delegation function, failure log).
 _DURABLE_CLAIM_OPS = {
     "drop": ("drop_completion_delivery", "Could not drop durable completion claim"),
@@ -1713,11 +1723,15 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                     pending_queue = route_pending.get(route_key)
                     if not pending_queue:
                         break
+                    head = pending_queue[0]
+                    if max(((evt.get("_watch_next_retry_at") or 0.0) for evt in head), default=0.0) > time.monotonic():
+                        break
                     group = pending_queue.popleft()
                     try:
                         delivered = await self._deliver_async_delegation_group(group)
                         if delivered is False:
                             # Retain oldest failed group ahead of later groups on retry
+                            _back_off_refused_completions(group)
                             pending_queue.appendleft(group)
                             break
                     except asyncio.CancelledError:
@@ -1766,6 +1780,8 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
 
                     for route_key, q in list(route_pending.items()):
                         if q and route_key not in route_tasks:
+                            if max(((evt.get("_watch_next_retry_at") or 0.0) for evt in q[0]), default=0.0) > time.monotonic():
+                                continue
                             t = asyncio.create_task(_route_worker(route_key))
                             route_tasks[route_key] = t
                             active_tasks.add(t)
@@ -1794,10 +1810,7 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         """Space out an undelivered async group's retries instead of re-offering it every 2 s pass.
         The backoff only paces; the durable ledger decides when a row gives up (a permanent refusal
         spends a delivery attempt there, so the count survives restarts) (#141153)."""
-        for evt in group:
-            step = int(evt.get("_watch_retry_step") or 0) + 1
-            evt["_watch_retry_step"] = step
-            evt["_watch_next_retry_at"] = _refusal_retry_at(step)
+        _back_off_refused_completions(group)
 
     @staticmethod
     def _redacted_output_tail(session, limit: int) -> str:

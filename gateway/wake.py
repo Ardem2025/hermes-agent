@@ -384,7 +384,7 @@ def check_coordinator_wake_eligibility(session_id: str, adapter: Any, evt: Optio
     1. Pending human gates (clarifications/choice prompts) MUST be clear.
     2. Bounded loop protection: consecutive_auto_wakes must be strictly less than MAX_CONSECUTIVE_AUTO_WAKES (10).
     3. The session must be an active SpDD coordinator (active passport under ~/.hermes/tasks/*/state.json
-       matching session_id or in_progress, or auto_resume_on_delegation=True in session/event metadata).
+       matching session_id, or auto_resume_on_delegation=True in session/event metadata).
     """
     if not session_id:
         return False
@@ -455,11 +455,7 @@ def check_coordinator_wake_eligibility(session_id: str, adapter: Any, evt: Optio
                     data = json.loads(passport.read_text(encoding="utf-8"))
                     p_status = data.get("status")
                     p_sid = data.get("session_id")
-                    if p_sid == sid:
-                        if p_status in ("in_progress", "active"):
-                            return True
-                    elif p_status in ("in_progress", "active"):
-                        # If active task passport has no explicit session_id bound, or matches coordinator
+                    if p_sid and str(p_sid) == sid and p_status in ("in_progress", "active"):
                         return True
                 except Exception:
                     continue
