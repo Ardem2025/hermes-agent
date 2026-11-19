@@ -11,11 +11,12 @@ URL that was not requested (redirect targets). Logs under the origin
 import asyncio
 import json
 import logging
+import os
 from typing import Any, Dict, List, Optional
 
 from tools.tool_backend_helpers import selection_error, selection_exists
 from tools.url_safety import normalize_url_for_request
-from tools.web_tools_rescue import _rescue_eligible, _rescue_extract
+from tools.web_tools_rescue import _keyless_rescue_enabled, _rescue_eligible, _rescue_extract
 
 logger = logging.getLogger("tools.web_tools")
 
@@ -271,7 +272,24 @@ async def _cached_final_url_allowed(hit: dict, requested: str) -> bool:
     return await async_is_safe_url(final_url)
 
 
-async def _extract_safe_urls(provider, safe_urls: list[str], format: Optional[str]) -> list[dict]:
+def _local_first_enabled() -> bool:
+    """Return True unless HERMES_LOCAL_FIRST_EXTRACT or web.local_first_extract disables it."""
+    env_val = (os.environ.get("HERMES_LOCAL_FIRST_EXTRACT") or "").strip().lower()
+    if env_val in ("0", "false", "no", "off"):
+        return False
+    if env_val in ("1", "true", "yes", "on"):
+        return True
+    try:
+        from tools.web_tools import _load_web_config
+        cfg = _load_web_config()
+        if "local_first_extract" in cfg:
+            return bool(cfg["local_first_extract"])
+    except Exception:
+        pass
+    return True
+
+
+async def _extract_safe_urls_legacy(provider, safe_urls: list[str], format: Optional[str]) -> list[dict]:
     """Serve cache hits, fetch the rest, and merge back in ``safe_urls`` order.
 
     The disk cache (tools/web_result_cache.py) sits AFTER the secret-URL gate, SSRF gate, and provider
@@ -302,3 +320,132 @@ async def _extract_safe_urls(provider, safe_urls: list[str], format: Optional[st
     if not cached_results:
         return results
     return _merge_in_order(len(safe_urls), cached_results, fetch_positions, fetch_urls, results)
+
+
+async def _extract_safe_urls(provider, safe_urls: list[str], format: Optional[str]) -> list[dict]:
+    """Local-First 3-tier extract pipeline (Tier 1 httpx+bs4/pymupdf -> Tier 2 crw-server -> Tier 3 keyless rescue)."""
+    if not _local_first_enabled():
+        return await _extract_safe_urls_legacy(provider, safe_urls, format)
+
+    from plugins.web import keyless_mcp
+    from tools import web_tools_local_extract
+    from tools.web_result_cache import extract_cache_get, extract_cache_put, extract_cache_record_final_url
+    from tools.website_policy import check_website_access as _check_site
+
+    results_by_pos: dict[int, dict] = {}
+    tier1_positions: list[int] = []
+    tier1_urls: list[str] = []
+
+    for position, url in enumerate(safe_urls):
+        try:
+            _policy_block = _check_site(url)
+        except Exception:
+            _policy_block = None
+        if _policy_block is not None:
+            entry = _result_entry(url, _policy_block["message"])
+            entry["blocked_by_policy"] = {
+                k: _policy_block[k] for k in ("host", "rule", "source") if k in _policy_block
+            } or True
+            results_by_pos[position] = entry
+            continue
+        hit = extract_cache_get(url, format=format, provider="local_first")
+        if hit is not None and not await _cached_final_url_allowed(hit, url):
+            hit = None
+        if hit is not None:
+            results_by_pos[position] = hit
+        else:
+            tier1_positions.append(position)
+            tier1_urls.append(url)
+
+    if not tier1_urls:
+        return [results_by_pos[i] for i in range(len(safe_urls))]
+
+    logger.info("Web extract local-first Tier 1: %d URL(s)", len(tier1_urls))
+    t1_outcomes = await web_tools_local_extract.local_extract_urls(tier1_urls)
+
+    tier2_positions: list[int] = []
+    tier2_urls: list[str] = []
+    for pos, url, outcome in zip(tier1_positions, tier1_urls, t1_outcomes):
+        if outcome.status == "ok":
+            res = outcome.result
+            meta = res.get("metadata") if isinstance(res.get("metadata"), dict) else {}
+            final_url = str(meta.get("sourceURL") or res.get("url") or url)
+            refusal = await _final_url_refusal({**res, "url": final_url}) if final_url != url else None
+            if refusal is not None:
+                entry = _result_entry(url, refusal["error"])
+                if refusal.get("blocked_by_policy"):
+                    entry["blocked_by_policy"] = refusal["blocked_by_policy"]
+                results_by_pos[pos] = entry
+                continue
+            results_by_pos[pos] = res
+            _content = res.get("raw_content", "") or res.get("content", "")
+            if _content:
+                stored = extract_cache_put(url, _content, res.get("title", ""), format=format, provider="local_first")
+                if stored and final_url and final_url != url:
+                    extract_cache_record_final_url(url, final_url, _content, format=format, provider="local_first")
+        elif outcome.status == "terminal_error":
+            results_by_pos[pos] = outcome.result
+        else:
+            tier2_positions.append(pos)
+            tier2_urls.append(url)
+
+    if not tier2_urls:
+        return [results_by_pos[i] for i in range(len(safe_urls))]
+
+    logger.info("Web extract local-first Tier 2 (crw-server): %d URL(s)", len(tier2_urls))
+    t2_outcomes = await web_tools_local_extract.crw_local_extract_urls(tier2_urls)
+
+    tier3_positions: list[int] = []
+    tier3_urls: list[str] = []
+    tier3_fallback: dict[int, dict] = {}
+    for pos, url, outcome in zip(tier2_positions, tier2_urls, t2_outcomes):
+        if outcome.status == "ok":
+            res = outcome.result
+            meta = res.get("metadata") if isinstance(res.get("metadata"), dict) else {}
+            final_url = str(meta.get("sourceURL") or res.get("url") or url)
+            refusal = await _final_url_refusal({**res, "url": final_url}) if final_url != url else None
+            if refusal is not None:
+                entry = _result_entry(url, refusal["error"])
+                if refusal.get("blocked_by_policy"):
+                    entry["blocked_by_policy"] = refusal["blocked_by_policy"]
+                results_by_pos[pos] = entry
+                continue
+            results_by_pos[pos] = res
+            _content = res.get("raw_content", "") or res.get("content", "")
+            if _content:
+                stored = extract_cache_put(url, _content, res.get("title", ""), format=format, provider="local_first")
+                if stored and final_url and final_url != url:
+                    extract_cache_record_final_url(url, final_url, _content, format=format, provider="local_first")
+        elif outcome.status == "terminal_error":
+            results_by_pos[pos] = outcome.result
+        else:
+            tier3_positions.append(pos)
+            tier3_urls.append(url)
+            tier3_fallback[pos] = outcome.result
+
+    if tier3_urls:
+        if _keyless_rescue_enabled():
+            logger.info("Web extract local-first Tier 3 (keyless rescue): %d URL(s)", len(tier3_urls))
+            provider_name = getattr(provider, "name", "firecrawl") if provider is not None else "firecrawl"
+            try:
+                rescued = await asyncio.to_thread(keyless_mcp.extract_with_failover, provider_name, list(tier3_urls))
+                rescued = await _gate_final_urls(rescued, set(tier3_urls))
+            except Exception as exc:
+                logger.warning("Tier 3 keyless rescue failed: %s", exc)
+                rescued = []
+            for idx, pos in enumerate(tier3_positions):
+                if idx < len(rescued) and not rescued[idx].get("error"):
+                    r = rescued[idx]
+                    meta = r.setdefault("metadata", {})
+                    if isinstance(meta, dict):
+                        meta["rescued_from"] = "local_first"
+                    results_by_pos[pos] = r
+                else:
+                    results_by_pos[pos] = (
+                        rescued[idx] if idx < len(rescued) and rescued[idx].get("error") else tier3_fallback[pos]
+                    )
+        else:
+            for pos in tier3_positions:
+                results_by_pos[pos] = tier3_fallback[pos]
+
+    return _merge_in_order(len(safe_urls), results_by_pos, [], [], [])

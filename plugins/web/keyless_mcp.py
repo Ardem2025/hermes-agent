@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import threading
+import time
 import uuid
 from typing import Any, Callable, Dict, List, Optional
 
@@ -70,6 +72,29 @@ def _is_search_failover_eligible(message: str) -> bool:
     vendors may echo the query in an otherwise terminal error.
     """
     return _is_rate_limitish(message) or bool(_VENDOR_REFUSAL_RE.match(message or ""))
+
+
+_WRAPPED_MCP_OR_TRANSPORT_RE = re.compile(
+    r"^\s*keyless\s+\w+\s+(?:search|extract)\s+failed:\s*"
+    r"(?:unrecognized mcp response shape|mcp response contained no text content|request failed:|"
+    r".*(?:timed out|connecterror|remoteprotocolerror|readerror|connecttimeout))",
+    re.IGNORECASE,
+)
+_TRANSPORT_PREFIX_RE = re.compile(r"^\s*request failed:\s*", re.IGNORECASE)
+
+
+def _is_failover_eligible_error(message: str) -> bool:
+    """Return whether a search/extract error should fail over to the next ring vendor."""
+    if not message or is_origin_http_error(message):
+        return False
+    low = message.lower()
+    if "blocked:" in low or "blocked by website policy" in low:
+        return False
+    return (
+        _is_search_failover_eligible(message)
+        or bool(_WRAPPED_MCP_OR_TRANSPORT_RE.match(message))
+        or bool(_TRANSPORT_PREFIX_RE.match(message))
+    )
 
 
 def _fail_msg(vendor: str, kind: str, exc: Any, *, other_backends: bool = True) -> str:
@@ -370,6 +395,43 @@ _KEYLESS_EXTRACTORS: dict[str, Callable[[list[str]], list[dict[str, Any]]]] = {v
 _ring_lock = threading.Lock()
 _ring_cursor = int(_SESSION_ID, 16) % len(_KEYLESS_RING)
 
+_DEFAULT_COOLDOWN_SECONDS = 300.0
+_vendor_cooldown_until: dict[str, float] = {}
+
+
+def _cooldown_seconds() -> float:
+    raw = (os.environ.get("HERMES_KEYLESS_COOLDOWN_SECONDS") or "").strip()
+    if raw:
+        try:
+            return max(0.0, float(raw))
+        except ValueError:
+            pass
+    return _DEFAULT_COOLDOWN_SECONDS
+
+
+def _is_vendor_cooled_down(vendor: str) -> bool:
+    with _ring_lock:
+        until = _vendor_cooldown_until.get(vendor, 0.0)
+        if until <= 0.0:
+            return False
+        if time.monotonic() >= until:
+            _vendor_cooldown_until.pop(vendor, None)
+            return False
+        return True
+
+
+def _mark_vendor_cooldown(vendor: str, seconds: Optional[float] = None) -> None:
+    dur = _cooldown_seconds() if seconds is None else max(0.0, float(seconds))
+    if dur <= 0.0:
+        return
+    with _ring_lock:
+        _vendor_cooldown_until[vendor] = time.monotonic() + dur
+
+
+def _reset_vendor_cooldowns() -> None:
+    with _ring_lock:
+        _vendor_cooldown_until.clear()
+
 
 def _vendor_pinned(name: str) -> bool:
     """True when config explicitly routes web traffic to *name* (backend keys or a
@@ -384,48 +446,69 @@ def _vendor_pinned(name: str) -> bool:
 
 
 def _ring_order(name: str) -> list[str]:
-    """Vendor walk order: pinned → start at *name* (its ring position fixes the failover
-    succession); else round-robin from the cursor, advancing it per request. Vendors
-    pinned ``paid`` are excluded (explicit paid opts their free endpoint out)."""
+    """Vendor walk order: pinned ring vendor -> start at *name*; non-ring or unpinned ->
+    round-robin from the cursor, advancing it per request. Vendors pinned ``paid`` or
+    currently in cooldown are excluded."""
     global _ring_cursor
-    if _vendor_pinned(name):
-        start = _KEYLESS_RING.index(name) if name in _KEYLESS_RING else 0
+    if name in _KEYLESS_RING and _vendor_pinned(name):
+        start = _KEYLESS_RING.index(name)
     else:
         with _ring_lock:
             start = _ring_cursor
             _ring_cursor = (_ring_cursor + 1) % len(_KEYLESS_RING)
     ordered = _KEYLESS_RING[start:] + _KEYLESS_RING[:start]
-    return [v for v in ordered if provider_tier(v) != "paid"]
+    return [v for v in ordered if provider_tier(v) != "paid" and not _is_vendor_cooled_down(v)]
 
 
 _ALL_PAID_MSG = "All keyless web providers are pinned to paid tiers."
+_ALL_COOLDOWN_MSG = "All keyless web vendors are temporarily in cooldown; retry shortly."
 
 
-def _walk_ring(name: str, kind: str, call, throttled) -> tuple:
-    """Call each vendor from :func:`_ring_order` until a result is not ``throttled``.
-    Returns ``(order, vendor, result, exhausted)``; ``order`` is empty (result None)
-    when every vendor is pinned paid."""
+def _walk_ring(name: str, kind: str, call, throttled, empty_result=None) -> tuple:
+    """Call each vendor from :func:`_ring_order` until a result is not ``throttled``
+    (and not ``empty_result`` if provided). Returns ``(order, vendor, result, exhausted)``."""
     order = _ring_order(name)
     vendor, result = None, None
+    last_vendor, last_result = None, None
     for i, vendor in enumerate(order):
         result = call(vendor)
-        if not throttled(result):
-            return order, vendor, result, False
-        if i + 1 < len(order):
-            logger.info("keyless %s %s unavailable; failing over to %s", vendor, kind, order[i + 1])
+        if throttled(result):
+            _mark_vendor_cooldown(vendor)
+            if i + 1 < len(order):
+                logger.info("keyless %s %s unavailable; failing over to %s", vendor, kind, order[i + 1])
+            continue
+        if empty_result is not None and empty_result(result):
+            last_vendor, last_result = vendor, result
+            if i + 1 < len(order):
+                logger.info("keyless %s %s returned 0 results; trying %s", vendor, kind, order[i + 1])
+            continue
+        if last_result is not None and isinstance(result, dict) and not result.get("success"):
+            continue
+        return order, vendor, result, False
+    if last_result is not None:
+        return order, last_vendor, last_result, False
     return order, vendor, result, True
 
 
 def search_with_failover(name: str, query: str, limit: int = 5) -> dict[str, Any]:
-    """Rate limits and vendor refusals (HTTP 401/402/403/5xx) advance to the next
-    vendor, other errors stop the walk (a malformed query fails everywhere).
+    """Rate limits, vendor refusals (HTTP 401/402/403/5xx), and wrapped MCP/transport
+    errors advance to the next vendor (and cool down the failing vendor for 300s);
+    0-result successes try the next vendor without cooling down.
     ``data.served_by`` is set when the serving vendor differs from *name*."""
 
     def _throttled(result: dict[str, Any]) -> bool:
-        return not result.get("success") and _is_search_failover_eligible(result.get("error", ""))
+        return not result.get("success") and _is_failover_eligible_error(result.get("error", ""))
 
-    order, vendor, result, exhausted = _walk_ring(name, "search", lambda v: _KEYLESS_SEARCHERS[v](query, limit), _throttled)
+    def _empty(result: dict[str, Any]) -> bool:
+        data = result.get("data") or {}
+        return bool(result.get("success")) and not (data.get("web") or data.get("results"))
+
+    order, vendor, result, exhausted = _walk_ring(
+        name, "search", lambda v: _KEYLESS_SEARCHERS[v](query, limit), _throttled, empty_result=_empty
+    )
     if not order:
+        if any(provider_tier(v) != "paid" for v in _KEYLESS_RING):
+            return search_fail(_ALL_COOLDOWN_MSG)
         return search_fail(_ALL_PAID_MSG)
     if exhausted:
         result["error"] = f"{result.get('error', '')} (all keyless vendors unavailable: {', '.join(order)})"
@@ -436,17 +519,20 @@ def search_with_failover(name: str, query: str, limit: int = 5) -> dict[str, Any
 
 def extract_with_failover(name: str, urls: list[str]) -> list[dict[str, Any]]:
     """Advances to the next ring vendor only when EVERY url in a batch comes
-    back with a rate-limit-shaped error — partial failures and HTTP 403s can
-    be page problems, not provider throttling, and return as-is. A target's own
-    ``HTTP 429 from origin`` is the page's answer, not the vendor's quota."""
+    back with a rate-limit-shaped or wrapped MCP/transport error — partial failures
+    and HTTP 403s can be page problems, not provider throttling, and return as-is.
+    A target's own ``HTTP 429 from origin`` is the page's answer, not the vendor's quota."""
 
     def _throttled(error: str) -> bool:
-        return bool(error) and not is_origin_http_error(error) and _is_rate_limitish(error)
+        return bool(error) and not is_origin_http_error(error) and (
+            _is_rate_limitish(error) or bool(_WRAPPED_MCP_OR_TRANSPORT_RE.match(error))
+        )
 
     def _all_throttled(results: list[dict[str, Any]]) -> bool:
         return bool(results) and all(_throttled(r.get("error", "")) for r in results)
 
     order, _vendor, results, _exhausted = _walk_ring(name, "extract", lambda v: _KEYLESS_EXTRACTORS[v](list(urls)), _all_throttled)
     if not order:
-        return [_page_error(u, _ALL_PAID_MSG) for u in urls]
+        msg = _ALL_COOLDOWN_MSG if any(provider_tier(v) != "paid" for v in _KEYLESS_RING) else _ALL_PAID_MSG
+        return [_page_error(u, msg) for u in urls]
     return results
