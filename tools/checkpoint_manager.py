@@ -1065,6 +1065,10 @@ class CheckpointManager:
             logger.debug("Checkpoint skipped: directory too broad (%s)", abs_dir)
             return False
 
+        if not Path(abs_dir).is_dir():
+            logger.debug("Checkpoint skipped: working directory does not exist (%s)", abs_dir)
+            return False
+
         if abs_dir in self._checkpointed_dirs:
             return False
 
@@ -1556,6 +1560,11 @@ class CheckpointManager:
 
     def _take(self, working_dir: str, reason: str, *, prune: bool = True) -> bool:
         """Take a snapshot.  Returns True on success."""
+        abs_dir = str(_normalize_path(working_dir))
+        if not Path(abs_dir).is_dir():
+            logger.debug("Checkpoint skipped: working directory does not exist (%s)", abs_dir)
+            return False
+
         store = _store_path()
 
         err = _init_store(store, working_dir)

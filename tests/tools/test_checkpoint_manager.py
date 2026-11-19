@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import logging
 import os
 import shutil
 import subprocess
@@ -159,6 +160,48 @@ class TestTakeCheckpoint:
         mgr.new_turn()
         (work_dir / "main.py").write_text("print('modified')\n")
         assert mgr.ensure_checkpoint(str(work_dir), "turn 2") is True
+
+    def test_missing_working_dir_skips_without_error_or_phantom_project(
+        self, mgr, checkpoint_base, tmp_path, caplog,
+    ):
+        missing_dir = tmp_path / "does-not-exist" / "nested"
+        with caplog.at_level(logging.ERROR, logger="tools.checkpoint_manager"):
+            assert mgr.ensure_checkpoint(str(missing_dir), "before write_file") is False
+            assert mgr._take(str(missing_dir), "direct take") is False
+
+        assert [r for r in caplog.records if r.levelno >= logging.ERROR] == []
+        assert str(missing_dir.resolve()) not in mgr._checkpointed_dirs
+        projects_dir = _store_path(checkpoint_base) / "projects"
+        assert not projects_dir.exists() or list(projects_dir.glob("*.json")) == []
+
+    def test_missing_working_dir_checkpoints_after_creation_in_same_turn(
+        self, mgr, checkpoint_base, tmp_path, caplog,
+    ):
+        new_dir = tmp_path / "created-later"
+        with caplog.at_level(logging.ERROR, logger="tools.checkpoint_manager"):
+            assert mgr.ensure_checkpoint(str(new_dir), "before write_file") is False
+            new_dir.mkdir()
+            (new_dir / "state.json").write_text('{"ok": true}\n')
+            assert mgr.ensure_checkpoint(str(new_dir), "after mkdir") is True
+
+        assert [r for r in caplog.records if r.levelno >= logging.ERROR] == []
+        cps = mgr.list_checkpoints(str(new_dir))
+        assert len(cps) == 1
+        assert cps[0]["reason"] == "after mkdir"
+
+    def test_file_path_as_working_dir_skips_without_error_or_phantom_project(
+        self, mgr, checkpoint_base, tmp_path, caplog,
+    ):
+        file_path = tmp_path / "not-a-dir.txt"
+        file_path.write_text("hello\n")
+        with caplog.at_level(logging.ERROR, logger="tools.checkpoint_manager"):
+            assert mgr.ensure_checkpoint(str(file_path), "file") is False
+            assert mgr._take(str(file_path), "direct file") is False
+
+        assert [r for r in caplog.records if r.levelno >= logging.ERROR] == []
+        assert str(file_path.resolve()) not in mgr._checkpointed_dirs
+        projects_dir = _store_path(checkpoint_base) / "projects"
+        assert not projects_dir.exists() or list(projects_dir.glob("*.json")) == []
 
 
 # =========================================================================
