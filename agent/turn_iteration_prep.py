@@ -60,9 +60,18 @@ def _maybe_inject_iteration_budget_warning(agent: Any, messages: Any) -> bool:
         and is_dispatcher_owned_worker_context()
         and "kanban_complete" in getattr(agent, "valid_tool_names", ())
     )
+    is_subagent = (
+        getattr(agent, "platform", None) == "subagent"
+        or bool(getattr(agent, "side_agent", False))
+        or getattr(agent, "_delegate_depth", 0) > 0
+    )
+    budget = getattr(agent, "iteration_budget", None)
     if ratio is None and kanban_worker:
         ratio = 0.9
-    budget = getattr(agent, "iteration_budget", None)
+    elif ratio is None and budget is not None and 1 < budget.max_total < sys.maxsize and (is_subagent or budget.max_total <= 50):
+        lead = min(5, max(3, budget.max_total // 4))
+        threshold = max(1, budget.max_total - lead)
+        ratio = threshold / budget.max_total
     if (
         ratio is None
         or budget is None

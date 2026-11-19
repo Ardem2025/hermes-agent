@@ -11,6 +11,7 @@ the delegation call and the summary result, never the child's intermediate
 tool calls or reasoning.
 """
 
+import json
 import logging
 import time
 import weakref
@@ -615,6 +616,33 @@ def delegate_task(
         )
     max_children = _get_max_concurrent_children()
     task_list, err = _normalize_task_list(goal, context, tasks, output_schema, top_role, max_children)
+    if not err:
+        from tools.delegate_tool_registry import _find_active_duplicate_subagent
+        dup_matches = [(t, _find_active_duplicate_subagent(parent_agent, t.get("goal"))) for t in task_list]
+        if dup_matches and all(dup is not None for _, dup in dup_matches):
+            dups = [dup for _, dup in dup_matches]
+            sids = [d["subagent_id"] for d in dups if d.get("subagent_id")]
+            transcripts = [d["live_transcript"] for d in dups if d.get("live_transcript")]
+            payload: dict[str, Any] = {
+                "status": "dispatched",
+                "mode": "background",
+                "deduplicated": True,
+                "count": len(dups),
+                "delegation_id": dups[0].get("delegation_id"),
+                "subagent_ids": sids,
+                "goals": [t["goal"] for t in task_list],
+                "note": (
+                    "Active subagent(s) with the same goal are already running in this session; "
+                    "returning existing subagent(s) instead of spawning duplicates."
+                ),
+            }
+            if len(dups) == 1:
+                payload["subagent_id"] = dups[0].get("subagent_id")
+            if transcripts:
+                payload["live_transcripts"] = transcripts
+            return json.dumps(payload, ensure_ascii=False)
+        if any(dup is not None for _, dup in dup_matches):
+            task_list = [t for t, dup in dup_matches if dup is None]
     if not err:
         task_schemas, err = _coerce_task_schemas(task_list, output_schema)
     if not err:

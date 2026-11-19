@@ -234,6 +234,38 @@ def _owns_subagent_record(record: dict[str, Any], parent_agent: Any) -> bool:
     # Compression rotation on either side: compare lineage tips.
     return _resolve_session_lineage(owner_sid, parent_agent) in {parent_sid, _resolve_session_lineage(parent_sid, parent_agent)}
 
+def _normalize_goal_key(goal: Any) -> str:
+    return " ".join(str(goal or "").split()).strip().lower()
+
+
+def _find_active_duplicate_subagent(parent_agent: Any, goal: Any) -> Optional[dict[str, Any]]:
+    """Return metadata for an already-running owned subagent with the same normalized goal, else None."""
+    norm_goal = _normalize_goal_key(goal)
+    if not norm_goal or parent_agent is None:
+        return None
+    with _active_subagents_lock:
+        records = list(_active_subagents.values())
+    for r in records:
+        if r.get("status") not in (None, "running"):
+            continue
+        agent = r.get("agent")
+        if getattr(agent, "_interrupt_requested", False):
+            continue
+        if not _owns_subagent_record(r, parent_agent):
+            continue
+        if _normalize_goal_key(r.get("goal")) == norm_goal:
+            started = r.get("started_at")
+            return {
+                "subagent_id": r.get("subagent_id"),
+                "delegation_id": r.get("delegation_id"),
+                "goal": r.get("goal"),
+                "status": r.get("status") or "running",
+                "elapsed_seconds": round(time.time() - started, 1) if isinstance(started, (int, float)) else None,
+                "live_transcript": getattr(agent, "_live_transcript_path", None),
+            }
+    return None
+
+
 def _list_payload(parent_agent: Any) -> dict[str, Any]:
     with _active_subagents_lock:
         records = list(_active_subagents.values())
@@ -242,13 +274,16 @@ def _list_payload(parent_agent: Any) -> dict[str, Any]:
         if not _owns_subagent_record(r, parent_agent):
             continue
         started = r.get("started_at")
+        elapsed = round(time.time() - started, 1) if isinstance(started, (int, float)) else None
         entries.append({
             "subagent_id": r.get("subagent_id"),
+            "delegation_id": r.get("delegation_id"),
             "parent_id": r.get("parent_id"),
             "goal": r.get("goal"),
             "model": r.get("model"),
             "status": r.get("status"),
-            "running_seconds": round(time.time() - started, 1) if isinstance(started, (int, float)) else None,
+            "running_seconds": elapsed,
+            "elapsed_seconds": elapsed,
             "accepting_steer": bool(r.get("accepting_steer", False)),
             "live_transcript": getattr(r.get("agent"), "_live_transcript_path", None),
         })

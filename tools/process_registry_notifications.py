@@ -216,13 +216,28 @@ def _format_batch_delegation(evt: dict, deleg_id: str, completed_at: float) -> s
     n, n_unit = len(goals) or len(results), len(results) or len(goals)
     group = evt.get("group")
     unit = f"group '{group}' ({n_unit} subagent(s))" if group is not None else f"{n_unit} subagent(s)"
+    batch_status = evt.get("status")
+    all_interrupted = batch_status == "interrupted" or (
+        bool(results) and all(r.get("status") == "interrupted" for r in results)
+    )
+    if all_interrupted:
+        batch_title = f"[ASYNC DELEGATION BATCH STOPPED BY PARENT — {deleg_id}]"
+        batch_intro = (
+            f"A background fan-out unit you dispatched earlier — {unit} — was stopped before completing; "
+            "any partial results are below."
+        )
+    else:
+        batch_title = f"[ASYNC DELEGATION BATCH COMPLETE — {deleg_id}]"
+        batch_intro = (
+            f"A background fan-out unit you dispatched earlier — {unit} — has finished; its consolidated results are "
+            "below. Any other units from the same delegate_task call report separately as they finish. You may have "
+            "moved on since dispatching — act on these or re-dispatch if things have changed. If you are still waiting "
+            "on siblings, end your turn after acting on this one."
+        )
     lines = _preamble(
         evt,
-        f"[ASYNC DELEGATION BATCH COMPLETE — {deleg_id}]",
-        f"A background fan-out unit you dispatched earlier — {unit} — has finished; its consolidated results are "
-        "below. Any other units from the same delegate_task call report separately as they finish. You may have "
-        "moved on since dispatching — act on these or re-dispatch if things have changed. If you are still waiting "
-        "on siblings, end your turn after acting on this one.",
+        batch_title,
+        batch_intro,
         completed_at, with_goal=False)
     lines[-1] += f"   Total duration: {evt.get('total_duration_seconds', evt.get('duration_seconds', '?'))}s"
     lines += _recovery_lines(evt)
@@ -289,12 +304,23 @@ def _format_async_delegation(evt: dict) -> str:
         return _format_batch_delegation(evt, deleg_id, completed_at)
     status, summary, error = evt.get("status") or "completed", evt.get("summary"), evt.get("error")
     truncated = _is_truncated(evt)
+    if status == "interrupted":
+        title = f"[ASYNC DELEGATION STOPPED BY PARENT — {deleg_id}]"
+        intro = (
+            "A background subagent you dispatched earlier was stopped before completing. "
+            "Any partial output is below."
+        )
+    else:
+        title = f"[ASYNC DELEGATION COMPLETE — {deleg_id}]"
+        intro = (
+            "A background subagent you dispatched earlier has finished. You may "
+            "have moved on since dispatching it; the full task source is below so "
+            "you can act on the result or re-dispatch if things have changed."
+        )
     lines = _preamble(
         evt,
-        f"[ASYNC DELEGATION COMPLETE — {deleg_id}]",
-        "A background subagent you dispatched earlier has finished. You may "
-        "have moved on since dispatching it; the full task source is below so "
-        "you can act on the result or re-dispatch if things have changed.",
+        title,
+        intro,
         completed_at, with_goal=True)
     lines += _notice_lines([evt]) + [
         f"Status: {status}" + (f"   API calls: {evt['api_calls']}" if evt.get("api_calls") is not None else "")
