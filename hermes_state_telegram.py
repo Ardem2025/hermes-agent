@@ -429,52 +429,6 @@ class SessionTelegramTopicsMixin:
         """Remove one Telegram topic binding without touching its session transcript."""
         return bool(self.delete_telegram_topic_binding(chat_id=chat_id, thread_id=thread_id, profile_name=profile_name) > 0)
 
-    def set_telegram_topic_delivery_enabled(self, session_id: str, delivery_enabled: bool) -> bool:
-        """Update whether outbound delivery to Telegram is enabled for this session's topic."""
-        self.apply_telegram_topic_migration()
-        updated = False
-
-        def _do(conn):
-            nonlocal updated
-            try:
-                cursor = conn.execute(
-                    "UPDATE telegram_dm_topic_bindings SET delivery_enabled = ?, updated_at = ? WHERE session_id = ?",
-                    (1 if delivery_enabled else 0, time.time(), str(session_id)),
-                )
-                updated = bool(cursor.rowcount and cursor.rowcount > 0)
-            except sqlite3.OperationalError:
-                updated = False
-
-        self._execute_write(_do)
-        return updated
-
-    def advance_telegram_topic_sync_checkpoint(self, session_id: str, message_id: int) -> bool:
-        """Record delivery through one persisted message row, monotonically."""
-        self.apply_telegram_topic_migration()
-        updated = False
-
-        def _do(conn):
-            nonlocal updated
-            try:
-                cursor = conn.execute(
-                    "UPDATE telegram_dm_topic_bindings "
-                    "SET last_synced_message_id = CASE "
-                    "WHEN last_synced_message_id IS NULL OR last_synced_message_id < ? "
-                    "THEN ? ELSE last_synced_message_id END, updated_at = ? "
-                    "WHERE session_id = ?",
-                    (int(message_id), int(message_id), time.time(), str(session_id)),
-                )
-                updated = bool(cursor.rowcount and cursor.rowcount > 0)
-            except sqlite3.OperationalError:
-                updated = False
-
-        self._execute_write(_do)
-        return updated
-
-    def unbind_telegram_topic(self, *, chat_id: str, thread_id: str, profile_name: str = "default") -> bool:
-        """Remove one Telegram topic binding without touching its session transcript."""
-        return bool(self.delete_telegram_topic_binding(chat_id=chat_id, thread_id=thread_id, profile_name=profile_name) > 0)
-
     def is_telegram_session_linked_to_topic(self, *, session_id: str) -> bool:
         """True if the session is bound to any Telegram DM topic (absent tables → False)."""
         row = self._topic_read_one("""
