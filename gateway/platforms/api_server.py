@@ -4288,6 +4288,49 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 )
                 events.enqueue(event_name, {"message_id": message_id, "tool_name": tool_name, "preview": preview, "args": args})
             elif event_type in _subagent_pulse_events:
+                def _json_safe(val: Any) -> Any:
+                    if val is None or isinstance(val, (str, int, float, bool)):
+                        return val
+                    if isinstance(val, dict):
+                        return {str(k): _json_safe(v) for k, v in val.items()}
+                    if isinstance(val, (list, tuple)):
+                        return [_json_safe(v) for v in val]
+                    return str(val)
+
+                _subagent_event_map = {
+                    "subagent_start": "subagent.start",
+                    "subagent.start": "subagent.start",
+                    "subagent_progress": "subagent.progress",
+                    "subagent.progress": "subagent.progress",
+                    "subagent_complete": "subagent.complete",
+                    "subagent.complete": "subagent.complete",
+                }
+                normalized_event_name = _subagent_event_map.get(event_type, event_type)
+                args_dict = args if isinstance(args, dict) else {}
+                subagent_id = (
+                    kwargs.get("subagent_id")
+                    or args_dict.get("subagent_id")
+                    or (f"task_{kwargs['task_index']}" if kwargs.get("task_index") is not None else None)
+                )
+                default_status = "completed" if normalized_event_name == "subagent.complete" else "running"
+                subagent_payload: dict[str, Any] = {
+                    "message_id": message_id,
+                    "event_type": normalized_event_name,
+                    "subagent_id": _json_safe(subagent_id),
+                    "goal": _json_safe(
+                        kwargs.get("goal")
+                        or args_dict.get("goal")
+                        or (preview if normalized_event_name == "subagent.start" else None)
+                    ),
+                    "tool_name": _json_safe(tool_name or kwargs.get("tool_name") or kwargs.get("action")),
+                    "preview": _json_safe(preview or kwargs.get("summary") or kwargs.get("action")),
+                    "args": _json_safe(args),
+                    "status": _json_safe(kwargs.get("status") or default_status),
+                    "timestamp": time.time(),
+                }
+                if "task_index" in kwargs:
+                    subagent_payload["task_index"] = _json_safe(kwargs.get("task_index"))
+                events.enqueue(normalized_event_name, subagent_payload)
                 if not duplicate_to_telegram:
                     return
                 source_platform = kwargs.get("source_platform")
@@ -4322,9 +4365,12 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             try:
                 await queue.put(_event_payload("run.started", {
                     "user_message": {"role": "user", "content": user_message},
-                    "runtime": runtime_meta}))
+                    "runtime": runtime_meta,
+                    "timestamp": time.time()}))
                 self._set_run_status(run_id, "running", last_event="run.started")
-                await queue.put(_event_payload("message.started", {"message": {"id": message_id, "role": "assistant"}}))
+                await queue.put(_event_payload("message.started", {
+                    "message": {"id": message_id, "role": "assistant", "timestamp": time.time()},
+                    "timestamp": time.time()}))
                 history = await self._conversation_history_for_session(session_id)
                 result, usage = await self._run_agent(
                     conversation_history=history, stream_delta_callback=_delta,
@@ -4345,7 +4391,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 await mirror.send_final(final_response)
                 await queue.put(_event_payload("assistant.completed", {
                     "session_id": effective_session_id, "message_id": message_id,
-                    "content": final_response, **fields, "runtime": effective_runtime}))
+                    "content": final_response, **fields, "runtime": effective_runtime,
+                    "timestamp": time.time()}))
                 await queue.put(_event_payload(f"run.{status}", {
                     "session_id": effective_session_id, "message_id": message_id, **fields,
                     "messages": turn_messages, "usage": usage, "runtime": effective_runtime}))
