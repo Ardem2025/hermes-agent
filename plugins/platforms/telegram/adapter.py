@@ -2443,6 +2443,33 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
         self._persist_dm_topic_thread_id(chat_id_int, name, int(thread_id), replace_existing=force_create)
         return str(thread_id)
 
+    _RECENT_BOT_TOPIC_RENAMES_CAP = 256
+    _RECENT_BOT_TOPIC_RENAMES_TTL_SECONDS = 30.0
+
+    def _record_bot_topic_rename(self, chat_id: str, thread_id: str, title: str) -> None:
+        """Record a bot-initiated DM topic rename to suppress echo updates."""
+        store = self.__dict__.setdefault("_recent_bot_topic_renames", {})
+        now = time.monotonic()
+        ttl = self._RECENT_BOT_TOPIC_RENAMES_TTL_SECONDS
+        for stale in [k for k, ts in store.items() if now - ts > ttl]:
+            del store[stale]
+        key = (str(chat_id), str(thread_id), title)
+        if key not in store:
+            while len(store) >= self._RECENT_BOT_TOPIC_RENAMES_CAP:
+                del store[min(store, key=lambda k: store[k])]
+        store[key] = now
+
+    def _is_recent_bot_topic_rename(self, chat_id: str, thread_id: str, title: str) -> bool:
+        """Return True if (chat_id, thread_id, title) matches a recent bot-initiated rename."""
+        store = self.__dict__.get("_recent_bot_topic_renames")
+        if not store:
+            return False
+        now = time.monotonic()
+        ttl = self._RECENT_BOT_TOPIC_RENAMES_TTL_SECONDS
+        for stale in [k for k, ts in store.items() if now - ts > ttl]:
+            del store[stale]
+        return (str(chat_id), str(thread_id), title) in store
+
     async def rename_dm_topic(self, chat_id: int, thread_id: int, name: str) -> None:
         """Rename a forum topic in a private (DM) chat."""
         if not self._bot:
@@ -2452,6 +2479,9 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
         except (TypeError, ValueError):
             chat_id_arg = chat_id
         await self._bot.edit_forum_topic(chat_id=chat_id_arg, message_thread_id=int(thread_id), name=name)
+        sanitized_name = self._sanitize_topic_title_for_db(name)
+        if sanitized_name:
+            self._record_bot_topic_rename(str(chat_id), str(thread_id), sanitized_name)
         logger.info("[%s] Renamed DM topic in chat %s thread_id=%s -> '%s'", self.name, chat_id, thread_id, name)
 
     def _persist_dm_topic_thread_id(self, chat_id: int, topic_name: str, thread_id: int, replace_existing: bool = False) -> None:
@@ -6568,27 +6598,84 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
         msg = getattr(update, "effective_message", None)
         edited = getattr(msg, "forum_topic_edited", None) if msg is not None else None
         if msg is None or edited is None:
+            logger.info(
+                "[%s] Ignoring forum_topic_edited: reason=missing_msg_or_edited has_msg=%s has_edited=%s",
+                self.name, msg is not None, edited is not None,
+            )
             return
-        from_user = getattr(msg, "from_user", None)
-        if from_user is None or getattr(from_user, "is_bot", False) or self._is_own_message(msg):
-            return
-        if not self._is_user_authorized_from_message(msg):
-            self._log_blocked_user(msg, level=logging.DEBUG, what="unauthorized topic edit")
-            return
-        if self._chat_type_str(getattr(msg, "chat", None)) != "private":
-            return
-        thread_id = getattr(msg, "message_thread_id", None)
-        if thread_id is None:
-            return
-        new_name = self._sanitize_topic_title_for_db(getattr(edited, "name", None))
-        if not new_name:
-            return
+        chat = getattr(msg, "chat", None)
         chat_id_str = self._chat_id_str(msg)
+        chat_type = self._chat_type_str(chat)
+        thread_id = getattr(msg, "message_thread_id", None)
+        from_user = getattr(msg, "from_user", None)
+        from_user_id = getattr(from_user, "id", None) if from_user is not None else None
+        is_bot = bool(getattr(from_user, "is_bot", False)) if from_user is not None else None
+        raw_name = getattr(edited, "name", None)
+        logger.info(
+            "[%s] Received forum_topic_edited: chat_id=%s thread_id=%s chat_type=%s from_user_id=%s is_bot=%s raw_name=%r",
+            self.name, chat_id_str, thread_id, chat_type, from_user_id, is_bot, raw_name,
+        )
+        if self._is_own_message(msg):
+            logger.info(
+                "[%s] Ignoring forum_topic_edited: reason=own_bot_echo chat_id=%s thread_id=%s from_user_id=%s",
+                self.name, chat_id_str, thread_id, from_user_id,
+            )
+            return
+        if chat_type != "private":
+            logger.info(
+                "[%s] Ignoring forum_topic_edited: reason=non_private_chat chat_id=%s thread_id=%s chat_type=%s",
+                self.name, chat_id_str, thread_id, chat_type,
+            )
+            return
+        if from_user is not None:
+            authorized = self._is_user_authorized_from_message(msg)
+        elif chat_id_str:
+            from types import SimpleNamespace
+            auth_msg = SimpleNamespace(
+                from_user=SimpleNamespace(id=chat_id_str, is_bot=False, username=None, full_name=None),
+                chat=chat,
+                message_thread_id=thread_id,
+                is_topic_message=getattr(msg, "is_topic_message", False),
+                sender_chat=None,
+            )
+            authorized = self._is_user_authorized_from_message(auth_msg)
+        else:
+            authorized = False
+        if not authorized:
+            self._log_blocked_user(msg, level=logging.DEBUG, what="unauthorized topic edit")
+            logger.info(
+                "[%s] Ignoring forum_topic_edited: reason=unauthorized chat_id=%s thread_id=%s from_user_id=%s",
+                self.name, chat_id_str, thread_id, from_user_id,
+            )
+            return
+        if thread_id is None:
+            logger.info(
+                "[%s] Ignoring forum_topic_edited: reason=missing_thread_id chat_id=%s",
+                self.name, chat_id_str,
+            )
+            return
+        new_name = self._sanitize_topic_title_for_db(raw_name)
+        if not new_name:
+            logger.info(
+                "[%s] Ignoring forum_topic_edited: reason=empty_or_icon_only_name chat_id=%s thread_id=%s raw_name=%r",
+                self.name, chat_id_str, thread_id, raw_name,
+            )
+            return
         thread_id_str = str(thread_id)
+        if self._is_recent_bot_topic_rename(chat_id_str, thread_id_str, new_name):
+            logger.info(
+                "[%s] Ignoring forum_topic_edited: reason=bot_rename_echo chat_id=%s thread_id=%s new_name=%r",
+                self.name, chat_id_str, thread_id_str, new_name,
+            )
+            return
         db = getattr(getattr(self, "_session_store", None), "_db", None)
         if db is None:
             if (chat_id_str, thread_id_str) in self.__dict__.get("_created_topic_names", {}):
                 self._store_created_topic_name(chat_id_str, thread_id_str, new_name)
+            logger.info(
+                "[%s] Ignoring forum_topic_edited: reason=db_unavailable chat_id=%s thread_id=%s",
+                self.name, chat_id_str, thread_id_str,
+            )
             return
         profile_name = getattr(self, "_owner_profile", None) or getattr(self, "_hermes_profile_name", None) or "default"
         try:
@@ -6597,17 +6684,35 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
             )
         except Exception:
             logger.debug("[%s] Failed to look up topic binding on edit", self.name, exc_info=True)
+            logger.info(
+                "[%s] Ignoring forum_topic_edited: reason=binding_lookup_error chat_id=%s thread_id=%s",
+                self.name, chat_id_str, thread_id_str,
+            )
             return
         session_id = binding.get("session_id") if isinstance(binding, dict) else binding
         if not session_id:
             self._store_created_topic_name(chat_id_str, thread_id_str, new_name)
-            logger.debug(
-                "[%s] No binding for edited DM topic chat=%s thread=%s; cached pending name",
-                self.name, chat_id_str, thread_id_str,
+            logger.info(
+                "[%s] Ignoring forum_topic_edited: reason=no_binding_cached_pending chat_id=%s thread_id=%s new_name=%r",
+                self.name, chat_id_str, thread_id_str, new_name,
             )
             return
         self.__dict__.get("_created_topic_names", {}).pop((chat_id_str, thread_id_str), None)
+        current_title = None
+        get_title_fn = getattr(db, "get_session_title", None)
+        if callable(get_title_fn):
+            try:
+                current_title = get_title_fn(session_id)
+            except Exception:
+                current_title = None
+        if current_title == new_name:
+            logger.info(
+                "[%s] Ignoring forum_topic_edited: reason=unchanged_title chat_id=%s thread_id=%s session_id=%s title=%r",
+                self.name, chat_id_str, thread_id_str, session_id, new_name,
+            )
+            return
         self._apply_topic_title_to_session(db, session_id, new_name, thread_id_str)
+        cleared_keys = 0
         try:
             tid_int = int(thread_id_str)
         except (TypeError, ValueError):
@@ -6626,6 +6731,11 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
             ]
             for k in stale_keys:
                 self._dm_topics.pop(k, None)
+                cleared_keys += 1
+        logger.info(
+            "[%s] Synced forum_topic_edited to session: chat_id=%s thread_id=%s session_id=%s new_name=%r cleared_dm_topic_keys=%d",
+            self.name, chat_id_str, thread_id_str, session_id, new_name, cleared_keys,
+        )
 
     def _resolve_topic_binding(self, message: Message, chat_type: str, thread_id_str: Optional[str]) -> tuple:
         """Return ``(chat_topic, topic_skill)`` for a DM topic or bound forum topic (else Nones)."""
