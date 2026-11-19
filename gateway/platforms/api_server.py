@@ -4370,6 +4370,87 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         self._pulse_prefs()[session_id] = duplicate_to_telegram
         mirror = self._new_telegram_mirror(session_id=session_id, loop=loop, enabled=duplicate_to_telegram)
 
+        def _commentary(text: str, *, already_streamed: bool = False) -> None:
+            mirror.enqueue_commentary(text)
+
+        try:
+            history = await self._conversation_history_for_session(session_id)
+            result, usage = await self._run_agent(
+                conversation_history=history,
+                interim_assistant_callback=_commentary,
+                **ctx["run_kwargs"],
+            )
+            # One policy-gated re-run of a transiently failed turn — the peer-DM transport's half of the
+            # retry the local (``tools.bot_mode_dm``) and relayed (``tui_gateway.methods_bot_relay``)
+            # delivery lanes already apply (#93091 item 5, #115325). Same policy, same gate: transient
+            # classes (429 / 5xx) re-run the SAME session once, a context overflow lets the re-run's
+            # pre-API compaction shrink the transcript first, and auth/quota/config/model never re-run. The
+            # store is read again first: the failed attempt's turn-start persist left the DM as the
+            # transcript's unanswered tail row, and the re-run resumes that row instead of appending a
+            # second copy of it. A turn that fails again reaches the peer client exactly as before.
+            if result_retry_action(result) != RETRY_NONE:
+                history = await self._conversation_history_for_session(session_id)
+                result, usage = await self._run_agent(
+                    conversation_history=history,
+                    resume_unanswered_turn=True,
+                    interim_assistant_callback=_commentary,
+                    **ctx["run_kwargs"],
+                )
+        finally:
+            try:
+                await mirror.drain()
+            except Exception:
+                logger.debug("Telegram mirror drain failed in _handle_session_chat (non-fatal)", exc_info=True)
+        is_dict = isinstance(result, dict)
+        effective_session_id = result.get("session_id") if is_dict else session_id
+        final_response = _resolve_media_to_data_urls(
+            result.get("final_response", "") if is_dict else "")
+        await mirror.send_final(final_response)
+        headers = self._session_headers(effective_session_id or session_id, gateway_session_key)
+        return web.json_response(
+            {"object": "hermes.session.chat.completion", "status": _response_status(result),
+             "session_id": effective_session_id or session_id,
+             "message": {"role": "assistant", "content": final_response}, "usage": usage,
+             "runtime": self._effective_turn_runtime(ctx["runtime_request"], result, usage)},
+            headers=headers)
+
+    @_admit_api_agent_request
+    async def _handle_session_chat_stream(self, request: web.Request) -> web.StreamResponse:
+        """POST /api/sessions/{session_id}/chat/stream — SSE wrapper over _run_agent."""
+        limited = self._concurrency_limited_response()
+        if limited is not None:
+            return limited
+        ctx, err = await self._prepare_session_chat(request)
+        if err is not None:
+            return err
+        handed_off = await self._stream_through_live_bot_chat(request, ctx)
+        if handed_off is not None:
+            return handed_off
+        gateway_session_key, session_id = ctx["gateway_session_key"], ctx["session_id"]
+        from gateway.wake import reset_consecutive_auto_wakes
+        reset_consecutive_auto_wakes(session_id)
+        await asyncio.to_thread(self._mark_session_auto_resume, session_id)
+        ctx["run_kwargs"]["auto_resume_on_delegation"] = True
+        user_message, runtime_request = ctx["user_message"], ctx["runtime_request"]
+        runtime_meta = self._sanitize_runtime_metadata(
+            requested_runtime=runtime_request.get("requested"),
+            route_source=runtime_request.get("route_source") or "global",
+            model_lock=("accepted" if ctx["lock_active"] else ""))
+        message_id = f"msg_{uuid.uuid4().hex}"
+        run_id = f"run_{uuid.uuid4().hex}"
+        events = _SessionEventQueue(session_id, run_id)
+        queue, _event_payload = events.queue, events.payload
+        duplicate_to_telegram = bool(
+            ctx["body"].get("duplicate_to_telegram") if "duplicate_to_telegram" in ctx["body"] else self.is_telegram_bound(session_id)
+        )
+        preserve_on_disconnect = bool(
+            duplicate_to_telegram or self.is_telegram_bound(session_id) or ctx["body"].get("preserve_on_disconnect")
+        )
+        loop = asyncio.get_running_loop()
+        self._pulse_loop = loop
+        self._pulse_prefs()[session_id] = duplicate_to_telegram
+        mirror = self._new_telegram_mirror(session_id=session_id, loop=loop, enabled=duplicate_to_telegram)
+
         async def _finalize_pulse_ticker(fallback_status: str) -> None:
             entry = self._pulse_registry().get(session_id)
             if entry is None:
