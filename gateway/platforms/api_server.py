@@ -2931,7 +2931,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                             "status": rec.get("status", "running"),
                             "last_tool": rec.get("last_tool"),
                             "tool_count": rec.get("tool_count", 0),
-                            "running_seconds": round(time.time() - started, 1) if isinstance(started, (int, float)) else None,
+                            "started_at": started if isinstance(started, (int, float)) and not isinstance(started, bool) else None,
+                            "running_seconds": round(time.time() - started, 1) if isinstance(started, (int, float)) and not isinstance(started, bool) else None,
                         })
         except Exception as e:
             logger.debug("Failed to query live subagents for session %s: %s", session_id, e)
@@ -4102,8 +4103,10 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         _subagent_pulse_events = frozenset({
             "subagent.start",
             "subagent.progress",
+            "subagent.tool",
             "subagent.complete",
             "subagent_progress",
+            "subagent_tool",
         })
         _subagent_failure_statuses = ("failed", "error", "timeout", "cancelled")
         pulse_state: dict[str, Any] = {
@@ -4302,6 +4305,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                     "subagent.start": "subagent.start",
                     "subagent_progress": "subagent.progress",
                     "subagent.progress": "subagent.progress",
+                    "subagent_tool": "subagent.tool",
+                    "subagent.tool": "subagent.tool",
                     "subagent_complete": "subagent.complete",
                     "subagent.complete": "subagent.complete",
                 }
@@ -4312,6 +4317,39 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                     or args_dict.get("subagent_id")
                     or (f"task_{kwargs['task_index']}" if kwargs.get("task_index") is not None else None)
                 )
+                started_at = kwargs.get("started_at")
+                if not isinstance(started_at, (int, float)) or isinstance(started_at, bool):
+                    started_at = args_dict.get("started_at")
+                if not isinstance(started_at, (int, float)) or isinstance(started_at, bool):
+                    started_at = None
+                    try:
+                        from tools.delegate_tool_registry import _active_subagents, _active_subagents_lock
+                        task_idx = kwargs.get("task_index")
+                        with _active_subagents_lock:
+                            rec = _active_subagents.get(subagent_id) if subagent_id else None
+                            if rec is None:
+                                for cand in _active_subagents.values():
+                                    owner_sid = str(cand.get("owner_agent_session_id") or cand.get("owner_session_id") or "")
+                                    sid_match = bool(session_id) and (
+                                        owner_sid == session_id
+                                        or session_id in owner_sid
+                                        or (owner_sid and owner_sid in session_id)
+                                    )
+                                    if not sid_match:
+                                        continue
+                                    if subagent_id and cand.get("subagent_id") == subagent_id:
+                                        rec = cand
+                                        break
+                                    if task_idx is not None and cand.get("task_index") == task_idx:
+                                        rec = cand
+                                        break
+                            if rec is not None:
+                                cand_started = rec.get("started_at")
+                                if isinstance(cand_started, (int, float)) and not isinstance(cand_started, bool):
+                                    started_at = cand_started
+                    except Exception:
+                        pass
+                now_ts = time.time()
                 default_status = "completed" if normalized_event_name == "subagent.complete" else "running"
                 subagent_payload: dict[str, Any] = {
                     "message_id": message_id,
@@ -4326,8 +4364,13 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                     "preview": _json_safe(preview or kwargs.get("summary") or kwargs.get("action")),
                     "args": _json_safe(args),
                     "status": _json_safe(kwargs.get("status") or default_status),
-                    "timestamp": time.time(),
+                    "timestamp": now_ts,
                 }
+                if isinstance(started_at, (int, float)) and not isinstance(started_at, bool):
+                    subagent_payload["started_at"] = float(started_at)
+                    subagent_payload["running_seconds"] = round(max(0.0, now_ts - float(started_at)), 1)
+                elif isinstance(kwargs.get("running_seconds"), (int, float)) and not isinstance(kwargs.get("running_seconds"), bool):
+                    subagent_payload["running_seconds"] = round(max(0.0, float(kwargs["running_seconds"])), 1)
                 if "task_index" in kwargs:
                     subagent_payload["task_index"] = _json_safe(kwargs.get("task_index"))
                 events.enqueue(normalized_event_name, subagent_payload)
