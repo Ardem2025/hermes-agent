@@ -1,78 +1,3 @@
-
-def _transform_media_paths(text: str) -> str:
-    """Transform MEDIA:/path/to/file or Markdown images to /api/media/{filename} links.
-    Copies files outside .hermes/media into .hermes/media directory.
-    """
-    if not text or not isinstance(text, str):
-        return text
-
-    try:
-        try:
-            from hermes_cli.config import get_hermes_home
-            media_dir = Path(get_hermes_home()) / "media"
-        except Exception:
-            media_dir = Path(os.path.expanduser("~/.hermes/media"))
-
-        try:
-            media_dir.mkdir(parents=True, exist_ok=True)
-        except Exception:
-            pass
-
-        def _replace_media_prefix(match):
-            try:
-                raw_path = match.group(1).strip()
-                filename = os.path.basename(raw_path)
-                src_file = Path(raw_path)
-                dest_file = media_dir / filename
-                try:
-                    if src_file.is_file() and src_file.resolve() != dest_file.resolve():
-                        try:
-                            import shutil
-                            shutil.copy2(src_file, dest_file)
-                        except (OSError, PermissionError) as e:
-                            logger.debug("Failed to copy media file %s to %s: %s", src_file, dest_file, e)
-                except Exception as e:
-                    logger.debug("Error checking media path %s: %s", src_file, e)
-                return f"/api/media/{filename}"
-            except Exception as e:
-                logger.debug("Error in _replace_media_prefix: %s", e)
-                return match.group(0)
-
-        # 1. Match MEDIA:/path or MEDIA:path
-        text = re.sub(r'MEDIA:([^\s\)\]]+)', _replace_media_prefix, text)
-
-        # 2. Match markdown images ![alt](/local/path) -> ![alt](/api/media/filename)
-        def _replace_md_image(match):
-            try:
-                alt = match.group(1)
-                img_path = match.group(2).strip()
-                if img_path.startswith("http://") or img_path.startswith("https://") or img_path.startswith("data:"):
-                    return match.group(0)
-                if img_path.startswith("/api/media/"):
-                    return match.group(0)
-                filename = os.path.basename(img_path)
-                src_file = Path(img_path)
-                dest_file = media_dir / filename
-                try:
-                    if src_file.is_file() and src_file.resolve() != dest_file.resolve():
-                        try:
-                            import shutil
-                            shutil.copy2(src_file, dest_file)
-                        except (OSError, PermissionError) as e:
-                            logger.debug("Failed to copy image %s to %s: %s", src_file, dest_file, e)
-                except Exception as e:
-                    logger.debug("Error checking image path %s: %s", src_file, e)
-                return f"![{alt}](/api/media/{filename})"
-            except Exception as e:
-                logger.debug("Error in _replace_md_image: %s", e)
-                return match.group(0)
-
-        text = re.sub(r'!\[([^\]]*)\]\(([^\)]+)\)', _replace_md_image, text)
-    except Exception as e:
-        logger.debug("Error transforming media paths: %s", e)
-
-    return text
-
 """OpenAI-compatible API server platform adapter (aiohttp).
 
 Serves /v1/chat/completions, /v1/responses, /v1/models, /v1/capabilities, /api/sessions,
@@ -101,6 +26,156 @@ from datetime import datetime, timezone, UTC
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
+
+MEDIA_URL_TTL_SECONDS = 86400
+MAX_UPLOAD_BYTES = 20 * 1024 * 1024
+
+
+class _UploadTooLargeError(Exception):
+    """Raised when a streaming multipart upload exceeds MAX_UPLOAD_BYTES."""
+
+
+def _get_hermes_home_path() -> Path:
+    try:
+        from hermes_cli.config import get_hermes_home
+        return Path(get_hermes_home())
+    except Exception:
+        return Path(os.path.expanduser("~/.hermes"))
+
+
+def _allowed_media_dirs(hermes_home: Optional[Path] = None) -> list[Path]:
+    home = hermes_home or _get_hermes_home_path()
+    return [
+        home / "image_cache",
+        home / "cache" / "images",
+        home / "media",
+        home / "audio_cache",
+    ]
+
+
+def _is_safe_media_filename(filename: str) -> bool:
+    if not filename or filename in (".", ".."):
+        return False
+    if "/" in filename or "\\" in filename or ".." in filename or "\x00" in filename:
+        return False
+    if filename.startswith("."):
+        return False
+    return True
+
+
+def _sanitize_upload_filename(raw_name: Optional[str]) -> str:
+    base = os.path.basename((raw_name or "").strip())
+    if not base or base in (".", "..") or base.startswith("."):
+        ext = ""
+        if base and base not in (".", "..") and "." in base[1:]:
+            candidate_ext = Path(base).suffix
+            if re.fullmatch(r"\.[A-Za-z0-9]{1,16}", candidate_ext):
+                ext = candidate_ext
+        return f"upload_{uuid.uuid4().hex[:8]}{ext}"
+    cleaned = re.sub(r"[^A-Za-z0-9._-]", "_", base).lstrip(".")
+    if not cleaned or cleaned in (".", ".."):
+        ext = Path(base).suffix
+        if not re.fullmatch(r"\.[A-Za-z0-9]{1,16}", ext):
+            ext = ""
+        return f"upload_{uuid.uuid4().hex[:8]}{ext}"
+    return cleaned
+
+
+def _compute_media_hmac(filename: str, exp: int, api_key: str) -> str:
+    msg = f"{filename}:{exp}".encode("utf-8")
+    return hmac.new(api_key.encode("utf-8"), msg, hashlib.sha256).hexdigest()
+
+
+def _sign_media_url(filename: str, api_key: Optional[str] = None, *, ttl: int = MEDIA_URL_TTL_SECONDS) -> str:
+    base = f"/api/media/{filename}"
+    key = api_key if api_key is not None else os.environ.get("API_SERVER_KEY", "")
+    if not key:
+        return base
+    exp = int(time.time()) + ttl
+    sig = _compute_media_hmac(filename, exp, key)
+    return f"{base}?exp={exp}&sig={sig}"
+
+
+def _transform_media_paths(text: str, api_key: Optional[str] = None) -> str:
+    """Transform MEDIA:/path/to/file or Markdown images to /api/media/{filename} links.
+    Only files inside allowlisted hermes_home media directories are copied/linked.
+    """
+    if not text or not isinstance(text, str):
+        return text
+
+    try:
+        hermes_home = _get_hermes_home_path()
+        allowed_dirs = [d.resolve() for d in _allowed_media_dirs(hermes_home)]
+        media_dir = hermes_home / "media"
+        try:
+            media_dir.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+        resolved_media_dir = media_dir.resolve()
+        resolved_key = api_key if api_key is not None else os.environ.get("API_SERVER_KEY", "")
+
+        def _copy_if_allowed(raw_path: str) -> Optional[str]:
+            src_file = Path(raw_path)
+            try:
+                resolved_src = src_file.resolve()
+            except OSError:
+                return None
+            if not resolved_src.is_file():
+                return None
+            if not any(resolved_src.is_relative_to(d) for d in allowed_dirs):
+                return None
+            filename = resolved_src.name
+            if not _is_safe_media_filename(filename):
+                return None
+            dest_file = media_dir / filename
+            try:
+                resolved_dest = dest_file.resolve()
+                if not resolved_dest.is_relative_to(resolved_media_dir):
+                    return None
+                if resolved_src != resolved_dest:
+                    import shutil
+                    shutil.copy2(resolved_src, dest_file)
+            except (OSError, PermissionError) as e:
+                logger.debug("Failed to copy media file %s to %s: %s", src_file, dest_file, e)
+                return None
+            return filename
+
+        def _replace_media_prefix(match):
+            try:
+                raw_path = match.group(1).strip()
+                filename = _copy_if_allowed(raw_path)
+                if not filename:
+                    return match.group(0)
+                return _sign_media_url(filename, api_key=resolved_key)
+            except Exception as e:
+                logger.debug("Error in _replace_media_prefix: %s", e)
+                return match.group(0)
+
+        # 1. Match MEDIA:/path or MEDIA:path
+        text = re.sub(r'MEDIA:([^\s\)\]]+)', _replace_media_prefix, text)
+
+        # 2. Match markdown images ![alt](/local/path) -> ![alt](/api/media/filename)
+        def _replace_md_image(match):
+            try:
+                alt = match.group(1)
+                img_path = match.group(2).strip()
+                if img_path.startswith("http://") or img_path.startswith("https://") or img_path.startswith("data:"):
+                    return match.group(0)
+                if img_path.startswith("/api/media/"):
+                    return match.group(0)
+                filename = _copy_if_allowed(img_path)
+                if not filename:
+                    return match.group(0)
+                return f"![{alt}]({_sign_media_url(filename, api_key=resolved_key)})"
+            except Exception as e:
+                logger.debug("Error in _replace_md_image: %s", e)
+                return match.group(0)
+
+        text = re.sub(r'!\[([^\]]*)\]\(([^\)]+)\)', _replace_md_image, text)
+    except Exception as e:
+        logger.debug("Error transforming media paths: %s", e)
+
+    return text
 
 # _resolve_request_profile result for a /p/<profile>/ prefix this gateway does not serve (-> 404);
 # distinct from None (no prefix / multiplexing off -> default profile).
@@ -746,7 +821,8 @@ if AIOHTTP_AVAILABLE:
             cl = request.headers.get("Content-Length")
             if cl is not None:
                 try:
-                    if int(cl) > MAX_REQUEST_BYTES:
+                    limit = MAX_UPLOAD_BYTES if request.path.endswith("/api/files/upload") else MAX_REQUEST_BYTES
+                    if int(cl) > limit:
                         return _error_response("Request body too large.", 413, code="body_too_large")
                 except ValueError:
                     return _error_response("Invalid Content-Length header.", 400, code="invalid_content_length")
@@ -1136,47 +1212,56 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
     _handle_responses = _admit_api_agent_request(OpenAICompatRoutesMixin._handle_responses)
 
     
-    async def _handle_get_media(self, request: web.Request) -> web.Response:
-        """GET /api/media/{filename} — serve media files from configured directories."""
+    def _verify_media_auth(self, request: web.Request, filename: str) -> Optional[web.Response]:
+        """Authorize GET /api/media/{filename} via Bearer token or HMAC-SHA256 query token."""
+        auth_err = self._check_auth(request)
+        if auth_err is None:
+            return None
+        expected_key = self._expected_api_key()
+        if not expected_key:
+            return auth_err
+        exp_raw = request.query.get("exp", "")
+        sig = request.query.get("sig", "")
+        if not exp_raw or not sig:
+            return auth_err
         try:
-            filename = request.match_info.get("filename", "")
-            filename = os.path.basename(filename)
-            if not filename:
-                return web.json_response(_openai_error("Missing filename"), status=400)
+            exp = int(exp_raw)
+        except ValueError:
+            return auth_err
+        if exp < int(time.time()):
+            return auth_err
+        expected_sig = _compute_media_hmac(filename, exp, expected_key)
+        if hmac.compare_digest(sig.encode("utf-8"), expected_sig.encode("utf-8")):
+            return None
+        return auth_err
 
-            try:
-                from hermes_cli.config import get_hermes_home
-                hermes_home = Path(get_hermes_home())
-            except Exception:
-                hermes_home = Path(os.path.expanduser("~/.hermes"))
+    async def _handle_get_media(self, request: web.Request) -> web.Response:
+        """GET /api/media/{filename} — serve media files from allowlisted directories."""
+        try:
+            raw_filename = request.match_info.get("filename", "")
+            auth_err = self._verify_media_auth(request, raw_filename)
+            if auth_err is not None:
+                return auth_err
 
-            base_search_dirs = [
-                hermes_home / "image_cache",
-                hermes_home / "cache" / "images",
-                hermes_home / "media",
-                hermes_home / "audio_cache",
-                hermes_home / "sandbox",
-                Path("/tmp"),
-                Path(os.path.expanduser("~/sandbox")),
-                Path("sandbox"),
-            ]
+            if not _is_safe_media_filename(raw_filename):
+                return web.json_response(_openai_error("Invalid filename"), status=400)
+
+            hermes_home = _get_hermes_home_path()
+            base_search_dirs = _allowed_media_dirs(hermes_home)
 
             found_file = None
             for sdir in base_search_dirs:
-                candidate = sdir / filename
-                if candidate.is_file():
-                    found_file = candidate
+                resolved_dir = sdir.resolve()
+                candidate = sdir / raw_filename
+                try:
+                    resolved_candidate = candidate.resolve()
+                except OSError:
+                    continue
+                if not resolved_candidate.is_relative_to(resolved_dir):
+                    return web.json_response(_openai_error("Forbidden path"), status=403)
+                if resolved_candidate.is_file():
+                    found_file = resolved_candidate
                     break
-
-            if not found_file:
-                # Stem wildcard search
-                stem = Path(filename).stem
-                for sdir in base_search_dirs:
-                    if sdir.is_dir():
-                        matches = list(sdir.glob(f"{stem}.*"))
-                        if matches and matches[0].is_file():
-                            found_file = matches[0]
-                            break
 
             if not found_file:
                 return web.json_response(_openai_error("File not found", err_type="not_found_error"), status=404)
@@ -1195,44 +1280,89 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             logger.exception("Error serving media file: %s", e)
             return web.json_response(_openai_error(f"Internal error: {e}"), status=500)
 
+    @_require_auth
     async def _handle_post_file_upload(self, request: web.Request) -> web.Response:
         """POST /api/files/upload — upload files from WebUI."""
+        written_paths: list[Path] = []
         try:
-            try:
-                from hermes_cli.config import get_hermes_home
-                hermes_home = Path(get_hermes_home())
-            except Exception:
-                hermes_home = Path(os.path.expanduser("~/.hermes"))
+            cl = request.headers.get("Content-Length")
+            if cl is not None:
+                try:
+                    if int(cl) > MAX_UPLOAD_BYTES:
+                        return web.json_response(
+                            _openai_error("Uploaded file exceeds 20 MB limit", code="payload_too_large"),
+                            status=413,
+                        )
+                except ValueError:
+                    return web.json_response(_openai_error("Invalid Content-Length header"), status=400)
 
+            hermes_home = _get_hermes_home_path()
             upload_dir = hermes_home / "media"
             upload_dir.mkdir(parents=True, exist_ok=True)
+            resolved_upload_dir = upload_dir.resolve()
 
             reader = await request.multipart()
             uploaded_files = []
+            total_bytes = 0
+            api_key = self._expected_api_key()
             while True:
                 field = await reader.next()
                 if field is None:
                     break
                 if field.name in ("file", "files"):
-                    filename = os.path.basename(field.filename or f"upload_{uuid.uuid4().hex[:8]}")
+                    filename = _sanitize_upload_filename(field.filename)
                     dest = upload_dir / filename
-                    with open(dest, "wb") as f:
-                        while True:
-                            chunk = await field.read_chunk()
-                            if not chunk:
-                                break
-                            f.write(chunk)
+                    if not dest.resolve().is_relative_to(resolved_upload_dir):
+                        return web.json_response(_openai_error("Invalid upload filename"), status=400)
+                    if dest.exists() or dest.is_symlink():
+                        stem = Path(filename).stem
+                        ext = Path(filename).suffix
+                        filename = f"{stem}_{uuid.uuid4().hex[:8]}{ext}"
+                        dest = upload_dir / filename
+                        if not dest.resolve().is_relative_to(resolved_upload_dir):
+                            return web.json_response(_openai_error("Invalid upload filename"), status=400)
+
+                    file_bytes = 0
+                    try:
+                        with open(dest, "wb") as f:
+                            while True:
+                                chunk = await field.read_chunk()
+                                if not chunk:
+                                    break
+                                file_bytes += len(chunk)
+                                total_bytes += len(chunk)
+                                if file_bytes > MAX_UPLOAD_BYTES or total_bytes > MAX_UPLOAD_BYTES:
+                                    raise _UploadTooLargeError()
+                                f.write(chunk)
+                    except _UploadTooLargeError:
+                        with suppress(OSError):
+                            dest.unlink(missing_ok=True)
+                        for prev in written_paths:
+                            with suppress(OSError):
+                                prev.unlink(missing_ok=True)
+                        return web.json_response(
+                            _openai_error("Uploaded file exceeds 20 MB limit", code="payload_too_large"),
+                            status=413,
+                        )
+                    written_paths.append(dest)
                     try:
                         os.chmod(dest, 0o664)
                     except Exception:
                         pass
-                    uploaded_files.append({"filename": filename, "url": f"/api/media/{filename}", "path": str(dest)})
+                    uploaded_files.append({
+                        "filename": filename,
+                        "url": _sign_media_url(filename, api_key=api_key),
+                        "path": str(dest),
+                    })
 
             if not uploaded_files:
                 return web.json_response(_openai_error("No files uploaded"), status=400)
 
             return web.json_response({"files": uploaded_files, "status": "ok"})
         except Exception as e:
+            for prev in written_paths:
+                with suppress(OSError):
+                    prev.unlink(missing_ok=True)
             logger.exception("Error handling file upload: %s", e)
             return web.json_response(_openai_error(f"Upload error: {e}"), status=500)
 
@@ -3304,11 +3434,11 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                         sess_thread = str(origin_data.get("thread_id") or "").strip()
                     except Exception:
                         pass
-            chat_id = str(sess_dict.get("user_id") or getattr(self, "home_chat_id", "") or "139351986").strip()
+            chat_id = str(sess_dict.get("user_id") or sess_dict.get("chat_id") or getattr(self, "home_chat_id", "") or "").strip()
 
             if is_ended:
                 rebound_to_sid = None
-                if sess_thread and hasattr(db, "get_telegram_topic_binding"):
+                if chat_id and sess_thread and hasattr(db, "get_telegram_topic_binding"):
                     try:
                         curr_b = await asyncio.to_thread(db.get_telegram_topic_binding, chat_id=chat_id, thread_id=sess_thread)
                         if curr_b and curr_b.get("session_id") != session_id:
@@ -3326,7 +3456,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 ))
 
             if not binding:
-                if sess_thread and hasattr(db, "bind_telegram_topic"):
+                if chat_id and sess_thread and hasattr(db, "bind_telegram_topic"):
                     try:
                         uid = chat_id
                         runner, _ = self._telegram_runner_and_adapter()
@@ -3368,7 +3498,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             body, err = await self._read_json_body(request)
             if err:
                 return err
-            chat_id = str(body.get("chat_id") or body.get("telegram_chat_id") or session.get("user_id") or session.get("chat_id") or getattr(self, "home_chat_id", "") or "139351986").strip()
+            chat_id = str(body.get("chat_id") or body.get("telegram_chat_id") or session.get("user_id") or session.get("chat_id") or getattr(self, "home_chat_id", "") or "").strip()
             thread_id = str(body.get("thread_id") or "").strip()
             topic_name = str(body.get("topic_name") or session.get("title") or f"Hermes {session_id[:24]}").strip()
             delivery_enabled = bool(body.get("delivery_enabled", True))
