@@ -1495,6 +1495,36 @@ class SessionSessionsMixin:
             )
         return statuses
 
+    def session_last_messages(self, session_ids: list[str]) -> dict[str, dict[str, Any]]:
+        """``{session_id: {id, role, content, has_tool_calls, finish_reason, timestamp}}``
+        from each session's LAST message row; one query, MAX(id) per session joined back."""
+        ids = [sid for sid in (session_ids or []) if sid]
+        if not ids:
+            return {}
+        rows = self._read_all(f"""
+            SELECT m.session_id, m.id, m.role, m.content,
+                   m.tool_calls IS NOT NULL AS has_tool_calls,
+                   m.finish_reason, m.timestamp
+            FROM messages m
+            JOIN (
+                SELECT session_id, MAX(id) AS max_id
+                FROM messages
+                WHERE session_id IN ({_session_ids_placeholders(ids)})
+                GROUP BY session_id
+            ) latest ON m.id = latest.max_id
+        """, ids)
+        result: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            result[row["session_id"]] = {
+                "id": row["id"],
+                "role": row["role"],
+                "content": row["content"],
+                "has_tool_calls": bool(row["has_tool_calls"]),
+                "finish_reason": row["finish_reason"],
+                "timestamp": row["timestamp"],
+            }
+        return result
+
     def assert_export_safe(self, session_id: str, max_messages: Optional[int] = None) -> int:
         """Row count of this segment — every row, archived included, as the transfer export materializes
         it — or raise SessionExportTooLargeError (the LIMITed subquery

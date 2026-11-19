@@ -7,6 +7,7 @@ OpenAI-compatible frontend connects at http://localhost:8642/v1 with API_SERVER_
 """
 
 import asyncio
+import base64
 import errno
 import hashlib
 import hmac
@@ -14,10 +15,11 @@ import itertools
 import json
 from contextlib import contextmanager, nullcontext, suppress
 from contextvars import ContextVar, copy_context
-from functools import wraps
+from functools import partial, wraps
 import logging
 import os
 import re
+import secrets
 import sys
 import threading
 import time
@@ -25,6 +27,7 @@ import uuid
 from datetime import datetime, timezone, UTC
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
 MEDIA_URL_TTL_SECONDS = 86400
@@ -94,6 +97,160 @@ def _sign_media_url(filename: str, api_key: Optional[str] = None, *, ttl: int = 
     exp = int(time.time()) + ttl
     sig = _compute_media_hmac(filename, exp, key)
     return f"{base}?exp={exp}&sig={sig}"
+
+
+_PROCESS_MEDIA_REF_SECRET = secrets.token_hex(32)
+_MEDIA_FALLBACK_RE = re.compile(
+    r"""[`"'*_]{0,3}MEDIA:\s*(?P<path>`[^`\n]+?`|"[^"\n]+?"|'[^'\n]+?'|(?:~/|/|[A-Za-z]:[/\\])[^\s`"'<>)\]]+)[`"'*_]{0,3}"""
+)
+_MD_IMAGE_RE = re.compile(r'!\[([^\]]*)\]\(([^)\n]+)\)')
+_QUESTION_MARKERS = (
+    "выберите вариант",
+    "подтвердите",
+    "подтверждаешь",
+    "какой вариант",
+    "уточните",
+    "жду ответа",
+    "ответьте",
+    "please confirm",
+    "which option",
+    "choose an option",
+    "waiting for your reply",
+)
+
+
+def _compute_media_ref_hmac(filename: str, ref_b64: str, exp: int, secret: str) -> str:
+    msg = f"ref:{filename}:{ref_b64}:{exp}".encode("utf-8")
+    return hmac.new(secret.encode("utf-8"), msg, hashlib.sha256).hexdigest()
+
+
+def _sign_media_ref_url(
+    path_str: str,
+    api_key: Optional[str] = None,
+    *,
+    secret: Optional[str] = None,
+    ttl: int = MEDIA_URL_TTL_SECONDS,
+) -> str:
+    raw_name = Path(path_str).name
+    safe_filename = raw_name if _is_safe_media_filename(raw_name) else _sanitize_upload_filename(raw_name)
+    ref_b64 = base64.urlsafe_b64encode(str(path_str).encode("utf-8")).decode("ascii").rstrip("=")
+    key = api_key if api_key is not None else os.environ.get("API_SERVER_KEY", "")
+    signing_secret = key or secret or _PROCESS_MEDIA_REF_SECRET
+    exp = int(time.time()) + ttl
+    sig = _compute_media_ref_hmac(safe_filename, ref_b64, exp, signing_secret)
+    return f"/api/media/{quote(safe_filename)}?ref={ref_b64}&exp={exp}&sig={sig}"
+
+
+def _resolve_message_media_text(
+    text: str,
+    *,
+    api_key: Optional[str] = None,
+    ref_secret: Optional[str] = None,
+) -> str:
+    """Resolve MEDIA:<path> tags and local markdown images into signed /api/media/... URLs
+    or safe fallback text without exposing arbitrary filesystem paths."""
+    if not text or not isinstance(text, str):
+        return text
+    if "MEDIA:" not in text and "![" not in text:
+        return text
+
+    resolved_key = api_key if api_key is not None else os.environ.get("API_SERVER_KEY", "")
+    hermes_home = _get_hermes_home_path()
+    allowed_dirs = []
+    for d in _allowed_media_dirs(hermes_home):
+        try:
+            allowed_dirs.append(d.resolve())
+        except OSError:
+            pass
+
+    def _is_direct_allowed_media(p: Path) -> bool:
+        if not _is_safe_media_filename(p.name):
+            return False
+        for d in allowed_dirs:
+            cand = d / p.name
+            try:
+                rc = cand.resolve()
+            except OSError:
+                continue
+            if rc.is_file():
+                return rc == p
+        return False
+
+    def _resolve_local_path(raw_path: str, *, alt: Optional[str] = None) -> str:
+        cleaned = (raw_path or "").strip().strip("`\"'")
+        basename = os.path.basename(cleaned.rstrip("/\\")) or "file"
+        safe_path = validate_media_delivery_path(cleaned)
+        if not safe_path:
+            return f"⚠️ Файл недоступен: {basename}"
+        p = Path(safe_path)
+        try:
+            if p.stat().st_size > MAX_UPLOAD_BYTES:
+                return f"⚠️ Файл недоступен: {p.name}"
+        except OSError:
+            return f"⚠️ Файл недоступен: {p.name}"
+        if _is_direct_allowed_media(p):
+            signed_url = _sign_media_url(p.name, api_key=resolved_key)
+        else:
+            signed_url = _sign_media_ref_url(str(p), api_key=resolved_key, secret=ref_secret)
+        if p.suffix.lower() in _MEDIA_IMG_EXT:
+            label = (alt or "image").replace("[", "").replace("]", "")
+            return f"![{label}]({signed_url})"
+        return f"[📎 {p.name}]({signed_url})"
+
+    try:
+        sentinel_start = _terminal_sentinel_start(text)
+        scan = text[:sentinel_start] if sentinel_start >= 0 else text
+        resolved = MEDIA_TAG_CLEANUP_RE.sub(lambda m: _resolve_local_path(m.group("path")), scan)
+        resolved = _MEDIA_FALLBACK_RE.sub(lambda m: _resolve_local_path(m.group("path")), resolved)
+
+        def _repl_md_img(m: re.Match[str]) -> str:
+            alt = m.group(1)
+            target = m.group(2).strip()
+            lower = target.lower()
+            if lower.startswith(("http://", "https://", "data:image/", "/api/media/", "/sandbox-api/")):
+                return m.group(0)
+            if lower.startswith(("javascript:", "vbscript:", "data:")):
+                return f"⚠️ Файл недоступен: {alt or 'media'}"
+            if target.startswith(("/", "~/")) or re.match(r"^[A-Za-z]:[/\\]", target):
+                return _resolve_local_path(target, alt=alt)
+            return m.group(0)
+
+        resolved = _MD_IMAGE_RE.sub(_repl_md_img, resolved)
+        if sentinel_start >= 0 and resolved == scan:
+            return text
+        return resolved
+    except Exception:
+        logger.debug("Error resolving message media", exc_info=True)
+        return text
+
+
+def _assistant_expects_user_reply(content: str) -> bool:
+    """Deterministic detector for whether an assistant message asks the user a question
+    or requests confirmation/choice (ignoring code blocks and URLs)."""
+    if not content or not isinstance(content, str):
+        return False
+    cleaned = re.sub(r"```[\s\S]*?```", " ", content)
+    cleaned = re.sub(r"`[^`\n]*`", " ", cleaned)
+    cleaned = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", cleaned)
+    cleaned = re.sub(r"https?://\S+", " ", cleaned)
+    paragraphs = [p.strip() for p in re.split(r"\n\s*\n", cleaned) if p.strip()]
+    if not paragraphs:
+        return False
+    tail = "\n".join(paragraphs[-2:])
+    if re.search(r"\?(?:\s|$|[)\"»'\]])", tail):
+        return True
+    tail_lower = tail.lower()
+    return any(marker in tail_lower for marker in _QUESTION_MARKERS)
+
+
+class _DualMethod:
+    """Descriptor allowing a method to be called both on an instance and on the class."""
+    def __init__(self, func):
+        self.func = func
+        wraps(func)(self)
+
+    def __get__(self, instance, owner=None):
+        return partial(self.func, instance)
 
 
 def _transform_media_paths(text: str, api_key: Optional[str] = None) -> str:
@@ -1223,6 +1380,24 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
     
     def _verify_media_auth(self, request: web.Request, filename: str) -> Optional[web.Response]:
         """Authorize GET /api/media/{filename} via Bearer token or HMAC-SHA256 query token."""
+        if "ref" in request.query:
+            ref_b64 = request.query.get("ref", "")
+            exp_raw = request.query.get("exp", "")
+            sig = request.query.get("sig", "")
+            if not ref_b64 or not exp_raw or not sig:
+                return _error_response("Missing media signature", 403, code="forbidden")
+            try:
+                exp = int(exp_raw)
+            except ValueError:
+                return _error_response("Invalid media expiration", 403, code="forbidden")
+            if exp < int(time.time()):
+                return _error_response("Media URL expired", 403, code="forbidden")
+            signing_secret = self._expected_api_key() or getattr(self, "_media_ref_secret", _PROCESS_MEDIA_REF_SECRET)
+            expected_sig = _compute_media_ref_hmac(filename, ref_b64, exp, signing_secret)
+            if hmac.compare_digest(sig.encode("utf-8"), expected_sig.encode("utf-8")):
+                return None
+            return _error_response("Invalid media signature", 403, code="forbidden")
+
         auth_err = self._check_auth(request)
         if auth_err is None:
             return None
@@ -1245,7 +1420,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         return auth_err
 
     async def _handle_get_media(self, request: web.Request) -> web.Response:
-        """GET /api/media/{filename} — serve media files from allowlisted directories."""
+        """GET /api/media/{filename} — serve media files from allowlisted directories or signed ref."""
         try:
             raw_filename = request.match_info.get("filename", "")
             auth_err = self._verify_media_auth(request, raw_filename)
@@ -1255,25 +1430,52 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             if not _is_safe_media_filename(raw_filename):
                 return web.json_response(_openai_error("Invalid filename"), status=400)
 
-            hermes_home = _get_hermes_home_path()
-            base_search_dirs = _allowed_media_dirs(hermes_home)
-
             found_file = None
-            for sdir in base_search_dirs:
-                resolved_dir = sdir.resolve()
-                candidate = sdir / raw_filename
+            if "ref" in request.query:
+                ref_b64 = request.query.get("ref", "")
                 try:
-                    resolved_candidate = candidate.resolve()
-                except OSError:
-                    continue
-                if not resolved_candidate.is_relative_to(resolved_dir):
-                    return web.json_response(_openai_error("Forbidden path"), status=403)
-                if resolved_candidate.is_file():
-                    found_file = resolved_candidate
-                    break
+                    padded = ref_b64 + ("=" * (-len(ref_b64) % 4))
+                    decoded_path = base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8")
+                except Exception:
+                    return web.json_response(_openai_error("Invalid media reference"), status=400)
+                safe_path = validate_media_delivery_path(decoded_path)
+                if not safe_path:
+                    try:
+                        exists = Path(os.path.expanduser(decoded_path)).exists()
+                    except OSError:
+                        exists = False
+                    if exists:
+                        return web.json_response(_openai_error("Forbidden path"), status=403)
+                    return web.json_response(_openai_error("File not found", err_type="not_found_error"), status=404)
+                found_file = Path(safe_path)
+            else:
+                hermes_home = _get_hermes_home_path()
+                base_search_dirs = _allowed_media_dirs(hermes_home)
+                for sdir in base_search_dirs:
+                    resolved_dir = sdir.resolve()
+                    candidate = sdir / raw_filename
+                    try:
+                        resolved_candidate = candidate.resolve()
+                    except OSError:
+                        continue
+                    if not resolved_candidate.is_relative_to(resolved_dir):
+                        return web.json_response(_openai_error("Forbidden path"), status=403)
+                    if resolved_candidate.is_file():
+                        found_file = resolved_candidate
+                        break
 
             if not found_file:
                 return web.json_response(_openai_error("File not found", err_type="not_found_error"), status=404)
+
+            try:
+                file_size = found_file.stat().st_size
+            except OSError:
+                return web.json_response(_openai_error("File not found", err_type="not_found_error"), status=404)
+            if file_size > MAX_UPLOAD_BYTES:
+                return web.json_response(
+                    _openai_error("Media file exceeds 20 MB limit", code="payload_too_large"),
+                    status=413,
+                )
 
             ext = found_file.suffix.lower()
             content_type = {
@@ -1283,8 +1485,16 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 ".pdf": "application/pdf", ".txt": "text/plain",
             }.get(ext, "application/octet-stream")
 
+            headers = {
+                "Cache-Control": "public, max-age=86400",
+                "X-Content-Type-Options": "nosniff",
+            }
+            if ext not in _MEDIA_IMG_EXT:
+                headers["Content-Security-Policy"] = "default-src 'none'; sandbox"
+                headers["Content-Disposition"] = f'attachment; filename="{raw_filename}"'
+
             data = await asyncio.to_thread(found_file.read_bytes)
-            return web.Response(body=data, content_type=content_type, headers={"Cache-Control": "public, max-age=86400"})
+            return web.Response(body=data, content_type=content_type, headers=headers)
         except Exception as e:
             logger.exception("Error serving media file: %s", e)
             return web.json_response(_openai_error(f"Internal error: {e}"), status=500)
@@ -1865,6 +2075,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         extra = config.extra or {}
         self._host, self._port = listen_address(extra)
         self._api_key: str = extra.get("key", _get_scoped_secret("API_SERVER_KEY", ""))
+        self._media_ref_secret: str = secrets.token_hex(32)
         self._cors_origins: tuple[str, ...] = self._parse_cors_origins(
             extra.get("cors_origins", os.getenv("API_SERVER_CORS_ORIGINS", "")))
         self._model_name: str = self._resolve_model_name(
@@ -2381,6 +2592,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             ("POST", "/api/sessions", self._handle_create_session),
             ("GET", "/api/sessions/{session_id}", self._handle_get_session),
             ("PATCH", "/api/sessions/{session_id}", self._handle_patch_session),
+            ("POST", "/api/sessions/{session_id}/read", self._handle_read_session),
             ("DELETE", "/api/sessions/{session_id}", self._handle_delete_session),
             ("GET", "/api/sessions/{session_id}/messages", self._handle_session_messages),
             ("GET", "/api/sessions/{session_id}/telegram-binding", self._handle_get_telegram_binding),
@@ -3265,7 +3477,13 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             with _active_subagents_lock:
                 for sid, rec in _active_subagents.items():
                     owner_sid = str(rec.get("owner_agent_session_id") or rec.get("owner_session_id") or "")
-                    is_match = (owner_sid == session_id) or (session_id and session_id in owner_sid) or (owner_sid and owner_sid in session_id)
+                    parent_sid = str(rec.get("parent_session_id") or "")
+                    gw_key = str(rec.get("gateway_session_key") or "")
+                    is_match = (
+                        owner_sid == session_id
+                        or parent_sid == session_id
+                        or gw_key == session_id
+                    )
                     if is_match:
                         started = rec.get("started_at")
                         active.append({
@@ -3284,7 +3502,12 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             logger.debug("Failed to query live subagents for session %s: %s", session_id, e)
         return active
 
-    def _session_response(self, session: dict[str, Any]) -> dict[str, Any]:
+    def _session_response(
+        self,
+        session: dict[str, Any],
+        *,
+        last_msg: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
         """Return a stable, client-safe session representation."""
         safe_keys = (
             "id", "source", "user_id", "model", "title", "started_at", "ended_at", "end_reason",
@@ -3319,13 +3542,17 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
 
         session_id = str(session.get("id") or "")
         active_subagents = self._get_active_subagents_for_session(session_id)
+        running_subagents = [
+            s for s in active_subagents
+            if str(s.get("status") or "running").lower() == "running"
+        ]
         has_async = False
         try:
             from tools.async_delegation import has_active_or_pending_for_session
             has_async = has_active_or_pending_for_session(session_key=session_id, origin_ui_session_id=session_id, parent_session_id=session_id)
         except Exception as e:
             logger.debug("Failed to check async delegations for session %s: %s", session_id, e)
-        has_active_subagents = bool(active_subagents or has_async)
+        has_active_subagents = bool(running_subagents or has_async)
 
         active_run = None
         if session_id and hasattr(self, "_run_statuses"):
@@ -3333,12 +3560,21 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 if str(r_info.get("session_id") or "") == session_id and r_info.get("status") in {"queued", "running", "waiting_for_approval"}:
                     active_run = (r_id, r_info)
                     break
+        waiting_approval = False
         if active_run:
             r_id, r_info = active_run
-            payload["is_generating"] = True
-            payload["active_run_id"] = r_id
-            payload["tool_status"] = r_info.get("tool_status") or "Ассистент думает над задачей..."
-            payload["current_tool"] = r_info.get("current_tool")
+            run_status = str(r_info.get("status") or "")
+            if run_status == "waiting_for_approval":
+                waiting_approval = True
+                payload["is_generating"] = False
+                payload["active_run_id"] = r_id
+                payload["tool_status"] = r_info.get("tool_status") or "Ожидает подтверждения..."
+                payload["current_tool"] = r_info.get("current_tool")
+            else:
+                payload["is_generating"] = True
+                payload["active_run_id"] = r_id
+                payload["tool_status"] = r_info.get("tool_status") or "Ассистент думает над задачей..."
+                payload["current_tool"] = r_info.get("current_tool")
         else:
             is_gen = False
             tool_status = None
@@ -3374,8 +3610,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                         break
             if not is_gen and has_active_subagents:
                 is_gen = True
-                if active_subagents and active_subagents[0].get("last_tool"):
-                    last_tool = str(active_subagents[0]["last_tool"])
+                if running_subagents and running_subagents[0].get("last_tool"):
+                    last_tool = str(running_subagents[0]["last_tool"])
                     verb = None
                     try:
                         from agent.display import get_tool_verb
@@ -3386,8 +3622,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                         tool_status = f"Подзадача: {verb}..."
                     else:
                         tool_status = f"Подзадача выполняет {last_tool}..."
-                elif active_subagents:
-                    tool_status = f"Выполняются подзадачи ({len(active_subagents)} в работе)..."
+                elif running_subagents:
+                    tool_status = f"Выполняются подзадачи ({len(running_subagents)} в работе)..."
                 else:
                     tool_status = "Выполняется фоновая подзадача..."
                 current_tool = "delegate_task"
@@ -3398,30 +3634,83 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             payload["current_tool"] = current_tool
 
         payload["has_active_subagents"] = has_active_subagents
-        active_subagents_count = len(active_subagents)
+        active_subagents_count = len(running_subagents)
         payload["active_subagents_count"] = active_subagents_count
         payload["active_subagents"] = active_subagents
         payload["subagents"] = active_subagents
 
-        is_generating = payload.get("is_generating", False)
+        last_role = last_msg.get("role") if isinstance(last_msg, dict) else None
+        last_content = str(last_msg.get("content") or "") if isinstance(last_msg, dict) else ""
+        last_has_tool_calls = bool(last_msg.get("has_tool_calls")) if isinstance(last_msg, dict) else False
+        last_finish_reason = str(last_msg.get("finish_reason") or "") if isinstance(last_msg, dict) else ""
+
+        last_read_at = session.get("last_read_at")
+        if last_read_at is not None:
+            last_active_ts = (
+                session.get("last_active")
+                or (last_msg.get("timestamp") if isinstance(last_msg, dict) else None)
+                or session.get("started_at")
+            )
+            session_unread = float(last_active_ts or 0) > float(last_read_at)
+        else:
+            session_unread = False
+
+        is_generating = bool(payload.get("is_generating", False))
         is_gen = bool(is_generating or has_active_subagents or active_subagents_count > 0)
+        waiting_reason: Optional[str] = None
+        is_unread_completion = False
+
         if is_gen:
             status = "running"
-        elif session.get("ended_at") or session.get("end_reason"):
-            status = "completed"
-        else:
+        elif waiting_approval:
             status = "waiting_input"
+            waiting_reason = "approval"
+        elif last_role == "assistant" and not last_has_tool_calls and last_finish_reason != "tool_calls":
+            if _assistant_expects_user_reply(last_content):
+                status = "waiting_input"
+                waiting_reason = "question"
+            elif session_unread:
+                status = "completed"
+                is_unread_completion = True
+            else:
+                status = "idle"
+        elif session.get("ended_at") or session.get("end_reason"):
+            if session_unread:
+                status = "completed"
+                is_unread_completion = True
+            else:
+                status = "idle"
+        else:
+            status = "idle"
+
         payload["status"] = status
+        payload["waiting_reason"] = waiting_reason
+        payload["last_role"] = last_role
+        payload["is_unread_completion"] = is_unread_completion
         return payload
 
-    @staticmethod
-    def _message_response(message: dict[str, Any]) -> dict[str, Any]:
+    def _resolve_message_media(self, text: str, *, api_key: Optional[str] = None) -> str:
+        resolved_key = api_key if api_key is not None else self._expected_api_key()
+        return _resolve_message_media_text(
+            text,
+            api_key=resolved_key,
+            ref_secret=getattr(self, "_media_ref_secret", _PROCESS_MEDIA_REF_SECRET),
+        )
+
+    @_DualMethod
+    def _message_response(self, message: dict[str, Any]) -> dict[str, Any]:
         message = _project_client_message(message)
         safe_keys = (
             "id", "session_id", "role", "content", "tool_call_id", "tool_calls", "tool_name",
             "timestamp", "token_count", "finish_reason", "reasoning", "reasoning_content",
             "display_kind")
-        return {key: message.get(key) for key in safe_keys if key in message}
+        res = {key: message.get(key) for key in safe_keys if key in message}
+        if res.get("role") in ("assistant", "user") and isinstance(res.get("content"), str):
+            if self is not None:
+                res["content"] = self._resolve_message_media(res["content"])
+            else:
+                res["content"] = _resolve_message_media_text(res["content"])
+        return res
 
     async def _read_json_body(self, request: web.Request) -> tuple[dict[str, Any], Optional[web.Response]]:
         try:
@@ -3509,10 +3798,17 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                     sessions = await _list()
             except Exception:
                 pass  # resolution degrades to today's no-row behavior
+        session_ids = [str(s.get("id") or "") for s in sessions if s.get("id")]
+        last_msgs = (
+            await asyncio.to_thread(db.session_last_messages, session_ids)
+            if session_ids and hasattr(db, "session_last_messages")
+            else {}
+        )
         # Back-filled pins arrive PAST the limit: counting them would report a page that doesn't exist.
         windowed = sum(1 for s in sessions if not s.get("pinned"))
         return web.json_response({
-            "object": "list", "data": [self._session_response(s) for s in sessions],
+            "object": "list",
+            "data": [self._session_response(s, last_msg=last_msgs.get(str(s.get("id") or ""))) for s in sessions],
             "limit": limit, "offset": offset, "has_more": windowed >= limit})
 
     @_require_auth
@@ -3590,13 +3886,27 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             return _error_response(err[len("title:"):], 400, code="invalid_title")
         return web.json_response({"object": "hermes.session", "session": self._session_response(session)}, status=201)
 
+    async def _last_message_for_session(self, session_id: str) -> Optional[dict[str, Any]]:
+        if not session_id:
+            return None
+        db = await self._ensure_session_db_async()
+        if db is None or not hasattr(db, "session_last_messages"):
+            return None
+        try:
+            last_msgs = await asyncio.to_thread(db.session_last_messages, [session_id])
+            return last_msgs.get(session_id)
+        except Exception:
+            return None
+
     @_require_auth
     async def _handle_get_session(self, request: web.Request) -> web.Response:
         """GET /api/sessions/{session_id}."""
-        session, err = await self._get_existing_session_or_404(request.match_info["session_id"])
+        session_id = request.match_info["session_id"]
+        session, err = await self._get_existing_session_or_404(session_id)
         if err:
             return err
-        return web.json_response({"object": "hermes.session", "session": self._session_response(session)})
+        last_msg = await self._last_message_for_session(str(session.get("id") or session_id))
+        return web.json_response({"object": "hermes.session", "session": self._session_response(session, last_msg=last_msg)})
 
     @_require_auth
     async def _handle_patch_session(self, request: web.Request) -> web.Response:
@@ -3636,7 +3946,23 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         if body.get("end_reason"):
             await asyncio.to_thread(db.end_session, session_id, str(body["end_reason"]))
         session = await asyncio.to_thread(db.get_session, session_id) or session
-        return web.json_response({"object": "hermes.session", "session": self._session_response(session)})
+        last_msg = await self._last_message_for_session(str(session.get("id") or session_id))
+        return web.json_response({"object": "hermes.session", "session": self._session_response(session, last_msg=last_msg)})
+
+    @_require_auth
+    async def _handle_read_session(self, request: web.Request) -> web.Response:
+        """POST /api/sessions/{session_id}/read — mark session read up to now."""
+        session_id = request.match_info["session_id"]
+        session, err = await self._get_existing_session_or_404(session_id)
+        if err:
+            return err
+        db = await self._ensure_session_db_async()
+        if db is None:
+            return self._session_db_unavailable()
+        await asyncio.to_thread(db.set_session_read, session_id, True)
+        session = await asyncio.to_thread(db.get_session, session_id) or session
+        last_msg = await self._last_message_for_session(str(session.get("id") or session_id))
+        return web.json_response({"object": "hermes.session", "session": self._session_response(session, last_msg=last_msg)})
 
     @_require_auth
     async def _handle_delete_session(self, request: web.Request) -> web.Response:
@@ -4359,6 +4685,10 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         from gateway.wake import reset_consecutive_auto_wakes
         reset_consecutive_auto_wakes(session_id)
         await asyncio.to_thread(self._mark_session_auto_resume, session_id)
+        db_turn = await self._ensure_session_db_async()
+        if db_turn is not None and hasattr(db_turn, "set_session_read"):
+            with suppress(Exception):
+                await asyncio.to_thread(db_turn.set_session_read, session_id, True)
         ctx["run_kwargs"]["auto_resume_on_delegation"] = True
         duplicate_to_telegram = bool(
             ctx["body"].get("duplicate_to_telegram")
@@ -4403,9 +4733,9 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 logger.debug("Telegram mirror drain failed in _handle_session_chat (non-fatal)", exc_info=True)
         is_dict = isinstance(result, dict)
         effective_session_id = result.get("session_id") if is_dict else session_id
-        final_response = _resolve_media_to_data_urls(
-            result.get("final_response", "") if is_dict else "")
-        await mirror.send_final(final_response)
+        raw_final_response = result.get("final_response", "") if is_dict else ""
+        final_response = self._resolve_message_media(raw_final_response)
+        await mirror.send_final(raw_final_response)
         headers = self._session_headers(effective_session_id or session_id, gateway_session_key)
         return web.json_response(
             {"object": "hermes.session.chat.completion", "status": _response_status(result),
@@ -4430,6 +4760,10 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         from gateway.wake import reset_consecutive_auto_wakes
         reset_consecutive_auto_wakes(session_id)
         await asyncio.to_thread(self._mark_session_auto_resume, session_id)
+        db_turn = await self._ensure_session_db_async()
+        if db_turn is not None and hasattr(db_turn, "set_session_read"):
+            with suppress(Exception):
+                await asyncio.to_thread(db_turn.set_session_read, session_id, True)
         ctx["run_kwargs"]["auto_resume_on_delegation"] = True
         user_message, runtime_request = ctx["user_message"], ctx["runtime_request"]
         runtime_meta = self._sanitize_runtime_metadata(
@@ -4558,10 +4892,12 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                             if rec is None:
                                 for cand in _active_subagents.values():
                                     owner_sid = str(cand.get("owner_agent_session_id") or cand.get("owner_session_id") or "")
+                                    parent_sid = str(cand.get("parent_session_id") or "")
+                                    gw_key = str(cand.get("gateway_session_key") or "")
                                     sid_match = bool(session_id) and (
                                         owner_sid == session_id
-                                        or session_id in owner_sid
-                                        or (owner_sid and owner_sid in session_id)
+                                        or parent_sid == session_id
+                                        or gw_key == session_id
                                     )
                                     if not sid_match:
                                         continue
@@ -4617,7 +4953,10 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             # as its own typed event — never folded into ``assistant.completed`` (#67580).
             if isinstance(text, str) and text.strip():
                 events.enqueue("assistant.commentary", {
-                    "message_id": message_id, "text": text, "already_streamed": bool(already_streamed)})
+                    "message_id": message_id,
+                    "text": self._resolve_message_media(text),
+                    "already_streamed": bool(already_streamed),
+                })
                 mirror.enqueue_commentary(text)
 
         approval_notify = self._register_session_stream_approval(run_id, events, message_id)
@@ -4642,7 +4981,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                     approval_session_key=run_id, **ctx["run_kwargs"])
                 await events.flush()
                 is_dict = isinstance(result, dict)
-                final_response = _resolve_media_to_data_urls(result.get("final_response", "") if is_dict else "")
+                raw_final_response = result.get("final_response", "") if is_dict else ""
+                final_response = self._resolve_message_media(raw_final_response)
                 effective_session_id = result.get("session_id", session_id) if is_dict else session_id
                 turn_messages = self._turn_transcript_messages(history, user_message, result) if is_dict else []
                 effective_runtime = self._effective_turn_runtime(runtime_request, result, usage)
@@ -4651,7 +4991,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 status, fields = _api_runs.terminal_run_status(result if is_dict else {})
                 await mirror.drain()
                 await _finalize_pulse_ticker(status or "completed")
-                await mirror.send_final(final_response)
+                await mirror.send_final(raw_final_response)
                 await queue.put(_event_payload("assistant.completed", {
                     "session_id": effective_session_id, "message_id": message_id,
                     "content": final_response, **fields, "runtime": effective_runtime,
