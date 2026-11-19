@@ -13,6 +13,7 @@ import os
 import html as _html
 import re
 import time
+from collections import deque
 from contextvars import ContextVar
 from datetime import datetime, timezone, UTC
 from weakref import WeakValueDictionary
@@ -226,9 +227,20 @@ _FLOOD_INLINE_WAIT_CAP_SECS = 5.0
 # the same text anyway), and the FINAL edit is never gated (the answer itself is never
 # withheld).  Tunable: validated in production by the issue reporter at 0 flood events.
 _TELEGRAM_CHAT_OUTBOUND_BUDGET_SECS = 1.0
+_MAX_FLOOD_COOLDOWN_SECS = 86400.0
+_TELEGRAM_CHAT_RATE_WINDOW_SECS = 60.0
+_TELEGRAM_CHAT_TYPING_SOFT_LIMIT = 15
+_TELEGRAM_CHAT_INTERIM_SOFT_LIMIT = 18
 
 
-def _flood_cap_result(wait: float) -> SendResult:
+def _preserve_int_retry_after(raw, wait: float) -> float | int:
+    """Preserve integer formatting for ``flood_control:<n>`` when ``retry_after`` was an ``int``."""
+    if isinstance(raw, int) and not isinstance(raw, bool) and raw >= 0:
+        return raw
+    return wait
+
+
+def _flood_cap_result(wait: float | int) -> SendResult:
     """The shared fail-closed SendResult for an over-cap flood wait."""
     return SendResult(success=False, error=f"flood_control:{wait}", retry_after=float(wait))
 
@@ -565,6 +577,7 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
         self._rich_send_disabled = self._rich_draft_disabled = False  # latched after a capability failure
         # Transient sendChatAction failures recur on every keep-typing tick; back off per chat.
         self._telegram_typing_cooldown_until: dict[str, float] = {}
+        self._telegram_chat_outbound_calls: dict[str, deque[float]] = {}
         self._telegram_typing_cooldown_seconds: float = self._coerce_float_extra(
             "typing_cooldown_seconds", 30.0, min_value=1.0, max_value=300.0)
         # Post-send typing re-arm: scheduled, deduped and rate-limited per chat. Awaiting a
@@ -1425,6 +1438,7 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
         try:
             # Raw Bot API result: return_type=Message would make PTB deserialize a 10.1 shape it doesn't
             # fully model; a post-delivery parse error ≠ send failure.
+            self._record_chat_outbound_call(chat_id)
             msg = await _await_with_thread_deadline(
                 self._bot.do_api_request("sendRichMessage", api_kwargs=payload),
                 timeout=_TEXT_SEND_DEADLINE, label="telegram-send", dump_on_blocked_loop=False)
@@ -1473,6 +1487,7 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
         # No topic routing on edits: message_thread_id/direct_messages_topic_id make Telegram reject it.
         payload = {**self._rich_payload_base(chat_id, content), "message_id": int(message_id)}
         try:
+            self._record_chat_outbound_call(chat_id)
             await _await_with_thread_deadline(
                 self._bot.do_api_request("editMessageText", api_kwargs=payload),
                 timeout=_TEXT_SEND_DEADLINE, label="telegram-send", dump_on_blocked_loop=False)
@@ -1504,6 +1519,7 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
             "chat_id": normalize_telegram_chat_id(chat_id), "draft_id": int(draft_id), "rich_message": self._rich_message_payload(content)}
         payload.update(self._thread_kwargs_for_draft(chat_id, metadata))
         try:
+            self._record_chat_outbound_call(chat_id)
             return bool(await _await_with_thread_deadline(
                 self._bot.do_api_request("sendRichMessageDraft", api_kwargs=payload),
                 timeout=_TEXT_SEND_DEADLINE, label="telegram-send", dump_on_blocked_loop=False))
@@ -3349,12 +3365,28 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
             thread_kwargs, reply_to_id = {"message_thread_id": None}, (None if private_dm_topic_send else reply_to_id)
         effective_thread_id = thread_kwargs.get("message_thread_id")
         _send_attempt = 0  # network/flood retries only; route changes each drop a constraint and spend none
+        _needs_slot_pace = False
         while True:
+            if _needs_slot_pace:
+                _needs_slot_pace = False
+                cooldown = self._send_flood_cooldown_remaining(chat_id)
+                if cooldown is not None:
+                    return _flood_cap_result(cooldown)
+                slot_remaining = self._chat_outbound_slot_remaining(chat_id)
+                if slot_remaining > 0:
+                    await asyncio.sleep(slot_remaining)
+                    cooldown = self._send_flood_cooldown_remaining(chat_id)
+                    if cooldown is not None:
+                        return _flood_cap_result(cooldown)
+                    self._hold_chat_outbound_slot(chat_id)
             try:
                 send_kwargs = {
                     "chat_id": normalize_telegram_chat_id(chat_id), "reply_to_message_id": reply_to_id, **thread_kwargs,
                     **self._link_preview_kwargs(), **self._notification_kwargs(metadata)}
-                return await self._send_chunk_markdown_or_plain(chunk, send_kwargs), used_thread_fallback
+                self._record_chat_outbound_call(chat_id)
+                sent_msg = await self._send_chunk_markdown_or_plain(chunk, send_kwargs)
+                self._hold_chat_outbound_slot(chat_id)
+                return sent_msg, used_thread_fallback
             except ((_TimedOut,) if _TimedOut else ()) + (TimeoutError, asyncio.TimeoutError) as send_err:
                 if _send_attempt >= 2:
                     raise
@@ -3363,6 +3395,7 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
                                self.name, _send_attempt + 1, wait, _redact_telegram_error_text(send_err))
                 await asyncio.sleep(wait)
                 _send_attempt += 1
+                _needs_slot_pace = True
                 continue
             except _NetErr as send_err:
                 if (_TimedOut and isinstance(send_err, _TimedOut)) or self._is_timed_out(send_err):
@@ -3373,6 +3406,7 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
                                    self.name, _send_attempt + 1, wait, _redact_telegram_error_text(send_err))
                     await asyncio.sleep(wait)
                     _send_attempt += 1
+                    _needs_slot_pace = True
                     continue
                 # BadRequest subclasses NetworkError in PTB but is permanent; handle specific cases.
                 if _BadReq and isinstance(send_err, _BadReq):
@@ -3415,6 +3449,7 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
                                self.name, _send_attempt + 1, wait, _redact_telegram_error_text(send_err))
                 await asyncio.sleep(wait)
                 _send_attempt += 1
+                _needs_slot_pace = True
             except Exception as send_err:
                 raw_retry_after = getattr(send_err, "retry_after", None)
                 wait = coerce_retry_after_seconds(raw_retry_after)
@@ -3431,15 +3466,16 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
                     # (#91969).
                     if wait > _FLOOD_INLINE_WAIT_CAP_SECS:
                         logger.warning(
-                            "[%s] Telegram flood control on send (retry_after=%.1fs > %.0fs); failing closed instead of sleeping: %s",
+                            "[%s] Telegram flood control on send (retry_after=%.1fs > %.0fs inline cap); failing closed instead of sleeping: %s",
                             self.name, wait, _FLOOD_INLINE_WAIT_CAP_SECS, safe_send_error)
-                        return self._record_send_flood_cooldown(chat_id, wait)
+                        return self._record_send_flood_cooldown(chat_id, _preserve_int_retry_after(raw_retry_after, wait))
                     if _send_attempt < 2:
                         logger.warning(
                             "[%s] Telegram flood control on send (attempt %d/3), retrying in %.1fs: %s", self.name,
                             _send_attempt + 1, wait, safe_send_error)
                         await asyncio.sleep(wait)
                         _send_attempt += 1
+                        _needs_slot_pace = True
                         continue
                     # Retries exhausted and still flooded. Fail closed the same way a long penalty
                     # does: raising here handed the caller the platform's own wording instead of the
@@ -3449,7 +3485,7 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
                         "[%s] Telegram flood control on send persisted across %d attempts; failing "
                         "closed so the delivery ledger owns the wait: %s",
                         self.name, _send_attempt + 1, safe_send_error)
-                    return self._record_send_flood_cooldown(chat_id, wait)
+                    return self._record_send_flood_cooldown(chat_id, _preserve_int_retry_after(raw_retry_after, wait))
                 raise
 
     async def _retrigger_typing(self, chat_id: str, metadata: Optional[dict[str, Any]]) -> None:
@@ -3554,7 +3590,8 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
                     _separate_chunk_indicator_from_fence(re.sub(r" \((\d+)/(\d+)\)$", r" \\(\1/\2\\)", chunk))
                     for chunk in chunks
                ]
-            return await self._send_chunks(chat_id, chunks, delivered, reply_to, metadata, error_types)
+            return await self._send_chunks(
+                chat_id, chunks, delivered, reply_to, metadata, error_types, slot_held_for_first=True)
         except Exception as e:
             classified = self._classify_send_exception(e, error_types)
             return self._with_partial_send(classified, chunks[len(delivered):], delivered, tail_certain=classified.retryable)
@@ -3575,21 +3612,31 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
 
     async def _send_chunks(
         self, chat_id: str, chunks: list[str], delivered: list[str], reply_to: Optional[str],
-        metadata: Optional[dict[str, Any]], error_types: tuple) -> SendResult:
+        metadata: Optional[dict[str, Any]], error_types: tuple, *, slot_held_for_first: bool = False) -> SendResult:
         """Deliver formatted ``chunks`` in order, appending each landed message id to ``delivered``
         (pre-seeded with the ids of an earlier partial send when resuming — the chunk index used for
         reply routing continues from there). A mid-loop refusal returns the ``partial_overflow`` result."""
         thread_id = self._metadata_thread_id(metadata)
         requested_thread_id = self._message_thread_id_for_send(thread_id)
         used_thread_fallback = False
-        prior = len(delivered)
-        for chunk in chunks:
+        for idx, chunk in enumerate(chunks):
+            if idx > 0 or not slot_held_for_first:
+                cooldown = self._send_flood_cooldown_remaining(chat_id)
+                if cooldown is not None:
+                    return self._with_partial_send(_flood_cap_result(cooldown), chunks[idx:], delivered)
+                slot_remaining = self._chat_outbound_slot_remaining(chat_id)
+                if slot_remaining > 0:
+                    await asyncio.sleep(slot_remaining)
+                    cooldown = self._send_flood_cooldown_remaining(chat_id)
+                    if cooldown is not None:
+                        return self._with_partial_send(_flood_cap_result(cooldown), chunks[idx:], delivered)
+                self._hold_chat_outbound_slot(chat_id)
             outcome = await self._send_chunk_with_retries(
                 chat_id, chunk, len(delivered), reply_to, metadata, thread_id, used_thread_fallback, error_types)
             if isinstance(outcome, SendResult):
                 # Every SendResult returned here is a DEFINITE non-delivery (flood cap, DM-topic refusal);
                 # ambiguous timeouts raise instead, so the remainder is safe to resume from.
-                return self._with_partial_send(outcome, chunks[len(delivered) - prior:], delivered)
+                return self._with_partial_send(outcome, chunks[idx:], delivered)
             msg, used_thread_fallback = outcome
             delivered.append(str(msg.message_id))
         await self._retrigger_typing(chat_id, metadata)
@@ -3633,7 +3680,8 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
                 return self._with_partial_send(_flood_cap_result(cooldown), list(undelivered), delivered)
             error_types = self._telegram_error_types()
             try:
-                return await self._send_chunks(chat_id, list(undelivered), delivered, reply_to, metadata, error_types)
+                return await self._send_chunks(
+                    chat_id, list(undelivered), delivered, reply_to, metadata, error_types, slot_held_for_first=False)
             except Exception as e:
                 classified = self._classify_send_exception(e, error_types)
                 return self._with_partial_send(
@@ -3695,10 +3743,13 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
         if (
             not finalize
             and utf16_len(content) <= self.MAX_MESSAGE_LENGTH
-            and self._chat_outbound_slot_remaining(chat_id) > 0
+            and (
+                self._chat_outbound_slot_remaining(chat_id) > 0
+                or self._chat_outbound_calls_in_window(chat_id) >= _TELEGRAM_CHAT_INTERIM_SOFT_LIMIT
+            )
         ):
             logger.debug(
-                "[%s] skipping interim edit for chat %s (shared send+edit budget: slot busy)",
+                "[%s] skipping interim edit for chat %s (shared send+edit budget)",
                 self.name, chat_id)
             return SendResult(success=True, message_id=message_id, raw_response={"skipped": True})
         self._hold_chat_outbound_slot(chat_id)
@@ -3740,10 +3791,12 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
             self._last_overflow_preview.pop(_preview_key, None)
         try:
             if not finalize:
+                self._record_chat_outbound_call(chat_id)
                 await self._edit_text(chat_id, message_id, content)
                 if _saturated_preview:
                     self._last_overflow_preview[_preview_key] = content
                 return SendResult(success=True, message_id=message_id)
+            self._record_chat_outbound_call(chat_id)
             await self._edit_markdown_or_plain(
                 chat_id, message_id, self.format_message(content), _strip_mdv2(content) if content else content,
                 "[%s] MarkdownV2 edit failed, falling back to plain text: %s")
@@ -3763,6 +3816,7 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
                 truncated = self._truncate_stream_overflow_preview(content)
                 if self._last_overflow_preview.get(_preview_key) == truncated:
                     return SendResult(success=True, message_id=message_id)
+                self._record_chat_outbound_call(chat_id)
                 await self._edit_text(chat_id, message_id, truncated)
                 self._last_overflow_preview[_preview_key] = truncated
                 return SendResult(success=True, message_id=message_id)
@@ -3779,10 +3833,11 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
                     logger.warning(
                         "[%s] Telegram flood control, refusing edit (retry_after %.1fs > %.0fs inline cap)",
                         self.name, wait, _FLOOD_INLINE_WAIT_CAP_SECS)
-                    return self._record_send_flood_cooldown(chat_id, wait)
+                    return self._record_send_flood_cooldown(chat_id, _preserve_int_retry_after(raw_retry_after, wait))
                 logger.warning("[%s] Telegram flood control, waiting %.1fs", self.name, wait)
                 await asyncio.sleep(wait)
                 try:
+                    self._record_chat_outbound_call(chat_id)
                     await self._edit_text(chat_id, message_id, content)
                     return SendResult(success=True, message_id=message_id)
                 except Exception as retry_err:
@@ -3797,7 +3852,11 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
                         # first refusal asked for. Fail closed canonically so the ledger arms its
                         # timer on this delay rather than storing the platform's raw wording, which
                         # it would read as an ordinary failure and never redeliver.
-                        final_wait = retry_wait if retry_wait is not None else wait
+                        final_wait = (
+                            _preserve_int_retry_after(raw_retry_wait, retry_wait)
+                            if retry_wait is not None
+                            else _preserve_int_retry_after(raw_retry_after, wait)
+                        )
                         return self._record_send_flood_cooldown(chat_id, final_wait)
                     return SendResult(success=False, error=safe_retry_error)
             safe_error = _redact_telegram_error_text(e)
@@ -3834,6 +3893,7 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
                 else:
                     # Degrade to stripped text on finalize (raw ** / ``` would render literally); previews stay raw.
                     text = _strip_mdv2(chunk) if finalize else chunk
+                self._record_chat_outbound_call(chat_id)
                 return await _await_with_thread_deadline(
                     self._bot.send_message(
                     chat_id=normalize_telegram_chat_id(chat_id), text=text, parse_mode=ParseMode.MARKDOWN_V2 if use_markdown else None,
@@ -3844,6 +3904,7 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
                     retry_thread_kwargs = self._thread_kwargs_for_send(
                         chat_id, thread_id, metadata, reply_to_message_id=None)
                     try:
+                        self._record_chat_outbound_call(chat_id)
                         return await _await_with_thread_deadline(
                             self._bot.send_message(
                             chat_id=normalize_telegram_chat_id(chat_id), text=_strip_mdv2(chunk) if finalize else chunk,
@@ -3869,6 +3930,7 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
             chunks = [content]  # defensive: a single chunk just edits normally
         first_chunk = chunks[0]
         try:
+            self._record_chat_outbound_call(chat_id)
             if finalize:
                 await self._edit_markdown_or_plain(
                     chat_id, message_id, _separate_chunk_indicator_from_fence(self.format_message(first_chunk)), _strip_mdv2(first_chunk),
@@ -5227,12 +5289,21 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
         """Suppress Telegram typing refreshes for this chat after transient failures."""
         if not hasattr(self, "_telegram_typing_cooldown_until"):
             self._telegram_typing_cooldown_until = {}
-        delay = coerce_retry_after_seconds(getattr(exc, "retry_after", None))
-        if delay is None:
-            delay = coerce_retry_after_seconds(str(exc))
-        if delay is None:
-            delay = self._telegram_typing_cooldown_seconds
-        self._telegram_typing_cooldown_until[str(chat_id)] = asyncio.get_running_loop().time() + max(1.0, min(delay, 300.0))
+        explicit_delay = coerce_retry_after_seconds(getattr(exc, "retry_after", None))
+        if explicit_delay is None:
+            explicit_delay = coerce_retry_after_seconds(str(exc))
+        delay = explicit_delay if explicit_delay is not None else self._telegram_typing_cooldown_seconds
+        clamped = max(1.0, min(float(delay), _MAX_FLOOD_COOLDOWN_SECS))
+        now = asyncio.get_running_loop().time()
+        for stale in [k for k, t in self._telegram_typing_cooldown_until.items() if t <= now]:
+            del self._telegram_typing_cooldown_until[stale]
+        key = str(chat_id)
+        self._telegram_typing_cooldown_until[key] = max(
+            self._telegram_typing_cooldown_until.get(key, 0.0),
+            now + clamped,
+        )
+        if explicit_delay is not None:
+            self._record_send_flood_cooldown(chat_id, explicit_delay)
 
     # --- per-chat send ordering + flood cooldown (#114396) ---------------------------------------------
     # Both keyed by the Bot-API-normalized chat id: the text path passes the raw chat_id while the media
@@ -5261,12 +5332,17 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
                 if not getattr(lock, "_waiters", None):  # nobody queued: drop the entry (bounded dict)
                     locks.pop(key, None)
 
-    def _record_send_flood_cooldown(self, chat_id: Any, wait: float) -> SendResult:
+    def _record_send_flood_cooldown(self, chat_id: Any, wait: float | int) -> SendResult:
         """A send refused with ``retry_after=wait`` arms a per-chat window during which ``send()`` fails
         closed locally (same ``flood_control:<s>`` result, so ledger recognition and redelivery timing are
         unchanged) instead of firing more requests into a penalty Telegram lengthens while it is hammered."""
         until: dict[str, float] = self.__dict__.setdefault("_telegram_send_cooldown_until", {})
-        until[str(normalize_telegram_chat_id(chat_id))] = asyncio.get_running_loop().time() + max(1.0, min(float(wait), 300.0))
+        now = asyncio.get_running_loop().time()
+        for stale in [k for k, t in until.items() if t <= now]:
+            del until[stale]
+        key = str(normalize_telegram_chat_id(chat_id))
+        clamped = max(1.0, min(float(wait), _MAX_FLOOD_COOLDOWN_SECS))
+        until[key] = max(until.get(key, 0.0), now + clamped)
         return _flood_cap_result(wait)
 
     def _send_flood_cooldown_remaining(self, chat_id: Any) -> Optional[float]:
@@ -5307,6 +5383,43 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
         slot_until[str(normalize_telegram_chat_id(chat_id))] = (
             asyncio.get_running_loop().time() + max(0.0, budget))
 
+    @staticmethod
+    def _rate_window_now() -> float:
+        try:
+            return asyncio.get_running_loop().time()
+        except RuntimeError:
+            return time.monotonic()
+
+    @staticmethod
+    def _prune_chat_outbound_calls(calls_by_chat: dict[str, deque[float]], now: float) -> None:
+        cutoff = now - _TELEGRAM_CHAT_RATE_WINDOW_SECS
+        for k in list(calls_by_chat.keys()):
+            dq = calls_by_chat[k]
+            while dq and dq[0] <= cutoff:
+                dq.popleft()
+            if not dq:
+                del calls_by_chat[k]
+
+    def _record_chat_outbound_call(self, chat_id: Any) -> None:
+        """Record an actual Telegram Bot API outbound call in the per-chat 60s sliding window."""
+        calls_by_chat: dict[str, deque[float]] = self.__dict__.setdefault("_telegram_chat_outbound_calls", {})
+        now = self._rate_window_now()
+        self._prune_chat_outbound_calls(calls_by_chat, now)
+        key = str(normalize_telegram_chat_id(chat_id))
+        dq = calls_by_chat.get(key)
+        if dq is None:
+            dq = deque()
+            calls_by_chat[key] = dq
+        dq.append(now)
+
+    def _chat_outbound_calls_in_window(self, chat_id: Any) -> int:
+        """Return the number of actual Telegram Bot API outbound calls for ``chat_id`` in the last 60s."""
+        calls_by_chat: dict[str, deque[float]] = self.__dict__.setdefault("_telegram_chat_outbound_calls", {})
+        now = self._rate_window_now()
+        self._prune_chat_outbound_calls(calls_by_chat, now)
+        dq = calls_by_chat.get(str(normalize_telegram_chat_id(chat_id)))
+        return len(dq) if dq is not None else 0
+
     async def send_typing(self, chat_id: str, metadata: Optional[dict[str, Any]] = None) -> None:
         """Send typing indicator."""
         if not self._bot or not typing_may_fire(self, chat_id):
@@ -5315,6 +5428,7 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
         message_thread_id: Optional[int] = None
 
         async def _action(**kw) -> None:
+            self._record_chat_outbound_call(chat_id)
             await self._bot.send_chat_action(chat_id=normalize_telegram_chat_id(chat_id), action="typing", **kw)
             self._telegram_typing_cooldown_until.pop(str(chat_id), None)
         try:

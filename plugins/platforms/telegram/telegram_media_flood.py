@@ -165,6 +165,9 @@ class TelegramMediaFloodMixin:
             async with self._chat_send_lock(chat_id):
                 wait = self._send_flood_cooldown_remaining(chat_id)
                 if wait is None:
+                    rec_fn = getattr(self, "_record_chat_outbound_call", None)
+                    if callable(rec_fn):
+                        rec_fn(chat_id)
                     yield
                     return
                 if stage == 0 or waits >= _MAX_WINDOW_WAITS or (stage == 1 and wait > _FLOOD_INLINE_WAIT_CAP_SECS):

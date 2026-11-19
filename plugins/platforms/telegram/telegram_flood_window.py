@@ -41,15 +41,32 @@ async def _after_window(adapter: Any, chat_id: Any, delete: Callable[[], Awaitab
     """``inline`` (the caller awaits it): every wake re-checks the cap, so a window another request
     extended meanwhile is handed to the background task instead of being slept on the caller's turn."""
     from plugins.platforms.telegram.adapter import _FLOOD_INLINE_WAIT_CAP_SECS
+    slot_fn = getattr(adapter, "_chat_outbound_slot_remaining", None)
+    hold_fn = getattr(adapter, "_hold_chat_outbound_slot", None)
+    rec_fn = getattr(adapter, "_record_chat_outbound_call", None)
     for waits in range(_MAX_WINDOW_WAITS + 2):  # re-check after the last allowed wait
         remaining = adapter._send_flood_cooldown_remaining(chat_id)
-        if remaining is None:
-            return await delete()
-        if waits > _MAX_WINDOW_WAITS:
-            break
-        if inline and remaining > _FLOOD_INLINE_WAIT_CAP_SECS:
-            return _defer(adapter, chat_id, delete, remaining)
-        await asyncio.sleep(remaining)
+        if remaining is not None:
+            if waits > _MAX_WINDOW_WAITS:
+                break
+            if inline and remaining > _FLOOD_INLINE_WAIT_CAP_SECS:
+                return _defer(adapter, chat_id, delete, remaining)
+            await asyncio.sleep(remaining)
+            continue
+        slot_rem = float(slot_fn(chat_id)) if callable(slot_fn) else 0.0
+        if slot_rem > 0:
+            if waits > _MAX_WINDOW_WAITS:
+                break
+            await asyncio.sleep(slot_rem)
+            continue
+        if callable(hold_fn):
+            hold_fn(chat_id)
+        if callable(rec_fn):
+            rec_fn(chat_id)
+        return await delete()
+    remaining = adapter._send_flood_cooldown_remaining(chat_id)
+    if inline and remaining is not None and remaining > _FLOOD_INLINE_WAIT_CAP_SECS:
+        return _defer(adapter, chat_id, delete, remaining)
     logger.warning("[%s] message delete in chat %s dropped: flood window kept re-arming", adapter.name, chat_id)
     return False
 
@@ -92,13 +109,17 @@ async def delete_message(adapter: Any, chat_id: str, message_id: str) -> bool:
 async def send_draft(adapter: Any, chat_id: str, draft_id: int, content: str, metadata: Optional[dict[str, Any]]) -> SendResult:
     """``TelegramAdapter.send_draft`` body: rich draft, else MarkdownV2 then plain ``sendMessageDraft``."""
     from plugins.platforms.telegram.adapter import (
-        _TEXT_SEND_DEADLINE, ParseMode, _await_with_thread_deadline, _redact_telegram_error_text, normalize_telegram_chat_id,
-        utf16_len)
+        _TELEGRAM_CHAT_INTERIM_SOFT_LIMIT, _TEXT_SEND_DEADLINE, ParseMode, _await_with_thread_deadline,
+        _redact_telegram_error_text, normalize_telegram_chat_id, utf16_len)
     if not adapter._bot:
         return SendResult(success=False, error="not_connected")
     # A frame inside the chat's flood window is skipped (#107612): the next frame or the final send supersedes it.
     if (skipped := skipped_draft(adapter, chat_id)) is not None:
         return skipped
+    calls_fn = getattr(adapter, "_chat_outbound_calls_in_window", None)
+    if callable(calls_fn) and calls_fn(chat_id) >= _TELEGRAM_CHAT_INTERIM_SOFT_LIMIT:
+        logger.debug("[%s] skipping draft frame for chat %s: 60s soft limit reached", adapter.name, chat_id)
+        return SendResult(success=True, message_id=None, raw_response={"skipped": True})
     # Rich draft fast-path; any failure degrades to the plain draft below. Drafts have no message_id.
     if adapter._should_attempt_rich_draft(content) and await adapter._try_send_rich_draft(chat_id, draft_id, content, metadata):
         return SendResult(success=True, message_id=None)
@@ -115,6 +136,7 @@ async def send_draft(adapter: Any, chat_id: str, draft_id: int, content: str, me
         getattr(adapter, "_rich_messages_enabled", False) and not getattr(adapter, "_rich_drafts_enabled", False)
         and adapter._needs_rich_rendering(text))
     draft_thread_kwargs = adapter._thread_kwargs_for_draft(chat_id, metadata)
+    rec_fn = getattr(adapter, "_record_chat_outbound_call", None)
     for use_markdown in ((False,) if plain_rich_preview else (True, False)):
         kwargs: dict[str, Any] = {
             "chat_id": normalize_telegram_chat_id(chat_id), "draft_id": int(draft_id),
@@ -123,6 +145,8 @@ async def send_draft(adapter: Any, chat_id: str, draft_id: int, content: str, me
             kwargs["parse_mode"] = ParseMode.MARKDOWN_V2
         kwargs.update(draft_thread_kwargs)
         try:
+            if callable(rec_fn):
+                rec_fn(chat_id)
             if await _await_with_thread_deadline(
                 adapter._bot.send_message_draft(**kwargs), timeout=_TEXT_SEND_DEADLINE, label="telegram-send", dump_on_blocked_loop=False):
                 return SendResult(success=True, message_id=None)

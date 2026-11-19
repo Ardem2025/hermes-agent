@@ -73,6 +73,23 @@ def _settle_progress_send(st, result) -> None:
         st.flood_pending = False
 
 
+def _is_skipped_result(result) -> bool:
+    raw = getattr(result, "raw_response", None)
+    return bool(getattr(result, "success", False) and isinstance(raw, dict) and raw.get("skipped"))
+
+
+_ACTIVE_PROGRESS_LOOPS: dict[tuple[int, str], int] = {}
+
+
+def _progress_chat_key(adapter: Any, chat_id: Any) -> tuple[int, str]:
+    raw = str(chat_id or "").strip()
+    try:
+        norm = str(int(raw))
+    except (TypeError, ValueError):
+        norm = raw
+    return (id(adapter), norm)
+
+
 def _tool_lifecycle_payload(call_id, tool_name, args) -> dict:
     """The ``ToolStartPayload`` contract every client reads (``tool_id``/``name``/``context``),
     plus the ``tool_call_id``/``tool_name`` the gateway's own consumers were built on."""
@@ -765,11 +782,11 @@ class GatewayTurnProgressMixin:
             replace_mode=ctx.progress_grouping == "replace",
         )
 
-    async def _edit_progress_message(self, st, message_id: str, content: str):
+    async def _edit_progress_message(self, st, message_id: str, content: str, *, finalize: bool = False):
         ctx = self._ctx
         kwargs = {"chat_id": ctx.source.chat_id, "message_id": message_id, "content": content}
         if getattr(st.adapter, "REQUIRES_EDIT_FINALIZE", False):
-            kwargs["finalize"] = True
+            kwargs["finalize"] = finalize
         if st._edit_accepts_metadata:
             kwargs["metadata"] = ctx._progress_metadata
         return await st.adapter.edit_message(**kwargs)
@@ -810,7 +827,7 @@ class GatewayTurnProgressMixin:
         if len(groups) <= 1:
             return False
         if st.progress_msg_id is not None:
-            result = await self._edit_progress_message(st, st.progress_msg_id, self._progress_text(groups[0]))
+            result = await self._edit_progress_message(st, st.progress_msg_id, self._progress_text(groups[0]), finalize=True)
             if not result.success:
                 if getattr(result, "retryable", False) or _note_flood(st, result):
                     logger.debug("[%s] Transient overflow edit failure — keeping can_edit=True", st.adapter.name)
@@ -863,7 +880,7 @@ class GatewayTurnProgressMixin:
     async def _flush_progress_edit(self, st) -> None:
         if st.can_edit and st.progress_lines and st.progress_msg_id and not _in_flood_window(st):
             with suppress(Exception):
-                await self._edit_progress_message(st, st.progress_msg_id, self._progress_text(st.progress_lines))
+                await self._edit_progress_message(st, st.progress_msg_id, self._progress_text(st.progress_lines), finalize=True)
 
     async def _drain_progress_on_cancel(self, st) -> None:
         ctx = self._ctx
@@ -902,7 +919,10 @@ class GatewayTurnProgressMixin:
             st.flood_pending = True
             return False
         if st.can_edit and st.progress_msg_id is not None:
-            result = await self._edit_progress_message(st, st.progress_msg_id, "\n".join(st.progress_lines))
+            result = await self._edit_progress_message(st, st.progress_msg_id, "\n".join(st.progress_lines), finalize=False)
+            if _is_skipped_result(result):
+                st.flood_pending = True
+                return False
             if result.success:
                 st.flood_pending = False
                 return True
@@ -937,7 +957,9 @@ class GatewayTurnProgressMixin:
         if not self._ctx._run_still_current() or self._agent_interrupted():
             return False
         if st.owed_bubbles:
-            result = await self._edit_progress_message(st, *st.owed_bubbles[0])
+            result = await self._edit_progress_message(st, *st.owed_bubbles[0], finalize=True)
+            if _is_skipped_result(result):
+                return True
             if result.success or not (getattr(result, "retryable", False) or _note_flood(st, result)):
                 st.owed_bubbles.pop(0)
             return True
@@ -963,45 +985,55 @@ class GatewayTurnProgressMixin:
         st = self._progress_edit_state(adapter)
         last_edit_ts = 0.0
         EDIT_INTERVAL = 1.5  # Minimum seconds between edits (Telegram flood control)
-        while True:
-            try:
-                if not ctx._run_still_current():
-                    self._drain_progress_queue()
-                    return
-                raw = ctx.progress_queue.get_nowait()
-                # Drain silently when interrupted: events queued in the window between tool parse
-                # and interrupt processing should not render as bubbles.
-                if self._agent_interrupted():
-                    await asyncio.sleep(0)
-                    continue
-                if self._is_reset_marker(raw):
-                    self._reset_progress_bubble(st)
-                    continue
-                msg = self._progress_absorb(st, raw)
-                if not await self._roll_progress_overflow_if_needed(st):
-                    # Throttle edits: batch rapid tool updates into fewer API calls (grammY pattern:
-                    # proactively rate-limit rather than react to 429s). Loop back to drain further
-                    # queued messages before sending a single batched edit.
-                    remaining = EDIT_INTERVAL - (time.monotonic() - last_edit_ts)
-                    if remaining > 0:
-                        await asyncio.sleep(remaining)
-                        continue
+        progress_key = _progress_chat_key(adapter, ctx.source.chat_id)
+        _ACTIVE_PROGRESS_LOOPS[progress_key] = _ACTIVE_PROGRESS_LOOPS.get(progress_key, 0) + 1
+        try:
+            while True:
+                effective_interval = min(10.0, EDIT_INTERVAL * max(1, _ACTIVE_PROGRESS_LOOPS.get(progress_key, 1)))
+                try:
                     if not ctx._run_still_current():
+                        self._drain_progress_queue()
                         return
-                    if not await self._progress_send_or_edit(st, msg):
+                    raw = ctx.progress_queue.get_nowait()
+                    # Drain silently when interrupted: events queued in the window between tool parse
+                    # and interrupt processing should not render as bubbles.
+                    if self._agent_interrupted():
+                        await asyncio.sleep(0)
                         continue
-                last_edit_ts = time.monotonic()
-                await self._progress_restore_typing(st)
-            except queue.Empty:
-                if time.monotonic() - last_edit_ts >= EDIT_INTERVAL and await self._deliver_flood_pending_progress(st):
+                    if self._is_reset_marker(raw):
+                        self._reset_progress_bubble(st)
+                        continue
+                    msg = self._progress_absorb(st, raw)
+                    if not await self._roll_progress_overflow_if_needed(st):
+                        # Throttle edits: batch rapid tool updates into fewer API calls (grammY pattern:
+                        # proactively rate-limit rather than react to 429s). Loop back to drain further
+                        # queued messages before sending a single batched edit.
+                        remaining = effective_interval - (time.monotonic() - last_edit_ts)
+                        if remaining > 0:
+                            await asyncio.sleep(remaining)
+                            continue
+                        if not ctx._run_still_current():
+                            return
+                        if not await self._progress_send_or_edit(st, msg):
+                            continue
                     last_edit_ts = time.monotonic()
-                await asyncio.sleep(0.3)
-            except asyncio.CancelledError:
-                await self._drain_progress_on_cancel(st)
-                return
-            except Exception as e:
-                logger.error("Progress message error: %s", e)
-                await asyncio.sleep(1)
+                    await self._progress_restore_typing(st)
+                except queue.Empty:
+                    if time.monotonic() - last_edit_ts >= effective_interval and await self._deliver_flood_pending_progress(st):
+                        last_edit_ts = time.monotonic()
+                    await asyncio.sleep(0.3)
+                except asyncio.CancelledError:
+                    await self._drain_progress_on_cancel(st)
+                    return
+                except Exception as e:
+                    logger.error("Progress message error: %s", e)
+                    await asyncio.sleep(1)
+        finally:
+            remaining_loops = _ACTIVE_PROGRESS_LOOPS.get(progress_key, 0) - 1
+            if remaining_loops > 0:
+                _ACTIVE_PROGRESS_LOOPS[progress_key] = remaining_loops
+            else:
+                _ACTIVE_PROGRESS_LOOPS.pop(progress_key, None)
 
     # ── ID-bearing lifecycle callbacks (agent thread) ───────────────────────────────────────
 
