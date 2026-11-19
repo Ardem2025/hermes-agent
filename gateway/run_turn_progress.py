@@ -232,6 +232,9 @@ class GatewayTurnProgressMixin:
             # the progress queue drains on a background task, that raw JSON typically lands right underneath
             # the rendered prompt (#52374).
             or tool_name == "clarify"
+            # On Telegram, SubagentPulseTicker owns the live delegation card; emitting a separate
+            # tool.started bubble for delegate_task causes a 1-3s flicker/duplicate before cleanup.
+            or (tool_name == "delegate_task" and self._uses_telegram_pulse_ticker())
             or self._agent_interrupted()
         ):
             return
@@ -244,6 +247,30 @@ class GatewayTurnProgressMixin:
             self._progress_emit(msg)
 
 
+    def _resolve_telegram_pulse_adapter(self):
+        ctx = self._ctx
+        adapter = (
+            getattr(ctx, "_live_status_adapter", None)
+            or getattr(ctx, "_status_adapter", None)
+            or getattr(self._runner, "adapter", None)
+        )
+        if adapter is None and hasattr(self._runner, "_delivery_adapter_for"):
+            with suppress(Exception):
+                adapter = self._runner._delivery_adapter_for(ctx.source)
+        return adapter
+
+    def _uses_telegram_pulse_ticker(self) -> bool:
+        """True when Telegram SubagentPulseTicker owns delegation progress for this turn."""
+        ctx = self._ctx
+        if getattr(ctx, "_pulse_ticker", None) is not None:
+            return True
+        raw_platform = getattr(getattr(ctx, "source", None), "platform", None)
+        platform = getattr(raw_platform, "value", raw_platform)
+        if platform != "telegram":
+            return False
+        chat_id = getattr(getattr(ctx, "source", None), "chat_id", None)
+        return bool(chat_id and self._resolve_telegram_pulse_adapter())
+
     def _handle_subagent_pulse(self, event_type: str, tool_name: str | None, preview: str | None, args: dict | None, kwargs: dict) -> None:
         """Route subagent events to SubagentPulseTicker for Telegram."""
         ctx = self._ctx
@@ -251,7 +278,7 @@ class GatewayTurnProgressMixin:
         platform = getattr(raw_platform, "value", raw_platform)
         if platform != "telegram":
             return
-        adapter = getattr(ctx, "_live_status_adapter", None) or getattr(self._runner, "adapter", None)
+        adapter = self._resolve_telegram_pulse_adapter()
         if not adapter:
             return
 
@@ -295,7 +322,13 @@ class GatewayTurnProgressMixin:
             ticker.on_subagent_complete(task_idx, status, summary)
             active_left = any(t.get("status") == "running" for t in ticker.tasks.values())
             if not active_left:
-                self._schedule(ticker.stop(status=status, summary=summary), "subagent pulse ticker complete")
+                failed_task = next(
+                    (t for t in ticker.tasks.values() if t.get("status") not in ("running", "completed")),
+                    None,
+                )
+                final_status = str(failed_task.get("status")) if failed_task is not None else status
+                final_summary = str(failed_task.get("summary") or summary or "") if failed_task is not None else summary
+                self._schedule(ticker.stop(status=final_status, summary=final_summary), "subagent pulse ticker complete")
 
     def _progress_subagent_notice(self, preview, kwargs: dict) -> None:
         """Only terminal failure statuses render (same notice rail as credit warnings)."""

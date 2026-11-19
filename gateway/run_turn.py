@@ -1844,6 +1844,7 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
     async def _run_agent_cleanup_turn_tasks(
         self, turn_ctx: TurnContext, *, progress_task: Any, log_task: Any, interrupt_monitor: asyncio.Task,
         _notify_task: asyncio.Task, tracking_task: asyncio.Task, stream_task: Any,
+        interrupted: Optional[bool] = None,
     ) -> None:
         """``finally`` half of a turn: cancel background tasks, flush stream, release the session slot."""
         stream_consumer_holder, session_key = turn_ctx.stream_consumer_holder, turn_ctx.session_key
@@ -1870,8 +1871,24 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
 
         pulse_ticker = getattr(turn_ctx, "_pulse_ticker", None)
         if pulse_ticker and getattr(pulse_ticker, "active", False):
-            with suppress(Exception):
-                await pulse_ticker.stop(status="interrupted")
+            _agent_obj = turn_ctx.agent_holder[0] if getattr(turn_ctx, "agent_holder", None) else None
+            _result_obj = turn_ctx.result_holder[0] if getattr(turn_ctx, "result_holder", None) else None
+            _is_interrupted = bool(
+                interrupted
+                or getattr(_agent_obj, "is_interrupted", False)
+                or (isinstance(_result_obj, dict) and _result_obj.get("interrupted"))
+                or getattr(self, "_draining", False)
+            )
+            _tasks = getattr(pulse_ticker, "tasks", None)
+            _has_running = isinstance(_tasks, dict) and any(
+                isinstance(t, dict) and t.get("status") == "running" for t in _tasks.values()
+            )
+            if _is_interrupted:
+                with suppress(Exception):
+                    await pulse_ticker.stop(status="interrupted")
+            elif not _has_running:
+                with suppress(Exception):
+                    await pulse_ticker.stop(status="completed")
 
         tracking_task.cancel()
         if session_key:
@@ -2212,6 +2229,7 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
             else spawn(self._run_agent_notify_long_running(disp, turn_ctx, _executor_task_holder))
         )
 
+        _turn_interrupted = False
         try:
             # run_sync is TurnRunner.run_sync (bound method; executor call unchanged).
             worker = self._run_agent_start_turn_worker(turn_ctx, turn_runner.run_sync)
@@ -2230,10 +2248,24 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
                 return await self._run_agent_queued_followup(
                     turn_ctx, adapter, pending, pending_event, response, result, stream_task,
                 )
+        except BaseException as _turn_exc:
+            if isinstance(_turn_exc, asyncio.CancelledError) or _interrupt_detected.is_set():
+                _turn_interrupted = True
+            raise
         finally:
+            _agent_obj = turn_ctx.agent_holder[0] if turn_ctx.agent_holder else None
+            _result_obj = turn_ctx.result_holder[0] if turn_ctx.result_holder else None
+            _turn_interrupted = bool(
+                _turn_interrupted
+                or _interrupt_detected.is_set()
+                or getattr(_agent_obj, "is_interrupted", False)
+                or (isinstance(_result_obj, dict) and _result_obj.get("interrupted"))
+                or getattr(self, "_draining", False)
+            )
             await self._run_agent_cleanup_turn_tasks(
                 turn_ctx, progress_task=progress_task, log_task=log_task, interrupt_monitor=interrupt_monitor,
                 _notify_task=_notify_task, tracking_task=tracking_task, stream_task=stream_task,
+                interrupted=_turn_interrupted,
             )
             if turn_ctx._cleanup_msg_ids:
                 _adapter = _cleanup_adapter or self._delivery_adapter_for(source)

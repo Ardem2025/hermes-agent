@@ -18,9 +18,18 @@ import uuid
 from pathlib import Path
 from typing import Any, Optional
 
-from agent.display import _TOOL_VERBS_RU
+from agent.display import _TOOL_VERBS_RU, get_tool_verb
 
 logger = logging.getLogger("gateway.subagent_pulse_ticker")
+
+
+def _is_ru_language() -> bool:
+    """Return True when active UI language is Russian."""
+    try:
+        from agent.i18n import get_language
+        return get_language() == "ru"
+    except Exception:
+        return False
 
 
 class SubagentPulseTicker:
@@ -65,11 +74,14 @@ class SubagentPulseTicker:
     ) -> None:
         """Register subagent task start."""
         path_obj = Path(transcript_path) if transcript_path else None
+        is_ru = _is_ru_language()
+        default_goal = f"Задача #{task_index + 1}" if is_ru else f"Task #{task_index + 1}"
+        init_action = "🚀 Инициализация окружения..." if is_ru else "🚀 Initializing environment..."
         self.tasks[task_index] = {
-            "goal": goal or f"Задача #{task_index + 1}",
+            "goal": goal or default_goal,
             "path": path_obj,
             "started_at": time.time(),
-            "last_action": "🚀 Инициализация окружения...",
+            "last_action": init_action,
             "status": "running",
             "summary": None,
         }
@@ -81,8 +93,9 @@ class SubagentPulseTicker:
         if task_index in self.tasks:
             self.tasks[task_index]["last_action"] = action
         else:
+            default_goal = f"Задача #{task_index + 1}" if _is_ru_language() else f"Task #{task_index + 1}"
             self.tasks[task_index] = {
-                "goal": f"Задача #{task_index + 1}",
+                "goal": default_goal,
                 "path": None,
                 "started_at": time.time(),
                 "last_action": action,
@@ -99,19 +112,20 @@ class SubagentPulseTicker:
         summary: Optional[str] = None,
     ) -> None:
         """Record subagent completion."""
+        is_ru = _is_ru_language()
+        done_label = "✅ Завершен" if is_ru else "✅ Completed"
+        err_label = f"❌ Ошибка ({status})" if is_ru else f"❌ Error ({status})"
         if task_index in self.tasks:
             self.tasks[task_index]["status"] = status
             self.tasks[task_index]["summary"] = summary
-            if status == "completed":
-                self.tasks[task_index]["last_action"] = "✅ Завершен"
-            else:
-                self.tasks[task_index]["last_action"] = f"❌ Ошибка ({status})"
+            self.tasks[task_index]["last_action"] = done_label if status == "completed" else err_label
         else:
+            default_goal = f"Задача #{task_index + 1}" if is_ru else f"Task #{task_index + 1}"
             self.tasks[task_index] = {
-                "goal": f"Задача #{task_index + 1}",
+                "goal": default_goal,
                 "path": None,
                 "started_at": time.time(),
-                "last_action": "✅ Завершен" if status == "completed" else f"❌ {status}",
+                "last_action": done_label if status == "completed" else f"❌ {status}",
                 "status": status,
                 "summary": summary,
             }
@@ -133,16 +147,19 @@ class SubagentPulseTicker:
 
     @staticmethod
     def safe_read_transcript(path: Optional[Path | str]) -> str:
-        """Safely read tail of live transcript log and map to Russian tool action."""
+        """Safely read tail of live transcript log and map to localized tool action."""
+        is_ru = _is_ru_language()
+        init_msg = "🚀 Инициализация окружения..." if is_ru else "🚀 Initializing environment..."
+        running_msg = "⚙️ Выполнение..." if is_ru else "⚙️ Running..."
         if not path:
-            return "🚀 Инициализация окружения..."
+            return init_msg
         path_obj = Path(path)
         if not path_obj.exists():
-            return "🚀 Инициализация окружения..."
+            return init_msg
         try:
             stat = path_obj.stat()
             if stat.st_size == 0:
-                return "🚀 Инициализация окружения..."
+                return init_msg
             read_size = min(4096, stat.st_size)
             with path_obj.open("r", encoding="utf-8", errors="replace") as f:
                 if stat.st_size > read_size:
@@ -150,11 +167,12 @@ class SubagentPulseTicker:
                 content = f.read()
             return SubagentPulseTicker._parse_action_from_content(content)
         except (FileNotFoundError, OSError, UnicodeDecodeError):
-            return "⚙️ Выполнение..."
+            return running_msg
 
     @staticmethod
     def _parse_action_from_content(content: str) -> str:
         """Extract tool action line from transcript tail."""
+        is_ru = _is_ru_language()
         lines = [line.strip() for line in content.splitlines() if line.strip()]
         for line in reversed(lines):
             if " tool " in line and "->" in line:
@@ -163,18 +181,22 @@ class SubagentPulseTicker:
                 match = re.match(r"^([a-zA-Z0-9_-]+)\((.*)\)$", action_part)
                 if match:
                     tool_name, args = match.groups()
-                    tool_ru = _TOOL_VERBS_RU.get(tool_name, tool_name)
+                    if is_ru:
+                        tool_label = _TOOL_VERBS_RU.get(tool_name, tool_name)
+                    else:
+                        tool_label = get_tool_verb(tool_name) or tool_name
                     arg_preview = args.strip()[:35]
                     if arg_preview:
-                        return f"⚙️ {tool_ru} ({arg_preview})"
-                    return f"⚙️ {tool_ru}"
+                        return f"⚙️ {tool_label} ({arg_preview})"
+                    return f"⚙️ {tool_label}"
                 return f"⚙️ {action_part[:40]}"
             if " result " in line:
                 result_part = line.split(" result ", 1)[-1].strip()
-                return f"⚙️ Обработка: {result_part[:35]}"
+                prefix = "Обработка" if is_ru else "Processing"
+                return f"⚙️ {prefix}: {result_part[:35]}"
             if " start " in line:
-                return "🚀 Запуск шага..."
-        return "⚙️ Выполнение..."
+                return "🚀 Запуск шага..." if is_ru else "🚀 Starting step..."
+        return "⚙️ Выполнение..." if is_ru else "⚙️ Running..."
 
     def _format_time(self, seconds: float) -> str:
         """Format seconds into MM:SS."""
@@ -183,21 +205,28 @@ class SubagentPulseTicker:
         return f"{mins:02d}:{s:02d}"
 
     def _render_card(self, cancelled: bool = False, final_status: Optional[str] = None) -> str:
-        """Render text card according to BDD specifications."""
+        """Render text card according to BDD specifications and active language."""
         now = time.time()
         elapsed = now - self.started_at
         time_str = self._format_time(elapsed)
+        is_ru = _is_ru_language()
 
         if cancelled:
-            return f"⏹️ [{time_str}] 🔀 Выполнение отменено пользователем"
+            if is_ru:
+                return f"⏹️ [{time_str}] 🔀 Выполнение отменено пользователем"
+            return f"⏹️ [{time_str}] 🔀 Execution cancelled by user"
 
         # Check global timeout
         if elapsed >= 900:
-            return "⏱️ [15:00] 🔀 Превышен таймаут выполнения (900s)"
+            if is_ru:
+                return "⏱️ [15:00] 🔀 Превышен таймаут выполнения (900s)"
+            return "⏱️ [15:00] 🔀 Execution timeout exceeded (900s)"
 
         total_tasks = len(self.tasks)
         if total_tasks == 0:
-            return f"⏳ [{time_str}] 🔀 Субагент: подготовка..."
+            if is_ru:
+                return f"⏳ [{time_str}] 🔀 Субагент: подготовка..."
+            return f"⏳ [{time_str}] 🔀 Subagent: preparing..."
 
         active_tasks = [t for t in self.tasks.values() if t.get("status") == "running"]
         active_count = len(active_tasks)
@@ -213,33 +242,50 @@ class SubagentPulseTicker:
                 summary = task.get("summary") or ""
                 summary_snippet = f": {summary[:60]}" if summary else ""
                 if st == "completed":
-                    return f"✅ [{time_str}] 🔀 Субагент 1/1 завершен{summary_snippet}"
-                return f"❌ [{time_str}] 🔀 Субагент 1/1 ошибка ({st}){summary_snippet}"
+                    if is_ru:
+                        return f"✅ [{time_str}] 🔀 Субагент 1/1 завершен{summary_snippet}"
+                    return f"✅ [{time_str}] 🔀 Subagent 1/1 completed{summary_snippet}"
+                if is_ru:
+                    return f"❌ [{time_str}] 🔀 Субагент 1/1 ошибка ({st}){summary_snippet}"
+                return f"❌ [{time_str}] 🔀 Subagent 1/1 error ({st}){summary_snippet}"
 
             # Running
             action = task.get("last_action") or ""
             if task.get("path"):
                 action = self.safe_read_transcript(task.get("path"))
-            goal_short = goal[:45] if goal else "Выполнение задачи"
+            default_goal = "Выполнение задачи" if is_ru else "Running task"
+            goal_short = goal[:45] if goal else default_goal
             newline = '\n'
-            return f"⏳ [{time_str}] 🔀 Субагент 1/1: {goal_short}{newline}↳ {action}"
+            label = "Субагент 1/1" if is_ru else "Subagent 1/1"
+            return f"⏳ [{time_str}] 🔀 {label}: {goal_short}{newline}↳ {action}"
 
         # Batch mode (N > 1)
         if final_status == "completed" or (active_count == 0 and not final_status):
-            return f"✅ [{time_str}] 🔀 Все субагенты ({total_tasks}) завершены"
+            if is_ru:
+                return f"✅ [{time_str}] 🔀 Все субагенты ({total_tasks}) завершены"
+            return f"✅ [{time_str}] 🔀 All subagents ({total_tasks}) completed"
 
         if final_status and final_status != "completed":
-            return f"❌ [{time_str}] 🔀 Субагенты остановлены ({final_status})"
+            if is_ru:
+                return f"❌ [{time_str}] 🔀 Субагенты остановлены ({final_status})"
+            return f"❌ [{time_str}] 🔀 Subagents stopped ({final_status})"
 
-        lines = [f"⏳ [{time_str}] 🔀 Субагенты ({active_count} активны):"]
+        header = (
+            f"⏳ [{time_str}] 🔀 Субагенты ({active_count} активны):"
+            if is_ru
+            else f"⏳ [{time_str}] 🔀 Subagents ({active_count} active):"
+        )
+        lines = [header]
         for idx in sorted(self.tasks.keys()):
             task = self.tasks[idx]
             task_status = task.get("status", "running")
             task_elapsed = self._format_time(now - task.get("started_at", self.started_at))
             if task_status == "completed":
-                lines.append(f" • #{idx + 1} [{task_elapsed}] ✅ Завершен")
+                done_txt = "✅ Завершен" if is_ru else "✅ Completed"
+                lines.append(f" • #{idx + 1} [{task_elapsed}] {done_txt}")
             elif task_status in ("failed", "error"):
-                lines.append(f" • #{idx + 1} [{task_elapsed}] ❌ Ошибка")
+                err_txt = "❌ Ошибка" if is_ru else "❌ Error"
+                lines.append(f" • #{idx + 1} [{task_elapsed}] {err_txt}")
             else:
                 action = task.get("last_action") or ""
                 if task.get("path"):
@@ -273,10 +319,8 @@ class SubagentPulseTicker:
                     self._last_content = text
                     if getattr(res, "message_id", None):
                         self.current_message_id = str(res.message_id)
-                        if self.turn_context is not None and getattr(self.turn_context, "_cleanup_progress", False):
-                            msg_ids = getattr(self.turn_context, "_cleanup_msg_ids", None)
-                            if isinstance(msg_ids, list) and self.current_message_id not in msg_ids:
-                                msg_ids.append(self.current_message_id)
+                        # Delegation pulse cards stay visible in chat across parent turn completion
+                        # (even when cleanup_progress=True) so background subagents remain observable.
             except Exception as exc:
                 err_msg = str(exc).lower()
                 # Suppress "message is not modified"
@@ -309,12 +353,13 @@ class SubagentPulseTicker:
 
                 await asyncio.sleep(self.interval)
         except asyncio.CancelledError:
-            # User cancellation or turn cleanup
-            cancel_card = self._render_card(cancelled=True)
-            try:
-                await self._send_or_edit(cancel_card)
-            except Exception:
-                pass
+            # User cancellation or external task abort (skip when stop() already set active=False)
+            if self.active:
+                cancel_card = self._render_card(cancelled=True)
+                try:
+                    await self._send_or_edit(cancel_card)
+                except Exception:
+                    pass
             raise
         except Exception as exc:
             logger.debug("Unexpected error in SubagentPulseTicker loop: %s", exc)
