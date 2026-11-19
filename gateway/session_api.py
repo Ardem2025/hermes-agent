@@ -4,6 +4,8 @@ from functools import partial
 import hashlib
 import json
 import logging
+import os
+from pathlib import Path
 
 from gateway.config import Platform
 from gateway.session import SessionEntry, SessionSource, _is_path_unsafe
@@ -97,7 +99,14 @@ def _telegram_row_profile_matches(authority, row):
             origin_profile = origin.get('profile')
     elif isinstance(raw_origin, dict):
         origin_profile = raw_origin.get('profile')
-    allowed = {authority.profile_id, _served_profile(authority)} - {None, ''}
+    served = _served_profile(authority)
+    pid = authority.profile_id
+    allowed = {pid, served} - {None, ''}
+    if served is None and isinstance(pid, str) and pid:
+        is_fs_path = os.path.isabs(pid) or os.sep in pid or (os.altsep is not None and os.altsep in pid)
+        if is_fs_path:
+            from gateway.session_authorities import served_profile_name
+            allowed.add(served_profile_name(Path(pid)))
     if not allowed:
         allowed = {'default'}
     if row_profile and row_profile not in allowed:
