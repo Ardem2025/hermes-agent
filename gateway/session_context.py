@@ -63,6 +63,7 @@ _SESSION_ASYNC_DELIVERY = ContextVar("HERMES_SESSION_ASYNC_DELIVERY", default=_U
 # Request-local proof that the client resumes SessionDB history. No env fallback
 # or child-process export: a bound id alone cannot authorize detached delivery.
 _SESSION_HISTORY_DELIVERY = ContextVar("HERMES_SESSION_HISTORY_DELIVERY", default=_UNSET)
+_SESSION_AUTO_RESUME = ContextVar("HERMES_AUTO_RESUME_ON_DELEGATION", default=_UNSET)
 
 # Cron auto-delivery vars, set per-job in run_job() so concurrent jobs don't clobber.
 _CRON_AUTO_DELIVER_PLATFORM = ContextVar("HERMES_CRON_AUTO_DELIVER_PLATFORM", default=_UNSET)
@@ -162,8 +163,8 @@ def set_session_vars(
     user_name: str = "", scope_id: str = "", session_key: str = "", session_id: str = "",
     message_id: str = "", profile: str = "", cwd: str = "", async_delivery: bool = True,
     ui_session_id: str = "", cron_session: Any = _UNSET, parent_chat_id: str = "",
-    session_history_delivery: str | None = None, actor_id: str | None = None, actor_name: str | None = None,
-    turn_event: Any = None,
+    session_history_delivery: str | None = None, auto_resume_on_delegation: bool | None = None,
+    actor_id: str | None = None, actor_name: str | None = None, turn_event: Any = None,
 ) -> list:
     """Set all session context variables and return reset tokens.  Call
     ``clear_session_vars(tokens)`` in a ``finally``; not nestable, clearing resets every var
@@ -184,6 +185,7 @@ def set_session_vars(
     tokens = [var.set(value) for var, value in zip(_SESSION_VARS, values)]
     tokens.append(_SESSION_ASYNC_DELIVERY.set(bool(async_delivery)))
     tokens.append(_SESSION_HISTORY_DELIVERY.set(_UNSET if session_history_delivery is None else session_history_delivery))
+    tokens.append(_SESSION_AUTO_RESUME.set(_UNSET if auto_resume_on_delegation is None else bool(auto_resume_on_delegation)))
     tokens.append(_SESSION_TURN_EVENT.set(turn_event))
     _runtime_cwd("set_session_cwd", cwd)
     return tokens
@@ -199,6 +201,7 @@ def clear_session_vars(tokens: list) -> None:
         var.set("")
     _SESSION_ASYNC_DELIVERY.set(_UNSET)
     _SESSION_HISTORY_DELIVERY.set(_UNSET)
+    _SESSION_AUTO_RESUME.set(_UNSET)
     _SESSION_TURN_EVENT.set(None)
     _runtime_cwd("clear_session_cwd")
 
@@ -213,6 +216,7 @@ def reset_session_vars() -> None:
         var.set(_UNSET)
     _SESSION_ASYNC_DELIVERY.set(_UNSET)
     _SESSION_HISTORY_DELIVERY.set(_UNSET)
+    _SESSION_AUTO_RESUME.set(_UNSET)
     _SESSION_TURN_EVENT.set(None)
     _runtime_cwd("clear_session_cwd")
 
@@ -281,3 +285,10 @@ def session_history_delivery_supported() -> bool:
 
     Fail closed on omitted bindings; never borrow authority from the environment."""
     return _SESSION_HISTORY_DELIVERY.get() == "1"
+
+
+def auto_resume_on_delegation_supported() -> bool:
+    """Whether this interactive session opted into coordinator auto-wake on delegation.
+
+    Fail closed on omitted bindings; stateless /v1/chat/completions turns stay False."""
+    return _SESSION_AUTO_RESUME.get() is True

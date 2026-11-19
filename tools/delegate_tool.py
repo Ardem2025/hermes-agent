@@ -36,7 +36,9 @@ from tools.delegate_tool_config import (
     _resolve_child_runtime, _resolve_delegation_credentials,
     _subagent_auto_approve, _subagent_auto_deny,
 )
-from tools.delegate_tool_dispatch import _Batch, _announce_batch, _capture_origin, _run_batch
+from tools.delegate_tool_dispatch import (
+    _Batch, _announce_batch, _capture_auto_resume_on_delegation, _capture_origin, _run_batch,
+)
 from tools.delegate_tool_progress import (
     DelegateEvent, SUBAGENT_FAILURE_STATUSES, _batch_prefix, _build_child_progress_callback,
     _build_child_system_prompt, _clean_error_text, _emit_parent_console, _quiet, _resolve_workspace_hint,
@@ -692,6 +694,7 @@ def delegate_task(
         _settle_refused_transcripts(refused, live_deleg_id, live_writers, _live_home)
     _announce_batch(parent_agent, len(task_list), live_deleg_id)
     origin = _capture_origin()
+    origin_auto_resume = _capture_auto_resume_on_delegation(parent_agent)
 
     children, err = _build_children(
         task_list, task_schemas, routes, top_role=top_role, max_iterations=default_max_iter, parent_agent=parent_agent,
@@ -703,6 +706,7 @@ def delegate_task(
         task_list, children, parent_agent, creds, context, top_role, max_children,
         live_deleg_id, live_writers, live_paths, *origin, overall_start,
         live_home=_live_home, refused=refused,
+        origin_auto_resume_on_delegation=origin_auto_resume,
     )
     return _run_batch(batch, background)
 

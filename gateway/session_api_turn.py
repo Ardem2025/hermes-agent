@@ -29,7 +29,7 @@ _PROGRESS_EVENTS = frozenset({'tool.started', 'tool.completed'}) | _SUBAGENT_PRO
 _SETTING_KEYS = ('ephemeral_system_prompt', 'requested_model', 'requested_provider',
                  'model_options', 'route', 'session_model', 'confirmed_runtime_lock',
                  'requested_runtime', 'route_source', 'room_dispatch', 'room_execution_policy',
-                 'session_history_delivery')
+                 'session_history_delivery', 'auto_resume_on_delegation')
 _OWNER_SCOPE_RE = re.compile(r'[0-9a-f]{64}')
 
 
@@ -102,7 +102,10 @@ def api_session_vars():
     current = api_execution.get()
     if current is None:
         return {}
-    return {'session_history_delivery': current['settings'].get('session_history_delivery') or ''}
+    return {
+        'session_history_delivery': current['settings'].get('session_history_delivery') or '',
+        'auto_resume_on_delegation': bool(current['settings'].get('auto_resume_on_delegation')),
+    }
 
 
 def check_api_settings(adapter, settings):

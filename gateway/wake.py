@@ -377,19 +377,35 @@ def reset_consecutive_auto_wakes(session_id: str) -> None:
     _CONSECUTIVE_AUTO_WAKES.pop(str(session_id), None)
 
 
+def _parse_json_dict(val: Any) -> dict[str, Any]:
+    if isinstance(val, dict):
+        return val
+    if isinstance(val, str) and val.strip():
+        import json
+        try:
+            parsed = json.loads(val)
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            pass
+    return {}
+
+
 def check_coordinator_wake_eligibility(session_id: str, adapter: Any, evt: Optional[dict] = None) -> bool:
     """Check if an async_delegation completion event should autonomously wake a coordinator session.
 
     Conditions for auto-wake:
     1. Pending human gates (clarifications/choice prompts) MUST be clear.
     2. Bounded loop protection: consecutive_auto_wakes must be strictly less than MAX_CONSECUTIVE_AUTO_WAKES (10).
-    3. The session must be an active SpDD coordinator (active passport under ~/.hermes/tasks/*/state.json
-       matching session_id, or auto_resume_on_delegation=True in session/event metadata).
+    3. Session must not currently hold an active turn lease.
+    4. Session must be an interactive/coordinator session (event flag, real SessionDB fields, or active SpDD passport).
     """
     if not session_id:
         return False
 
-    sid = str(session_id)
+    sid = str(session_id).strip()
+    if not sid:
+        return False
 
     # 1. Check pending clarify
     try:
@@ -413,38 +429,45 @@ def check_coordinator_wake_eligibility(session_id: str, adapter: Any, evt: Optio
         logger.info("coordinator auto-wake suppressed: session %s holds active turn lease (in-flight turn will consume delivery)", sid)
         return False
 
-    # 4. Check if SpDD coordinator intent
-    # 3a. Event metadata
+    # 4a. Event metadata
     if evt:
         if evt.get("auto_resume_on_delegation") is True or evt.get("auto_resume") is True:
             return True
         meta = evt.get("metadata")
-        if isinstance(meta, dict) and (meta.get("auto_resume_on_delegation") or meta.get("auto_resume")):
+        if isinstance(meta, dict) and (meta.get("auto_resume_on_delegation") is True or meta.get("auto_resume") is True):
             return True
 
-    # 3b. Session metadata via adapter / SessionDB
+    # 4b. SessionDB real schema (created_source, model_config, origin_json — no sessions.metadata column)
     if adapter is not None:
+        db_inst: Any = None
         ensure = getattr(adapter, "_ensure_session_db", None)
         if callable(ensure):
             try:
-                db_inst: Any = ensure()
-                get_sess = getattr(db_inst, "get_session", None)
-                if callable(get_sess):
-                    row = get_sess(sid)
-                    if row:
-                        smeta = row.get("metadata") or {}
-                        if isinstance(smeta, str):
-                            import json
-                            try:
-                                smeta = json.loads(smeta)
-                            except Exception:
-                                smeta = {}
-                        if smeta.get("auto_resume_on_delegation") or smeta.get("coordinator_role"):
-                            return True
+                db_inst = ensure()
             except Exception as exc:
-                logger.debug("session metadata check error for session %s: %s", sid, exc)
+                logger.debug("session db ensure error for session %s: %s", sid, exc)
+        if db_inst is None:
+            db_inst = getattr(adapter, "_session_db", None)
+        if db_inst is None:
+            runner = getattr(adapter, "gateway_runner", None)
+            db_inst = getattr(runner, "session_db", None) if runner else None
+        if db_inst is not None:
+            get_sess = getattr(db_inst, "get_session", None)
+            if callable(get_sess):
+                try:
+                    row = get_sess(sid)
+                    if isinstance(row, dict):
+                        created_source = str(row.get("created_source") or "").strip().lower()
+                        if created_source in ("telegram", "webui"):
+                            return True
+                        for raw_cfg in (row.get("model_config"), row.get("origin_json")):
+                            cfg = _parse_json_dict(raw_cfg)
+                            if cfg.get("auto_resume_on_delegation") is True or bool(cfg.get("coordinator_role")):
+                                return True
+                except Exception as exc:
+                    logger.debug("session metadata check error for session %s: %s", sid, exc)
 
-    # 3c. Active SpDD task passport in ~/.hermes/tasks/*/state.json
+    # 4c. Active SpDD task passport in ~/.hermes/tasks/*/state.json
     try:
         from pathlib import Path
         import json
@@ -454,7 +477,7 @@ def check_coordinator_wake_eligibility(session_id: str, adapter: Any, evt: Optio
                 try:
                     data = json.loads(passport.read_text(encoding="utf-8"))
                     p_status = data.get("status")
-                    p_sid = data.get("session_id")
+                    p_sid = data.get("session_id") or data.get("coordinator_session_id")
                     if p_sid and str(p_sid) == sid and p_status in ("in_progress", "active"):
                         return True
                 except Exception:

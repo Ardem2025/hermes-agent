@@ -54,6 +54,7 @@ class _Batch:
     # Result entries of tasks their backend refused (no child): joined into a sync result, listed in a background
     # call's dispatch payload. Units carved for async dispatch never carry them.
     refused: list = field(default_factory=list)
+    origin_auto_resume_on_delegation: bool = False
 
     def owner_kwargs(self) -> dict[str, Any]:
         """Steer/stop authority of the originating session, passed to every child run."""
@@ -89,6 +90,17 @@ def _capture_origin() -> tuple[str, str, Any, Any, bool]:
         _origin_ui_session_id = get_session_env("HERMES_UI_SESSION_ID", "")
         _origin_session_history_delivery = session_history_delivery_supported()
     return (_origin_wake_sid, _origin_ui_session_id, *_capture_gateway_steer_authority(_origin_ui_session_id), _origin_session_history_delivery)
+
+
+def _capture_auto_resume_on_delegation(parent_agent: Any = None) -> bool:
+    """Capture whether the parent turn opted into coordinator auto-wake on delegation."""
+    try:
+        from gateway.session_context import auto_resume_on_delegation_supported
+        if auto_resume_on_delegation_supported():
+            return True
+    except Exception:
+        pass
+    return getattr(parent_agent, "_auto_resume_on_delegation", False) is True
 
 def _report_child_done(parent_agent, spinner_ref, entry, tag, task_labels, n_tasks, remaining) -> None:
     """Print one completion line for a finished child and refresh the spinner text. Failed/errored/timed-out children
@@ -448,7 +460,9 @@ def _dispatch_unit(unit: _Batch, unit_id: Optional[str], slot_key: Optional[str]
         task_transcripts={str(i): str(unit.live_writers[i].path) for i, _, _ in unit.children
                           if i < len(unit.live_writers) and unit.live_writers[i] is not None
                           and unit.live_writers[i].path is not None},
-        progress_fn=lambda: _batch_progress_token(child_agents), **routing,
+        progress_fn=lambda: _batch_progress_token(child_agents),
+        auto_resume_on_delegation=bool(unit.origin_auto_resume_on_delegation),
+        **routing,
     )
 
 def _restore_parent_cancellation(unit: _Batch) -> None:

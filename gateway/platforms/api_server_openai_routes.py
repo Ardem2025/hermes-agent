@@ -955,6 +955,8 @@ class OpenAICompatRoutesMixin:
             # and the client can resume the session by sending it again). A fingerprint-derived
             # id from a header-less client is NOT: delegate_task keeps its forced-sync fallback
             # there — the wake would hard-fail or land in history that client never reloads.
+            # Never reset consecutive auto-wakes or set auto_resume_on_delegation here:
+            # internal wake self-POSTs enter via /v1/chat/completions.
             session_history_delivery=("1" if provided_session_id else ""))
         run_kwargs.update(self._authority_chat_kwargs(request, provided_session_id))
         # This is presentation only. The ordinary API-key/session authorization

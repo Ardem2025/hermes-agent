@@ -3198,6 +3198,10 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 "route_source": runtime_request.get("route_source") or "",
                 "confirmed": bool(runtime_request.get("require_model_lock")),
                 "updated_at": time.time()}}
+        raw_source = str(body.get("source") or "").strip().lower()
+        if raw_source == "webui" or source == "webui":
+            model_config = dict(model_config) if isinstance(model_config, dict) else {}
+            model_config["auto_resume_on_delegation"] = True
         title = body.get("title")
 
         def _atomic(conn):
@@ -3995,6 +3999,10 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             return handed_off
         gateway_session_key = ctx["gateway_session_key"]
         session_id = ctx["session_id"]
+        from gateway.wake import reset_consecutive_auto_wakes
+        reset_consecutive_auto_wakes(session_id)
+        await asyncio.to_thread(self._mark_session_auto_resume, session_id)
+        ctx["run_kwargs"]["auto_resume_on_delegation"] = True
         duplicate_to_telegram = bool(
             ctx["body"].get("duplicate_to_telegram")
             if "duplicate_to_telegram" in ctx["body"]
@@ -4060,6 +4068,10 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         if handed_off is not None:
             return handed_off
         gateway_session_key, session_id = ctx["gateway_session_key"], ctx["session_id"]
+        from gateway.wake import reset_consecutive_auto_wakes
+        reset_consecutive_auto_wakes(session_id)
+        await asyncio.to_thread(self._mark_session_auto_resume, session_id)
+        ctx["run_kwargs"]["auto_resume_on_delegation"] = True
         user_message, runtime_request = ctx["user_message"], ctx["runtime_request"]
         runtime_meta = self._sanitize_runtime_metadata(
             requested_runtime=runtime_request.get("requested"),
@@ -4744,10 +4756,17 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 code="rate_limit_exceeded", headers={"Retry-After": "1"})
         return None
 
-    @staticmethod
+    def _mark_session_auto_resume(self, session_id: str) -> None:
+        try:
+            db = self._ensure_session_db()
+            if db is not None and hasattr(db, "patch_session_model_config"):
+                db.patch_session_model_config(session_id, {"auto_resume_on_delegation": True})
+        except Exception:
+            logger.debug("Failed to persist auto_resume_on_delegation for %s", session_id, exc_info=True)
+
     def _bind_api_server_session(
         *, chat_id: str = "", session_key: str = "", session_id: str = "", profile: str = "",
-        session_history_delivery: str = "") -> list:
+        session_history_delivery: str = "", auto_resume_on_delegation: bool = False) -> list:
         """Bind an API turn with push disabled and history delivery default-denied.
 
         Only routes whose continuation reads SessionDB may pass "1". An omitted
@@ -4759,7 +4778,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         from gateway.session_context import set_session_vars
         return set_session_vars(
             platform="api_server", chat_id=chat_id, session_key=session_key, session_id=session_id,
-            profile=profile, async_delivery=False, cron_session="", session_history_delivery=session_history_delivery)
+            profile=profile, async_delivery=False, cron_session="", session_history_delivery=session_history_delivery,
+            auto_resume_on_delegation=(True if auto_resume_on_delegation else None))
 
     def _turn_runtime_metadata(
         self, agent: Any, *, route: Optional[dict[str, Any]], requested_runtime: Optional[dict[str, Any]],
@@ -4842,7 +4862,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         requested_runtime: Optional[dict[str, Any]] = None, route_source: str = "global",
         confirmed_runtime_lock: bool = False, bind_declared_conversation: bool = False,
         request_id: Optional[str] = None, history_from_session: bool = False, run_owner_scope=None,
-        session_history_delivery: str = "", turn_author: Optional[dict[str, Any]] = None,
+        session_history_delivery: str = "", auto_resume_on_delegation: bool = False,
+        turn_author: Optional[dict[str, Any]] = None,
         relay_metadata: Optional[dict[str, Any]] = None, notification_category: str = "result",
         resume_unanswered_turn: bool = False, approval_notify_callback=None,
         approval_session_key: Optional[str] = None, walked_from: Optional[str] = None) -> tuple:
@@ -4874,6 +4895,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 route_source=route_source, confirmed_runtime_lock=confirmed_runtime_lock,
                 bind_declared_conversation=bind_declared_conversation, request_id=request_id, run_owner_scope=run_owner_scope,
                 history_from_session=history_from_session, session_history_delivery=session_history_delivery,
+                auto_resume_on_delegation=auto_resume_on_delegation,
                 turn_author=turn_author, resume_unanswered_turn=resume_unanswered_turn, relay_metadata=relay_metadata,
                 approval_notify_callback=approval_notify_callback, approval_session_key=approval_session_key)
         loop = asyncio.get_running_loop()
@@ -4886,7 +4908,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 tokens = self._bind_api_server_session(
                     chat_id=session_id or "", session_key=gateway_session_key or session_id or "",
                     session_id=session_id or "", profile=request_profile or "",
-                    session_history_delivery=session_history_delivery)
+                    session_history_delivery=session_history_delivery,
+                    auto_resume_on_delegation=auto_resume_on_delegation)
                 agent = None
                 from agent.notification_presentation import notification_turn
                 from gateway.warning_notifications import diagnostic_turn_muted
