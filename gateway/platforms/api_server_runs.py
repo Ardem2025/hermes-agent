@@ -660,6 +660,12 @@ async def run_internal_session_turn(self, *, session_id: str, text: str, profile
     if not profile:
         raise ValueError("run_internal_session_turn requires the owning profile")
     token = _api_server._api_request_profile.set(profile)
+    ensure_loop = getattr(self, "_ensure_pulse_loop", None)
+    if callable(ensure_loop):
+        ensure_loop()
+    elif getattr(self, "_pulse_loop", None) is None:
+        with suppress(RuntimeError):
+            self._pulse_loop = asyncio.get_running_loop()
     attempts = 1 + len(_RETRY_DELAYS_SECONDS)
     last_err: Optional[BaseException] = None
     try:
@@ -691,11 +697,43 @@ async def run_internal_session_turn(self, *, session_id: str, text: str, profile
                 model_alias=self._model_name)
             if err is not None:
                 raise RuntimeError(f"internal wake route conflict for session {resolved!r}")
+            run_agent_kwargs: dict[str, Any] = {}
+            if (
+                getattr(getattr(self, "gateway_runner", None), "session_authority", None) is None
+                and callable(getattr(self, "is_telegram_bound", None))
+                and self.is_telegram_bound(resolved)
+                and callable(getattr(self, "handle_session_subagent_pulse", None))
+            ):
+                _wake_pulse_events = getattr(
+                    _api_server,
+                    "_SUBAGENT_PULSE_EVENTS",
+                    frozenset({"subagent.start", "subagent.progress", "subagent.complete", "subagent_progress"}),
+                )
+
+                def _wake_tool_progress(
+                    event_type: str,
+                    tool_name: str | None = None,
+                    preview: str | None = None,
+                    args: Any = None,
+                    **kwargs,
+                ) -> None:
+                    if event_type in _wake_pulse_events:
+                        self.handle_session_subagent_pulse(
+                            resolved,
+                            event_type,
+                            tool_name,
+                            preview,
+                            args,
+                            **kwargs,
+                        )
+
+                run_agent_kwargs["tool_progress_callback"] = _wake_tool_progress
             await self._run_agent(
                 user_message=text, conversation_history=history, session_id=resolved,
                 gateway_session_key=None, **overrides, route=route, requested_runtime={},
                 route_source="global", session_history_delivery="1",
                 notification_category=notification_category,
+                **run_agent_kwargs,
             )
             return
         raise RuntimeError(

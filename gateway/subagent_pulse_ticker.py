@@ -3,7 +3,7 @@
 Provides real-time dynamic card updates in Telegram during subagent execution:
 - Elapsed timer (MM:SS)
 - Safe transcript tail reading (~4KB) with tool verb translation
-- Batch subagent aggregation (tasks: dict[int, dict])
+- Batch subagent aggregation (tasks: dict[int | str, dict])
 - Telegram Flood Control (429) & 'message is not modified' handling
 - Bounded 3.0s cadence and cancellation/stop cleanup
 """
@@ -67,23 +67,103 @@ class SubagentPulseTicker:
         self._last_content: str = ""
         self._lock = asyncio.Lock()
 
-        # Registry of subagent tasks: task_index -> dict
-        # {task_index: {"goal": str, "path": Optional[Path], "started_at": float,
-        #               "last_action": str, "status": str, "summary": Optional[str]}}
-        self.tasks: dict[int, dict[str, Any]] = {}
+        # Registry of subagent tasks: task_key (int | str) -> dict
+        # {task_key: {"seq": int, "task_index": int, "delegation_id": Optional[str],
+        #             "subagent_id": Optional[str], "goal": str, "path": Optional[Path],
+        #             "started_at": float, "last_action": str, "status": str,
+        #             "summary": Optional[str]}}
+        self.tasks: dict[int | str, dict[str, Any]] = {}
+        self._task_seq: int = 0
+        self._subagent_key_aliases: dict[str, int | str] = {}
+
+    @staticmethod
+    def _coerce_task_index(task_index: Any) -> int:
+        if task_index is None:
+            return 0
+        try:
+            return int(task_index)
+        except (TypeError, ValueError):
+            return 0
+
+    def _resolve_task_key(
+        self,
+        task_index: int = 0,
+        delegation_id: Optional[str] = None,
+        subagent_id: Optional[str] = None,
+        *,
+        create: bool = False,
+    ) -> int | str:
+        """Resolve canonical task key (str when delegation_id/subagent_id present, else int)."""
+        idx = self._coerce_task_index(task_index)
+        deleg = str(delegation_id).strip() if delegation_id else None
+        sub_id = str(subagent_id).strip() if subagent_id else None
+
+        if deleg:
+            canonical = f"{deleg}:{idx}"
+            if canonical in self.tasks:
+                if sub_id:
+                    self._subagent_key_aliases[sub_id] = canonical
+                return canonical
+
+        if sub_id and sub_id in self._subagent_key_aliases:
+            aliased = self._subagent_key_aliases[sub_id]
+            if aliased in self.tasks:
+                return aliased
+
+        if not deleg and not sub_id:
+            if idx in self.tasks:
+                return idx
+            if not create:
+                running_matches = [
+                    (k, t)
+                    for k, t in self.tasks.items()
+                    if t.get("status") == "running" and t.get("task_index") == idx
+                ]
+                if running_matches:
+                    best_key, _ = max(
+                        running_matches,
+                        key=lambda item: (item[1].get("seq", 0), item[1].get("started_at", 0.0)),
+                    )
+                    return best_key
+
+        if deleg:
+            key: int | str = f"{deleg}:{idx}"
+        elif sub_id:
+            key = f"subagent:{sub_id}"
+        else:
+            key = idx
+
+        if sub_id:
+            self._subagent_key_aliases[sub_id] = key
+        return key
 
     def on_subagent_start(
         self,
         task_index: int = 0,
         goal: str = "",
         transcript_path: Optional[str | Path] = None,
+        *,
+        delegation_id: Optional[str] = None,
+        subagent_id: Optional[str] = None,
     ) -> None:
         """Register subagent task start."""
+        idx = self._coerce_task_index(task_index)
+        key = self._resolve_task_key(
+            idx,
+            delegation_id=delegation_id,
+            subagent_id=subagent_id,
+            create=True,
+        )
         path_obj = Path(transcript_path) if transcript_path else None
         is_ru = _is_ru_language()
-        default_goal = f"Задача #{task_index + 1}" if is_ru else f"Task #{task_index + 1}"
+        default_goal = f"Задача #{idx + 1}" if is_ru else f"Task #{idx + 1}"
         init_action = "🚀 Инициализация окружения..." if is_ru else "🚀 Initializing environment..."
-        self.tasks[task_index] = {
+        self._task_seq += 1
+        self.tasks[key] = {
+            "seq": self._task_seq,
+            "task_index": idx,
+            "delegation_id": str(delegation_id).strip() if delegation_id else None,
+            "subagent_id": str(subagent_id).strip() if subagent_id else None,
             "goal": goal or default_goal,
             "path": path_obj,
             "started_at": time.time(),
@@ -94,13 +174,36 @@ class SubagentPulseTicker:
 
     register_task = on_subagent_start
 
-    def on_subagent_progress(self, task_index: int = 0, action: str = "") -> None:
+    def on_subagent_progress(
+        self,
+        task_index: int = 0,
+        action: str = "",
+        *,
+        delegation_id: Optional[str] = None,
+        subagent_id: Optional[str] = None,
+    ) -> None:
         """Update current action of subagent."""
-        if task_index in self.tasks:
-            self.tasks[task_index]["last_action"] = action
+        idx = self._coerce_task_index(task_index)
+        key = self._resolve_task_key(
+            idx,
+            delegation_id=delegation_id,
+            subagent_id=subagent_id,
+            create=False,
+        )
+        if key in self.tasks:
+            self.tasks[key]["last_action"] = action
+            if delegation_id and not self.tasks[key].get("delegation_id"):
+                self.tasks[key]["delegation_id"] = str(delegation_id).strip()
+            if subagent_id and not self.tasks[key].get("subagent_id"):
+                self.tasks[key]["subagent_id"] = str(subagent_id).strip()
         else:
-            default_goal = f"Задача #{task_index + 1}" if _is_ru_language() else f"Task #{task_index + 1}"
-            self.tasks[task_index] = {
+            default_goal = f"Задача #{idx + 1}" if _is_ru_language() else f"Task #{idx + 1}"
+            self._task_seq += 1
+            self.tasks[key] = {
+                "seq": self._task_seq,
+                "task_index": idx,
+                "delegation_id": str(delegation_id).strip() if delegation_id else None,
+                "subagent_id": str(subagent_id).strip() if subagent_id else None,
                 "goal": default_goal,
                 "path": None,
                 "started_at": time.time(),
@@ -116,18 +219,37 @@ class SubagentPulseTicker:
         task_index: int = 0,
         status: str = "completed",
         summary: Optional[str] = None,
+        *,
+        delegation_id: Optional[str] = None,
+        subagent_id: Optional[str] = None,
     ) -> None:
         """Record subagent completion."""
+        idx = self._coerce_task_index(task_index)
+        key = self._resolve_task_key(
+            idx,
+            delegation_id=delegation_id,
+            subagent_id=subagent_id,
+            create=False,
+        )
         is_ru = _is_ru_language()
         done_label = "✅ Завершен" if is_ru else "✅ Completed"
         err_label = f"❌ Ошибка ({status})" if is_ru else f"❌ Error ({status})"
-        if task_index in self.tasks:
-            self.tasks[task_index]["status"] = status
-            self.tasks[task_index]["summary"] = summary
-            self.tasks[task_index]["last_action"] = done_label if status == "completed" else err_label
+        if key in self.tasks:
+            self.tasks[key]["status"] = status
+            self.tasks[key]["summary"] = summary
+            self.tasks[key]["last_action"] = done_label if status == "completed" else err_label
+            if delegation_id and not self.tasks[key].get("delegation_id"):
+                self.tasks[key]["delegation_id"] = str(delegation_id).strip()
+            if subagent_id and not self.tasks[key].get("subagent_id"):
+                self.tasks[key]["subagent_id"] = str(subagent_id).strip()
         else:
-            default_goal = f"Задача #{task_index + 1}" if is_ru else f"Task #{task_index + 1}"
-            self.tasks[task_index] = {
+            default_goal = f"Задача #{idx + 1}" if is_ru else f"Task #{idx + 1}"
+            self._task_seq += 1
+            self.tasks[key] = {
+                "seq": self._task_seq,
+                "task_index": idx,
+                "delegation_id": str(delegation_id).strip() if delegation_id else None,
+                "subagent_id": str(subagent_id).strip() if subagent_id else None,
                 "goal": default_goal,
                 "path": None,
                 "started_at": time.time(),
@@ -237,6 +359,9 @@ class SubagentPulseTicker:
 
         active_tasks = [t for t in self.tasks.values() if t.get("status") == "running"]
         active_count = len(active_tasks)
+        effective_final_status = final_status
+        if effective_final_status == "completed" and active_count > 0:
+            effective_final_status = None
 
         # Single subagent mode
         if total_tasks == 1:
@@ -244,8 +369,8 @@ class SubagentPulseTicker:
             goal = task.get("goal", "")
             status = task.get("status", "running")
 
-            if final_status or status != "running":
-                st = final_status or status
+            if effective_final_status or status != "running":
+                st = effective_final_status or status
                 summary = task.get("summary") or ""
                 summary_snippet = f": {summary[:60]}" if summary else ""
                 if st == "completed":
@@ -267,15 +392,15 @@ class SubagentPulseTicker:
             return f"⏳ [{interim_time_str}] 🔀 {label}: {goal_short}{newline}↳ {action}"
 
         # Batch mode (N > 1)
-        if final_status == "completed" or (active_count == 0 and not final_status):
+        if effective_final_status == "completed" or (active_count == 0 and not effective_final_status):
             if is_ru:
                 return f"✅ [{time_str}] 🔀 Все субагенты ({total_tasks}) завершены"
             return f"✅ [{time_str}] 🔀 All subagents ({total_tasks}) completed"
 
-        if final_status and final_status != "completed":
+        if effective_final_status and effective_final_status != "completed":
             if is_ru:
-                return f"❌ [{time_str}] 🔀 Субагенты остановлены ({final_status})"
-            return f"❌ [{time_str}] 🔀 Subagents stopped ({final_status})"
+                return f"❌ [{time_str}] 🔀 Субагенты остановлены ({effective_final_status})"
+            return f"❌ [{time_str}] 🔀 Subagents stopped ({effective_final_status})"
 
         header = (
             f"⏳ [{interim_time_str}] 🔀 Субагенты ({active_count} активны):"
@@ -283,21 +408,24 @@ class SubagentPulseTicker:
             else f"⏳ [{interim_time_str}] 🔀 Subagents ({active_count} active):"
         )
         lines = [header]
-        for idx in sorted(self.tasks.keys()):
-            task = self.tasks[idx]
+        ordered_tasks = sorted(
+            self.tasks.items(),
+            key=lambda item: (item[1].get("seq", 0), item[1].get("started_at", 0.0), str(item[0])),
+        )
+        for display_idx, (_, task) in enumerate(ordered_tasks, start=1):
             task_status = task.get("status", "running")
             task_elapsed = self._format_time(now - task.get("started_at", self.started_at), quantize_secs=30)
             if task_status == "completed":
                 done_txt = "✅ Завершен" if is_ru else "✅ Completed"
-                lines.append(f" • #{idx + 1} [{task_elapsed}] {done_txt}")
-            elif task_status in ("failed", "error"):
+                lines.append(f" • #{display_idx} [{task_elapsed}] {done_txt}")
+            elif task_status in ("failed", "error", "timeout", "cancelled"):
                 err_txt = "❌ Ошибка" if is_ru else "❌ Error"
-                lines.append(f" • #{idx + 1} [{task_elapsed}] {err_txt}")
+                lines.append(f" • #{display_idx} [{task_elapsed}] {err_txt}")
             else:
                 action = task.get("last_action") or ""
                 if task.get("path"):
                     action = self.safe_read_transcript(task.get("path"))
-                lines.append(f" • #{idx + 1} [{task_elapsed}] {action}")
+                lines.append(f" • #{display_idx} [{task_elapsed}] {action}")
 
         return "\n".join(lines)
 
@@ -386,11 +514,23 @@ class SubagentPulseTicker:
         except Exception as exc:
             logger.debug("Unexpected error in SubagentPulseTicker loop: %s", exc)
 
-    async def stop(self, status: str = "completed", summary: str = "") -> None:
+    async def stop(self, status: str = "completed", summary: str = "", *, force: bool = False) -> None:
         """Stop ticker and render final state card."""
+        if (
+            status == "completed"
+            and not force
+            and any(t.get("status") == "running" for t in self.tasks.values())
+        ):
+            return
+
         self.active = False
-        if summary and 0 in self.tasks:
-            self.tasks[0]["summary"] = summary
+        if summary:
+            if 0 in self.tasks:
+                self.tasks[0]["summary"] = summary
+            elif len(self.tasks) == 1:
+                only_task = next(iter(self.tasks.values()))
+                if not only_task.get("summary"):
+                    only_task["summary"] = summary
         if self.ticker_task and not self.ticker_task.done():
             self.ticker_task.cancel()
             try:
@@ -405,7 +545,10 @@ class SubagentPulseTicker:
         except Exception as exc:
             logger.debug("Final pulse render error (non-fatal): %s", exc)
 
-        if status == "completed" and self.cleanup_progress and self.current_message_id:
+        all_tasks_completed = bool(self.tasks) and all(
+            t.get("status") == "completed" for t in self.tasks.values()
+        )
+        if status == "completed" and self.cleanup_progress and self.current_message_id and all_tasks_completed:
             delete_fn = getattr(self.adapter, "delete_message", None)
             if callable(delete_fn):
                 try:

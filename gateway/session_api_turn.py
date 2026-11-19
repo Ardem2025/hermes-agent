@@ -5,7 +5,9 @@ from contextlib import contextmanager
 from functools import partial
 import hmac
 import json
+import logging
 import re
+from typing import Any
 import uuid
 
 from gateway.config import Platform
@@ -319,7 +321,6 @@ def recover_api_turns(adapter):
 def recover_authority_api_turns(adapter, authority):
     from hermes_state_runtime import list_session_admissions
     from gateway.session_ingress_media import collect_unheld_api_images
-    import logging
     collect_unheld_api_images(authority.db)
     from gateway.session_api_media import compact_settled_api_payloads
     compact_settled_api_payloads(authority.db)
@@ -341,6 +342,14 @@ def recover_authority_api_turns(adapter, authority):
 
 
 async def run_api_turn(adapter, *, approval_notify_callback=None, approval_session_key=None, **kwargs):
+    try:
+        ensure_loop = getattr(adapter, '_ensure_pulse_loop', None)
+        if callable(ensure_loop):
+            ensure_loop()
+        elif getattr(adapter, '_pulse_loop', None) is None:
+            adapter._pulse_loop = asyncio.get_running_loop()
+    except Exception:
+        pass
     admitted = await admit_api_turn_async(adapter, **kwargs)
     if approval_notify_callback is None or not approval_session_key:
         return await observe_api_turn(admitted, **kwargs)
@@ -367,6 +376,16 @@ async def run_api_turn(adapter, *, approval_notify_callback=None, approval_sessi
 
 async def observe_api_turn(admitted, **kwargs):
     authority, ref, row = admitted
+    pulse_adapter = _resolve_api_adapter_for_session(authority, ref.session_id)
+    if pulse_adapter is not None:
+        try:
+            ensure_loop = getattr(pulse_adapter, '_ensure_pulse_loop', None)
+            if callable(ensure_loop):
+                ensure_loop()
+            elif getattr(pulse_adapter, '_pulse_loop', None) is None:
+                pulse_adapter._pulse_loop = asyncio.get_running_loop()
+        except Exception:
+            pass
     from hermes_state_runtime import get_session_admission
     # The admission-time snapshot is stale once a drain already running ahead claims and settles
     # (or a stop cancels) the row; a waiter registered after that is never resolved. The current
@@ -488,7 +507,6 @@ def _notify_observers(authority, session_id, key, *args, **kwargs):
     """Observer callbacks are request-owned sinks; one that raises (closed socket, torn-down
     loop) must not abort canonical execution or starve the other observers. Returns whether
     any observer accepted the event."""
-    import logging
     accepted = False
     for observer in _api_observers(authority, session_id):
         callback = observer.get(key)
@@ -514,6 +532,84 @@ def _session_source_platform(authority, session_id):
     if platform is None:
         return None
     return getattr(platform, 'value', platform)
+
+
+def _resolve_api_adapter_for_session(authority, session_id: str) -> Any:
+    """Resolve active APIServerAdapter for a non-Telegram session without importing api_server."""
+    sessions = getattr(authority, 'sessions', None)
+    if sessions is None:
+        return None
+    try:
+        live = sessions.get(session_id) if hasattr(sessions, 'get') else sessions[session_id]
+    except KeyError:
+        return None
+    if live is None:
+        return None
+    if _session_source_platform(authority, session_id) == Platform.TELEGRAM.value:
+        return None
+    runner = getattr(authority, 'runner', None)
+    if runner is None:
+        return None
+    adapter = None
+    adapter_for_source = getattr(runner, '_adapter_for_source', None)
+    if callable(adapter_for_source):
+        try:
+            from gateway.session import SessionSource
+            from gateway.session_api import _served_profile
+            api_source = SessionSource(
+                platform=Platform.API_SERVER,
+                chat_id=session_id,
+                user_id='api',
+                chat_type='dm',
+                profile=_served_profile(authority),
+            )
+            adapter = adapter_for_source(api_source)
+        except Exception:
+            adapter = None
+    if adapter is None:
+        adapters = getattr(runner, 'adapters', None)
+        if isinstance(adapters, dict):
+            adapter = adapters.get(Platform.API_SERVER)
+    if adapter is None:
+        return None
+    if getattr(adapter, 'gateway_runner', None) is not runner:
+        return None
+    if getattr(adapter, '_disconnected', False):
+        return None
+    if not callable(getattr(adapter, 'handle_session_subagent_pulse', None)):
+        return None
+    return adapter
+
+
+def publish_api_subagent_pulse(
+    authority,
+    session_id: str,
+    event_type: str,
+    tool_name: str | None = None,
+    preview: str | None = None,
+    args: Any = None,
+    **kwargs,
+) -> None:
+    """Session-level subagent pulse delivery bypassing api_observers and check_approval_generation."""
+    adapter = _resolve_api_adapter_for_session(authority, session_id)
+    if adapter is None:
+        return
+    try:
+        adapter.handle_session_subagent_pulse(
+            session_id,
+            event_type,
+            tool_name,
+            preview,
+            args,
+            **kwargs,
+        )
+    except Exception:
+        logging.getLogger(__name__).debug(
+            'Session subagent pulse delivery failed for %s (%s)',
+            session_id,
+            event_type,
+            exc_info=True,
+        )
 
 
 def wire_api_observers(agent, owner, want_interim):
@@ -553,6 +649,7 @@ def wire_api_observers(agent, owner, want_interim):
                     forward_kwargs.setdefault('source_platform', source_platform)
                     forward_kwargs.setdefault('telegram_pulse_owned', source_platform == Platform.TELEGRAM.value)
                 publish_api_tool_progress(authority, session_id, generation, event_type, *args, **forward_kwargs)
+                publish_api_subagent_pulse(authority, session_id, event_type, *args, **forward_kwargs)
             else:
                 publish_api_tool_progress(authority, session_id, generation, event_type, *args, **kwargs)
         if progress is not None:

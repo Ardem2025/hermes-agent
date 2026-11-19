@@ -289,6 +289,15 @@ from hermes_state_errors import SessionActiveWriteGuardError
 
 logger = logging.getLogger(__name__)
 
+_SUBAGENT_PULSE_EVENTS = frozenset({
+    "subagent.start",
+    "subagent.progress",
+    "subagent.complete",
+    "subagent_progress",
+})
+_SUBAGENT_FAILURE_STATUSES = ("failed", "error", "timeout", "cancelled")
+_SESSION_PULSE_TTL_SECONDS = 1800.0
+
 
 async def _call_verifier(verifier, *args, **kwargs):
     """Await a sync-or-async verifier; sync ones may do blocking network I/O (signing-cert / JWKS
@@ -1391,6 +1400,339 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         """Return True if session has an active Telegram topic binding with delivery enabled."""
         return self._telegram_delivery_enabled(session_id)
 
+    def _pulse_registry(self) -> dict[str, dict[str, Any]]:
+        reg = getattr(self, "_session_pulse_tickers", None)
+        if reg is None:
+            reg = {}
+            setattr(self, "_session_pulse_tickers", reg)
+        return reg
+
+    def _pulse_locks(self) -> dict[str, asyncio.Lock]:
+        locks = getattr(self, "_session_pulse_locks", None)
+        if locks is None:
+            locks = {}
+            setattr(self, "_session_pulse_locks", locks)
+        return locks
+
+    def _pulse_lock_for(self, session_id: str) -> asyncio.Lock:
+        locks = self._pulse_locks()
+        lock = locks.get(session_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            locks[session_id] = lock
+        return lock
+
+    def _pulse_prefs(self) -> dict[str, bool]:
+        prefs = getattr(self, "_session_pulse_prefs", None)
+        if prefs is None:
+            prefs = {}
+            setattr(self, "_session_pulse_prefs", prefs)
+        return prefs
+
+    def _ensure_pulse_loop(self) -> Optional[asyncio.AbstractEventLoop]:
+        loop = getattr(self, "_pulse_loop", None)
+        if loop is not None and not loop.is_closed():
+            return loop
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return None
+        setattr(self, "_pulse_loop", loop)
+        return loop
+
+    def _resolve_telegram_cleanup_progress(self, telegram_adapter: Any) -> bool:
+        if telegram_adapter is None:
+            return False
+        has_real_delete = getattr(type(telegram_adapter), "delete_message", None) not in (
+            None,
+            BasePlatformAdapter.delete_message,
+        )
+        if not has_real_delete:
+            return False
+        runner = getattr(self, "gateway_runner", None)
+        user_config = getattr(runner, "user_config", None) if runner is not None else None
+        if not isinstance(user_config, dict):
+            user_config = {}
+            try:
+                from gateway.run import _load_gateway_config
+                loaded = _load_gateway_config()
+                if isinstance(loaded, dict):
+                    user_config = loaded
+            except Exception:
+                logger.debug("Failed to load gateway config for cleanup_progress", exc_info=True)
+        return bool(resolve_display_setting(user_config, "telegram", "cleanup_progress"))
+
+    def _prune_stale_pulse_entries(self, now: Optional[float] = None) -> None:
+        tickers = self._pulse_registry()
+        locks = self._pulse_locks()
+        prefs = self._pulse_prefs()
+        ts = time.monotonic() if now is None else now
+        stale_sids: list[str] = []
+        for sid, entry in list(tickers.items()):
+            last_at = float(entry.get("last_event_at") or 0.0)
+            if ts - last_at <= _SESSION_PULSE_TTL_SECONDS:
+                continue
+            ticker = entry.get("ticker")
+            is_active = bool(getattr(ticker, "active", False))
+            if not is_active or (ts - last_at > _SESSION_PULSE_TTL_SECONDS):
+                stale_sids.append(sid)
+        for sid in stale_sids:
+            entry = tickers.pop(sid, None)
+            if entry is not None:
+                start_task = entry.get("start_task")
+                if start_task is not None and not start_task.done():
+                    start_task.cancel()
+                ticker = entry.get("ticker")
+                if ticker is not None and getattr(ticker, "active", False):
+                    try:
+                        asyncio.create_task(ticker.stop(status="interrupted"))
+                    except Exception:
+                        pass
+            lock = locks.get(sid)
+            if lock is not None and not lock.locked():
+                locks.pop(sid, None)
+            prefs.pop(sid, None)
+        for sid in list(locks.keys()):
+            if sid not in tickers and not locks[sid].locked():
+                locks.pop(sid, None)
+        for sid in list(prefs.keys()):
+            if sid not in tickers:
+                # Keep explicit prefs only while session has an active entry or recent turn;
+                # stale prefs without entries are safe to prune when locks are gone.
+                if sid not in locks:
+                    pass
+
+    async def _start_pulse_entry(
+        self,
+        session_id: str,
+        target_entry: dict[str, Any],
+        prev_stop_task: Optional[asyncio.Task],
+    ) -> None:
+        try:
+            async with self._pulse_lock_for(session_id):
+                if prev_stop_task is not None and not prev_stop_task.done():
+                    try:
+                        await prev_stop_task
+                    except Exception:
+                        logger.debug("Previous pulse ticker stop_task failed (non-fatal)", exc_info=True)
+                await target_entry["ticker"].start()
+        except Exception:
+            logger.debug("Failed to start SubagentPulseTicker for session %s (non-fatal)", session_id, exc_info=True)
+        finally:
+            target_entry["starting"] = False
+
+    async def _stop_pulse_entry(
+        self,
+        session_id: str,
+        target_entry: dict[str, Any],
+        status: str,
+        summary: str,
+        *,
+        force: bool = False,
+    ) -> None:
+        try:
+            async with self._pulse_lock_for(session_id):
+                start_task = target_entry.get("start_task")
+                if start_task is not None and not start_task.done():
+                    try:
+                        await start_task
+                    except Exception:
+                        logger.debug("Pulse ticker start_task failed before stop (non-fatal)", exc_info=True)
+                ticker = target_entry["ticker"]
+                if ticker.active or ticker.ticker_task is not None:
+                    if force:
+                        await ticker.stop(status=status, summary=summary, force=True)
+                    else:
+                        await ticker.stop(status=status, summary=summary)
+        except Exception:
+            logger.debug("Failed to stop SubagentPulseTicker for session %s (non-fatal)", session_id, exc_info=True)
+        finally:
+            tickers = self._pulse_registry()
+            if tickers.get(session_id) is target_entry:
+                tickers.pop(session_id, None)
+
+    def _apply_pulse_event_on_loop(
+        self,
+        session_id: str,
+        event_type: str,
+        tool_name: str | None,
+        preview: str | None,
+        args: Any,
+        kwargs: dict[str, Any],
+    ) -> None:
+        if not session_id or getattr(self, "_disconnected", False):
+            return
+        source_platform = kwargs.get("source_platform")
+        if kwargs.get("telegram_pulse_owned") or source_platform in (
+            Platform.TELEGRAM,
+            Platform.TELEGRAM.value,
+            "telegram",
+        ):
+            return
+        prefs = self._pulse_prefs()
+        if session_id in prefs:
+            allowed = bool(prefs[session_id])
+        else:
+            allowed = bool(self.is_telegram_bound(session_id))
+        if not allowed:
+            return
+
+        now = time.monotonic()
+        self._prune_stale_pulse_entries(now)
+        tickers = self._pulse_registry()
+        task_idx = kwargs.get("task_index", 0)
+        delegation_id = kwargs.get("delegation_id")
+        subagent_id = kwargs.get("subagent_id")
+
+        if event_type == "subagent.start":
+            entry = tickers.get(session_id)
+            need_new_ticker = (
+                entry is None
+                or entry["stopped"]
+                or (not entry["ticker"].active and not entry["starting"])
+            )
+            if need_new_ticker:
+                try:
+                    _runner, telegram = self._telegram_runner_and_adapter()
+                    if not telegram:
+                        return
+                    db = self._ensure_session_db()
+                    if not db:
+                        return
+                    if hasattr(db, "apply_telegram_topic_migration"):
+                        db.apply_telegram_topic_migration()
+                    binding = db.get_telegram_topic_binding_by_session(session_id=session_id)
+                    if not binding or not binding.get("delivery_enabled", True):
+                        return
+                    chat_id = binding.get("chat_id")
+                    if not chat_id:
+                        return
+                    thread_id = binding.get("thread_id") or binding.get("message_thread_id")
+                    metadata = {"thread_id": str(thread_id)} if thread_id else {}
+                    cleanup_progress = self._resolve_telegram_cleanup_progress(telegram)
+                    from gateway.subagent_pulse_ticker import SubagentPulseTicker
+                    ticker = SubagentPulseTicker(
+                        adapter=telegram,
+                        chat_id=chat_id,
+                        thread_id=thread_id,
+                        metadata=metadata,
+                        cleanup_progress=cleanup_progress,
+                    )
+                except Exception:
+                    logger.debug("Failed to initialize SubagentPulseTicker for session %s", session_id, exc_info=True)
+                    return
+                prev_stop_task = entry.get("stop_task") if entry is not None else None
+                entry = {
+                    "ticker": ticker,
+                    "starting": True,
+                    "stopped": False,
+                    "start_task": None,
+                    "stop_task": None,
+                    "terminal_status": None,
+                    "terminal_summary": "",
+                    "last_event_at": now,
+                    "cleanup_progress": cleanup_progress,
+                }
+                tickers[session_id] = entry
+                entry["start_task"] = asyncio.create_task(
+                    self._start_pulse_entry(session_id, entry, prev_stop_task)
+                )
+            else:
+                entry["last_event_at"] = now
+            goal = kwargs.get("goal") or preview or ""
+            transcript = kwargs.get("live_transcript") or kwargs.get("transcript_path")
+            entry["ticker"].on_subagent_start(
+                task_idx,
+                goal,
+                transcript,
+                delegation_id=delegation_id,
+                subagent_id=subagent_id,
+            )
+        elif event_type in ("subagent.progress", "subagent_progress"):
+            entry = tickers.get(session_id)
+            if entry is None or entry["stopped"]:
+                return
+            entry["last_event_at"] = now
+            action = kwargs.get("action") or preview or tool_name or ""
+            entry["ticker"].on_subagent_progress(
+                task_idx,
+                action,
+                delegation_id=delegation_id,
+                subagent_id=subagent_id,
+            )
+        elif event_type == "subagent.complete":
+            entry = tickers.get(session_id)
+            if entry is None or entry["stopped"]:
+                return
+            entry["last_event_at"] = now
+            status = kwargs.get("status") or "completed"
+            summary = kwargs.get("summary") or preview
+            ticker = entry["ticker"]
+            ticker.on_subagent_complete(
+                task_idx,
+                status,
+                summary,
+                delegation_id=delegation_id,
+                subagent_id=subagent_id,
+            )
+            active_left = any(t.get("status") == "running" for t in ticker.tasks.values())
+            if not active_left:
+                failed_task = next(
+                    (t for t in ticker.tasks.values() if t.get("status") in _SUBAGENT_FAILURE_STATUSES),
+                    None,
+                )
+                if failed_task is not None:
+                    terminal_status = str(failed_task.get("status"))
+                    terminal_summary = str(failed_task.get("summary") or summary or "")
+                else:
+                    terminal_status = status if status in _SUBAGENT_FAILURE_STATUSES else "completed"
+                    terminal_summary = str(summary or "")
+                entry["terminal_status"] = terminal_status
+                entry["terminal_summary"] = terminal_summary
+                entry["stopped"] = True
+                if (ticker.active or entry["starting"]) and entry["stop_task"] is None:
+                    entry["stop_task"] = asyncio.create_task(
+                        self._stop_pulse_entry(session_id, entry, terminal_status, terminal_summary)
+                    )
+
+    def handle_session_subagent_pulse(
+        self,
+        session_id: str,
+        event_type: str,
+        tool_name: str | None = None,
+        preview: str | None = None,
+        args: Any = None,
+        **kwargs,
+    ) -> None:
+        """Thread-safe session-level sink for subagent.* pulse events."""
+        if not session_id or event_type not in _SUBAGENT_PULSE_EVENTS:
+            return
+        if getattr(self, "_disconnected", False):
+            return
+        loop = self._ensure_pulse_loop()
+        if loop is None or loop.is_closed():
+            return
+        try:
+            running_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            running_loop = None
+        payload_kwargs = dict(kwargs)
+        if running_loop is loop:
+            self._apply_pulse_event_on_loop(session_id, event_type, tool_name, preview, args, payload_kwargs)
+        else:
+            try:
+                loop.call_soon_threadsafe(
+                    self._apply_pulse_event_on_loop,
+                    session_id,
+                    event_type,
+                    tool_name,
+                    preview,
+                    args,
+                    payload_kwargs,
+                )
+            except RuntimeError:
+                logger.debug("Pulse loop closed before scheduling event for %s", session_id, exc_info=True)
+
     def _is_preserved(self, session_id: str, initial_flag: bool) -> bool:
         """Dynamic disconnect preservation: initial flag or dynamic Telegram binding check."""
         if initial_flag:
@@ -1558,6 +1900,10 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         self._session_db_cache_closed = False
         self._immediately_forwarded_user_hashes: dict[str, set[str]] = {}
         self._telegram_sync_locks: dict[str, asyncio.Lock] = {}
+        self._session_pulse_tickers: dict[str, dict[str, Any]] = {}
+        self._session_pulse_locks: dict[str, asyncio.Lock] = {}
+        self._session_pulse_prefs: dict[str, bool] = {}
+        self._pulse_loop: Optional[asyncio.AbstractEventLoop] = None
         # Last-known-good model per gateway_session_key ("*" = process-wide; never session_id,
         # which is per request -> unbounded). Recovers a transient empty model resolution.
         self._last_resolved_model: dict[str, str] = {}
@@ -4020,250 +4366,51 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             else self.is_telegram_bound(session_id)
         )
         loop = asyncio.get_running_loop()
+        self._pulse_loop = loop
+        self._pulse_prefs()[session_id] = duplicate_to_telegram
         mirror = self._new_telegram_mirror(session_id=session_id, loop=loop, enabled=duplicate_to_telegram)
-
-        def _commentary(text: str, *, already_streamed: bool = False) -> None:
-            mirror.enqueue_commentary(text)
-
-        try:
-            history = await self._conversation_history_for_session(session_id)
-            result, usage = await self._run_agent(
-                conversation_history=history,
-                interim_assistant_callback=_commentary,
-                **ctx["run_kwargs"],
-            )
-            # One policy-gated re-run of a transiently failed turn — the peer-DM transport's half of the
-            # retry the local (``tools.bot_mode_dm``) and relayed (``tui_gateway.methods_bot_relay``)
-            # delivery lanes already apply (#93091 item 5, #115325). Same policy, same gate: transient
-            # classes (429 / 5xx) re-run the SAME session once, a context overflow lets the re-run's
-            # pre-API compaction shrink the transcript first, and auth/quota/config/model never re-run. The
-            # store is read again first: the failed attempt's turn-start persist left the DM as the
-            # transcript's unanswered tail row, and the re-run resumes that row instead of appending a
-            # second copy of it. A turn that fails again reaches the peer client exactly as before.
-            if result_retry_action(result) != RETRY_NONE:
-                history = await self._conversation_history_for_session(session_id)
-                result, usage = await self._run_agent(
-                    conversation_history=history,
-                    resume_unanswered_turn=True,
-                    interim_assistant_callback=_commentary,
-                    **ctx["run_kwargs"],
-                )
-        finally:
-            try:
-                await mirror.drain()
-            except Exception:
-                logger.debug("Telegram mirror drain failed in _handle_session_chat (non-fatal)", exc_info=True)
-        is_dict = isinstance(result, dict)
-        effective_session_id = result.get("session_id") if is_dict else session_id
-        final_response = _resolve_media_to_data_urls(
-            result.get("final_response", "") if is_dict else "")
-        await mirror.send_final(final_response)
-        headers = self._session_headers(effective_session_id or session_id, gateway_session_key)
-        return web.json_response(
-            {"object": "hermes.session.chat.completion", "status": _response_status(result),
-             "session_id": effective_session_id or session_id,
-             "message": {"role": "assistant", "content": final_response}, "usage": usage,
-             "runtime": self._effective_turn_runtime(ctx["runtime_request"], result, usage)},
-            headers=headers)
-
-    @_admit_api_agent_request
-    async def _handle_session_chat_stream(self, request: web.Request) -> web.StreamResponse:
-        """POST /api/sessions/{session_id}/chat/stream — SSE wrapper over _run_agent."""
-        limited = self._concurrency_limited_response()
-        if limited is not None:
-            return limited
-        ctx, err = await self._prepare_session_chat(request)
-        if err is not None:
-            return err
-        handed_off = await self._stream_through_live_bot_chat(request, ctx)
-        if handed_off is not None:
-            return handed_off
-        gateway_session_key, session_id = ctx["gateway_session_key"], ctx["session_id"]
-        from gateway.wake import reset_consecutive_auto_wakes
-        reset_consecutive_auto_wakes(session_id)
-        await asyncio.to_thread(self._mark_session_auto_resume, session_id)
-        ctx["run_kwargs"]["auto_resume_on_delegation"] = True
-        user_message, runtime_request = ctx["user_message"], ctx["runtime_request"]
-        runtime_meta = self._sanitize_runtime_metadata(
-            requested_runtime=runtime_request.get("requested"),
-            route_source=runtime_request.get("route_source") or "global",
-            model_lock=("accepted" if ctx["lock_active"] else ""))
-        message_id = f"msg_{uuid.uuid4().hex}"
-        run_id = f"run_{uuid.uuid4().hex}"
-        events = _SessionEventQueue(session_id, run_id)
-        queue, _event_payload = events.queue, events.payload
-        duplicate_to_telegram = bool(
-            ctx["body"].get("duplicate_to_telegram") if "duplicate_to_telegram" in ctx["body"] else self.is_telegram_bound(session_id)
-        )
-        preserve_on_disconnect = bool(
-            duplicate_to_telegram or self.is_telegram_bound(session_id) or ctx["body"].get("preserve_on_disconnect")
-        )
-        loop = asyncio.get_running_loop()
-        mirror = self._new_telegram_mirror(session_id=session_id, loop=loop, enabled=duplicate_to_telegram)
-        _subagent_pulse_events = frozenset({
-            "subagent.start",
-            "subagent.progress",
-            "subagent.tool",
-            "subagent.complete",
-            "subagent_progress",
-            "subagent_tool",
-        })
-        _subagent_failure_statuses = ("failed", "error", "timeout", "cancelled")
-        pulse_state: dict[str, Any] = {
-            "ticker": None,
-            "starting": False,
-            "stopped": False,
-            "start_task": None,
-            "stop_task": None,
-            "terminal_status": None,
-            "terminal_summary": "",
-        }
-
-        async def _start_pulse_ticker(target_ticker: Any, prev_stop_task: Optional[asyncio.Task]) -> None:
-            try:
-                if prev_stop_task is not None and not prev_stop_task.done():
-                    try:
-                        await prev_stop_task
-                    except Exception:
-                        logger.debug("Previous pulse ticker stop_task failed (non-fatal)", exc_info=True)
-                await target_ticker.start()
-            except Exception:
-                logger.debug("Failed to start SubagentPulseTicker (non-fatal)", exc_info=True)
-            finally:
-                if pulse_state["ticker"] is target_ticker:
-                    pulse_state["starting"] = False
-
-        async def _stop_pulse_ticker(
-            target_ticker: Any,
-            target_start_task: Optional[asyncio.Task],
-            status: str,
-            summary: str,
-        ) -> None:
-            if target_start_task is not None and not target_start_task.done():
-                try:
-                    await target_start_task
-                except Exception:
-                    logger.debug("Pulse ticker start_task failed before stop (non-fatal)", exc_info=True)
-            if target_ticker.active or target_ticker.ticker_task is not None:
-                await target_ticker.stop(status=status, summary=summary)
-
-        def _handle_pulse_event(
-            event_type: str,
-            tool_name: str | None,
-            preview: str | None,
-            args: Any,
-            kwargs: dict[str, Any],
-        ) -> None:
-            if not duplicate_to_telegram:
-                return
-            source_platform = kwargs.get("source_platform")
-            if kwargs.get("telegram_pulse_owned") or source_platform in (
-                Platform.TELEGRAM,
-                Platform.TELEGRAM.value,
-                "telegram",
-            ):
-                return
-            task_idx = kwargs.get("task_index", 0)
-            if event_type == "subagent.start":
-                ticker = pulse_state["ticker"]
-                need_new_ticker = (
-                    ticker is None
-                    or pulse_state["stopped"]
-                    or (not ticker.active and not pulse_state["starting"])
-                )
-                if need_new_ticker:
-                    try:
-                        _runner, telegram = self._telegram_runner_and_adapter()
-                        if not telegram:
-                            return
-                        db = self._ensure_session_db()
-                        if not db:
-                            return
-                        if hasattr(db, "apply_telegram_topic_migration"):
-                            db.apply_telegram_topic_migration()
-                        binding = db.get_telegram_topic_binding_by_session(session_id=session_id)
-                        if not binding or not binding.get("delivery_enabled", True):
-                            return
-                        chat_id = binding.get("chat_id")
-                        if not chat_id:
-                            return
-                        thread_id = binding.get("thread_id") or binding.get("message_thread_id")
-                        metadata = {"thread_id": str(thread_id)} if thread_id else {}
-                        from gateway.subagent_pulse_ticker import SubagentPulseTicker
-                        ticker = SubagentPulseTicker(
-                            adapter=telegram,
-                            chat_id=chat_id,
-                            thread_id=thread_id,
-                            metadata=metadata,
-                        )
-                    except Exception:
-                        logger.debug("Failed to initialize SubagentPulseTicker for session %s", session_id, exc_info=True)
-                        return
-                    prev_stop_task = pulse_state["stop_task"]
-                    pulse_state["ticker"] = ticker
-                    pulse_state["starting"] = True
-                    pulse_state["stopped"] = False
-                    pulse_state["stop_task"] = None
-                    pulse_state["terminal_status"] = None
-                    pulse_state["terminal_summary"] = ""
-                    pulse_state["start_task"] = asyncio.create_task(_start_pulse_ticker(ticker, prev_stop_task))
-                goal = kwargs.get("goal") or preview or ""
-                transcript = kwargs.get("live_transcript") or kwargs.get("transcript_path")
-                ticker.on_subagent_start(task_idx, goal, transcript)
-            elif event_type in ("subagent.progress", "subagent_progress"):
-                ticker = pulse_state["ticker"]
-                if ticker is None or pulse_state["stopped"]:
-                    return
-                action = kwargs.get("action") or preview or tool_name or ""
-                ticker.on_subagent_progress(task_idx, action)
-            elif event_type == "subagent.complete":
-                ticker = pulse_state["ticker"]
-                if ticker is None or pulse_state["stopped"]:
-                    return
-                status = kwargs.get("status") or "completed"
-                summary = kwargs.get("summary") or preview
-                ticker.on_subagent_complete(task_idx, status, summary)
-                active_left = any(t.get("status") == "running" for t in ticker.tasks.values())
-                if not active_left:
-                    failed_task = next(
-                        (t for t in ticker.tasks.values() if t.get("status") in _subagent_failure_statuses),
-                        None,
-                    )
-                    if failed_task is not None:
-                        terminal_status = str(failed_task.get("status"))
-                        terminal_summary = str(failed_task.get("summary") or summary or "")
-                    else:
-                        terminal_status = status if status in _subagent_failure_statuses else "completed"
-                        terminal_summary = str(summary or "")
-                    pulse_state["terminal_status"] = terminal_status
-                    pulse_state["terminal_summary"] = terminal_summary
-                    pulse_state["stopped"] = True
-                    if (ticker.active or pulse_state["starting"]) and pulse_state["stop_task"] is None:
-                        pulse_state["stop_task"] = asyncio.create_task(
-                            _stop_pulse_ticker(ticker, pulse_state["start_task"], terminal_status, terminal_summary)
-                        )
 
         async def _finalize_pulse_ticker(fallback_status: str) -> None:
-            stop_task = pulse_state["stop_task"]
+            entry = self._pulse_registry().get(session_id)
+            if entry is None:
+                return
+            stop_task = entry.get("stop_task")
             if stop_task is not None:
                 try:
                     await stop_task
                 except Exception:
                     logger.debug("Pulse ticker stop_task failed (non-fatal)", exc_info=True)
                 return
-            ticker = pulse_state["ticker"]
-            if ticker is None or pulse_state["stopped"]:
+            if entry.get("stopped"):
                 return
-            start_task = pulse_state["start_task"]
-            if not ticker.active and not pulse_state["starting"] and (start_task is None or start_task.done()):
+            ticker = entry["ticker"]
+            start_task = entry.get("start_task")
+            if not ticker.active and not entry.get("starting") and (start_task is None or start_task.done()):
                 return
-            pulse_state["stopped"] = True
-            final_status = pulse_state["terminal_status"] or fallback_status
-            final_summary = pulse_state["terminal_summary"]
+            has_running = any(t.get("status") == "running" for t in ticker.tasks.values())
+            is_draining = bool(getattr(self, "_draining", False))
+            if fallback_status == "cancelled" or is_draining:
+                final_status = "interrupted" if is_draining and fallback_status != "cancelled" else "cancelled"
+                final_summary = entry.get("terminal_summary") or ""
+                entry["stopped"] = True
+                stop_task = asyncio.create_task(
+                    self._stop_pulse_entry(session_id, entry, final_status, final_summary)
+                )
+                entry["stop_task"] = stop_task
+                try:
+                    await stop_task
+                except Exception:
+                    logger.debug("Pulse ticker stop failed (non-fatal)", exc_info=True)
+                return
+            if has_running and fallback_status in ("completed", "failed"):
+                return
+            entry["stopped"] = True
+            final_status = entry.get("terminal_status") or fallback_status
+            final_summary = entry.get("terminal_summary") or ""
             stop_task = asyncio.create_task(
-                _stop_pulse_ticker(ticker, start_task, final_status, final_summary)
+                self._stop_pulse_entry(session_id, entry, final_status, final_summary)
             )
-            pulse_state["stop_task"] = stop_task
+            entry["stop_task"] = stop_task
             try:
                 await stop_task
             except Exception:
@@ -4290,7 +4437,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                     else event_type
                 )
                 events.enqueue(event_name, {"message_id": message_id, "tool_name": tool_name, "preview": preview, "args": args})
-            elif event_type in _subagent_pulse_events:
+            elif event_type in _SUBAGENT_PULSE_EVENTS or event_type in ("subagent.tool", "subagent_tool"):
                 def _json_safe(val: Any) -> Any:
                     if val is None or isinstance(val, (str, int, float, bool)):
                         return val
@@ -4374,23 +4521,15 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 if "task_index" in kwargs:
                     subagent_payload["task_index"] = _json_safe(kwargs.get("task_index"))
                 events.enqueue(normalized_event_name, subagent_payload)
-                if not duplicate_to_telegram:
-                    return
-                source_platform = kwargs.get("source_platform")
-                if kwargs.get("telegram_pulse_owned") or source_platform in (
-                    Platform.TELEGRAM,
-                    Platform.TELEGRAM.value,
-                    "telegram",
-                ):
-                    return
-                try:
-                    running_loop = asyncio.get_running_loop()
-                except RuntimeError:
-                    running_loop = None
-                if running_loop is loop:
-                    _handle_pulse_event(event_type, tool_name, preview, args, dict(kwargs))
-                else:
-                    loop.call_soon_threadsafe(_handle_pulse_event, event_type, tool_name, preview, args, dict(kwargs))
+                if event_type in _SUBAGENT_PULSE_EVENTS and getattr(self.gateway_runner, "session_authority", None) is None:
+                    self.handle_session_subagent_pulse(
+                        session_id,
+                        event_type,
+                        tool_name,
+                        preview,
+                        args,
+                        **kwargs,
+                    )
 
         def _commentary(text: str, *, already_streamed: bool = False) -> None:
             # Mid-turn assistant commentary (Codex ``phase="commentary"``, text beside tool calls)
@@ -4981,6 +5120,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         already persisted: the transcript's unanswered tail row is adopted from ``conversation_history``
         as THIS turn's user message instead of being appended a second time
         (``agent.session_persistence.adopt_unanswered_turn``; #115325)."""
+        self._ensure_pulse_loop()
         if getattr(self.gateway_runner, "session_authority", None) is not None:
             from gateway.session_api_turn import run_api_turn
             return await run_api_turn(self, user_message=user_message, conversation_history=conversation_history,
@@ -5347,6 +5487,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 return False
             from gateway.platforms.shared_ingress import listener_base_url
             self._mark_connected(listener_base=listener_base_url(self._host, self._port))
+            self._ensure_pulse_loop()
             # Publish a metrics-bearing snapshot at bind and keep it fresh: the
             # heartbeat loop updates last_heartbeat/metrics_today (#52323).
             self._publish_runtime_status()
@@ -5370,15 +5511,47 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         files, #37011).
         """
         self._mark_disconnected()
+        pulse_tickers = getattr(self, "_session_pulse_tickers", None)
+        pulse_locks = getattr(self, "_session_pulse_locks", None)
+        pulse_prefs = getattr(self, "_session_pulse_prefs", None)
+        if isinstance(pulse_tickers, dict) and pulse_tickers:
+            entries = list(pulse_tickers.values())
+            pulse_tickers.clear()
+            if isinstance(pulse_locks, dict):
+                pulse_locks.clear()
+            if isinstance(pulse_prefs, dict):
+                pulse_prefs.clear()
+            for entry in entries:
+                start_task = entry.get("start_task")
+                if start_task is not None and not start_task.done():
+                    start_task.cancel()
+                    with suppress(BaseException):
+                        await start_task
+                ticker = entry.get("ticker")
+                if ticker is not None and (
+                    getattr(ticker, "active", False) or getattr(ticker, "ticker_task", None) is not None
+                ):
+                    with suppress(Exception):
+                        await ticker.stop(status="interrupted")
+                stop_task = entry.get("stop_task")
+                if stop_task is not None and not stop_task.done():
+                    with suppress(Exception):
+                        await stop_task
+        else:
+            if isinstance(pulse_locks, dict):
+                pulse_locks.clear()
+            if isinstance(pulse_prefs, dict):
+                pulse_prefs.clear()
         # getattr: disconnect() tolerates bare __new__ fixtures (pinned in test_api_server_run_idempotency).
         routed = getattr(self, "_response_stores", {})
         stores = [s for s in (getattr(self, "_response_store", None), *list(routed.values())) if s is not None]
         routed.clear()
+        _adapter_label = getattr(getattr(self, "platform", None), "value", "api_server").title()
         for store in stores:
             try:
                 await asyncio.to_thread(store.close)  # a persistence worker may hold its lock
             except Exception:
-                logger.debug("Failed to close response store for %s", self.name, exc_info=True)
+                logger.debug("Failed to close response store for %s", _adapter_label, exc_info=True)
         with suppress(Exception):
             await asyncio.to_thread(self._memory_sessions.close_all)
         try:
@@ -5392,7 +5565,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             _api_runs._close_run_state(self)  # after site.stop(): no late request re-mints the executor
             self._close_cached_session_dbs()
             self._app = None
-        logger.info("[%s] API server stopped", self.name)
+        logger.info("[%s] API server stopped", _adapter_label)
 
     async def send(
         self, chat_id: str, content: str, reply_to: Optional[str] = None,

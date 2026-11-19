@@ -383,7 +383,8 @@ async def test_bdd4_error_cancellation_and_failure_statuses_no_double_stop(tmp_p
         assert "done" in [n for n, _ in _parse_sse(raw)]
         db.close()
 
-    # Case B: exception inside _run_agent -> ticker stopped once with failed, SSE gets error + done
+    # Case B: exception inside _run_agent while background subagent is still running -> ticker stays alive;
+    # when no running subagents remain on parent failure -> ticker stops once with failed
     exc_dir = tmp_path / "exc"
     exc_dir.mkdir()
     db_exc = _make_bound_db(exc_dir, "sess_exc", delivery_enabled=True)
@@ -396,22 +397,24 @@ async def test_bdd4_error_cancellation_and_failure_statuses_no_double_stop(tmp_p
         stop_calls_exc.append(status)
         return await orig_stop(self, status=status, summary=summary)
 
-    async def run_raises(**kwargs):
+    async def run_raises_with_running(**kwargs):
         cb = kwargs["tool_progress_callback"]
         cb("subagent.start", None, "Crash task", None, task_index=0, goal="Crash task")
         await asyncio.sleep(0.02)
         raise RuntimeError("agent exploded")
 
-    adapter_exc._run_agent = run_raises
+    adapter_exc._run_agent = run_raises_with_running
     with patch.object(SubagentPulseTicker, "stop", tracked_stop_exc):
         async with TestClient(TestServer(_make_stream_app(adapter_exc))) as cli:
             resp = await cli.post("/api/sessions/sess_exc/chat/stream", json={"message": "go"})
             assert resp.status == 200
             raw = await resp.text()
     await asyncio.sleep(0.03)
-    assert stop_calls_exc == ["failed"]
+    assert stop_calls_exc == []
+    assert "sess_exc" in adapter_exc._pulse_registry()
     names = [n for n, _ in _parse_sse(raw)]
     assert "error" in names and "done" in names
+    await adapter_exc.disconnect()
     db_exc.close()
 
     # Case C: CancelledError inside _run_agent -> ticker stopped once with cancelled, SSE gets done
@@ -614,4 +617,503 @@ def test_session_response_subagent_tool_status_localization(tmp_path):
     ):
         res_unk = adapter._session_response(session_row)
     assert res_unk["tool_status"] == "Подзадача выполняет custom_unknown_tool..."
+    db.close()
+
+
+class FakeDeletableTelegramAdapter(FakeTelegramAdapter):
+    """Fake Telegram adapter with real delete_message override for cleanup_progress tests."""
+
+    async def delete_message(self, chat_id: str, message_id: str) -> bool:
+        self.calls.append(
+            {
+                "op": "delete_message",
+                "chat_id": str(chat_id),
+                "message_id": str(message_id),
+                "metadata": {},
+            }
+        )
+        return True
+
+
+@pytest.mark.asyncio
+async def test_session_authority_background_pulse_survives_parent_turn_and_no_double_delivery(tmp_path):
+    """BDD 1 + session_authority: background subagent events survive observe_api_turn exit & stale generation without double delivery."""
+    _assert_sandbox_imports()
+    from concurrent.futures import ThreadPoolExecutor
+    from gateway.session_api_turn import observe_api_turn
+    from hermes_state_runtime import RuntimeStoreError
+
+    db = _make_bound_db(tmp_path, "sess_auth_bg", delivery_enabled=True)
+    telegram = FakeTelegramAdapter()
+    adapter = _make_adapter(db, telegram)
+    adapter._pulse_loop = asyncio.get_running_loop()
+
+    generation = 1
+    live_session = SimpleNamespace(
+        source=SimpleNamespace(platform=Platform.API_SERVER),
+        event_stream=SimpleNamespace(
+            lock=MagicMock(__enter__=lambda s: None, __exit__=lambda s, *a: None),
+            execution={"admission_id": "adm_bg"},
+        ),
+    )
+
+    def _check_gen(_sid, gen):
+        if gen != generation:
+            raise RuntimeStoreError("stale_generation")
+
+    runner = SimpleNamespace(
+        adapters={Platform.API_SERVER: adapter},
+        _adapter_for_source=lambda src: adapter if src.platform == Platform.API_SERVER else None,
+        user_config={"display": {"platforms": {"telegram": {"cleanup_progress": False}}}},
+        session_db=db,
+    )
+    authority = SimpleNamespace(
+        sessions={"sess_auth_bg": live_session},
+        api_observers={},
+        waiters={},
+        db=db,
+        runner=runner,
+        check_approval_generation=_check_gen,
+        _publish_pending=lambda ref: None,
+    )
+    runner.session_authority = authority
+    adapter.gateway_runner = runner
+    adapter._ensure_session_db = lambda: db
+    adapter._ensure_session_db_async = AsyncMock(return_value=db)
+
+    agent = SimpleNamespace(
+        status_callback=None,
+        interim_assistant_callback=None,
+        tool_progress_callback=None,
+        reasoning_callback=None,
+    )
+
+    # Spy on handle_session_subagent_pulse to verify no double delivery when session_authority is active
+    pulse_events_seen: list[tuple[str, str]] = []
+    orig_handle = adapter.handle_session_subagent_pulse
+
+    def spy_handle(session_id, event_type, *args, **kwargs):
+        pulse_events_seen.append((session_id, event_type))
+        return orig_handle(session_id, event_type, *args, **kwargs)
+
+    adapter.handle_session_subagent_pulse = spy_handle
+
+    def _schedule_parent(_ref):
+        wire_api_observers(agent, (authority, "sess_auth_bg", 1), want_interim=False)
+        agent.tool_progress_callback(
+            "subagent.start", None, "Task 0", None,
+            task_index=0, goal="Task 0", delegation_id="deleg_bg", subagent_id="sub_0",
+        )
+        agent.tool_progress_callback(
+            "subagent.start", None, "Task 1", None,
+            task_index=1, goal="Task 1", delegation_id="deleg_bg", subagent_id="sub_1",
+        )
+        authority.waiters["adm_bg"].set_result(None)
+
+    authority._schedule = _schedule_parent
+
+    # Parent turn runs via observe_api_turn + wire_api_observers, starts 2 background subagents, then exits
+    sse_received: list[str] = []
+    ref = SimpleNamespace(session_id="sess_auth_bg")
+    row = {"admission_id": "adm_bg", "status": "started"}
+    with (
+        patch("gateway.session_retirement.restore_retired", lambda *a, **kw: None),
+        patch("hermes_state_runtime.get_session_admission", return_value={"admission_id": "adm_bg", "status": "started", "outcome": "completed"}),
+        patch("gateway.session_api_turn.admission_result", return_value={"result": {"final_response": "ok"}, "usage": {}}),
+    ):
+        await observe_api_turn(
+            (authority, ref, row),
+            tool_progress_callback=lambda ev, *a, **kw: sse_received.append(ev),
+        )
+    await asyncio.sleep(0.03)
+
+    # Parent turn finished: api_observers cleared and generation bumped (stale_generation)
+    assert authority.api_observers == {}
+    generation = 2
+    assert "sess_auth_bg" in adapter._pulse_registry()
+    entry = adapter._pulse_registry()["sess_auth_bg"]
+    assert entry["ticker"].active is True
+    assert pulse_events_seen == [("sess_auth_bg", "subagent.start"), ("sess_auth_bg", "subagent.start")]
+
+    # Background ThreadPoolExecutor emits progress & complete after parent turn ended
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pool.submit(
+            agent.tool_progress_callback,
+            "subagent.progress", "terminal", "Running tests", None,
+            task_index=0, action="Running tests", delegation_id="deleg_bg", subagent_id="sub_0",
+        ).result()
+        pool.submit(
+            agent.tool_progress_callback,
+            "subagent.complete", None, "Done 0", None,
+            task_index=0, status="completed", summary="Done 0", delegation_id="deleg_bg", subagent_id="sub_0",
+        ).result()
+    await asyncio.sleep(0.04)
+
+    # Still 1 running subagent -> ticker stays active, no premature completion
+    assert "sess_auth_bg" in adapter._pulse_registry()
+    assert entry["ticker"].active is True
+    assert entry["ticker"].tasks["deleg_bg:0"]["status"] == "completed"
+    assert entry["ticker"].tasks["deleg_bg:1"]["status"] == "running"
+    assert not any("все субагенты" in c["content"].lower() for c in telegram.calls)
+
+    # Complete second subagent from ThreadPoolExecutor -> ticker stops cleanly
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pool.submit(
+            agent.tool_progress_callback,
+            "subagent.complete", None, "Done 1", None,
+            task_index=1, status="completed", summary="Done 1", delegation_id="deleg_bg", subagent_id="sub_1",
+        ).result()
+    await asyncio.sleep(0.05)
+
+    assert "sess_auth_bg" not in adapter._pulse_registry()
+    assert any(w in c["content"].lower() for c in telegram.calls for w in ("завершен", "completed"))
+
+    # Also verify _handle_session_chat_stream._tool_progress does NOT double-deliver when session_authority is set
+    pulse_events_seen.clear()
+
+    async def fake_run_with_authority(**kwargs):
+        cb = kwargs["tool_progress_callback"]
+        # Simulate _tool_progress receiving an event while session_authority is active
+        cb("subagent.start", None, "Only SSE", None, task_index=0, goal="Only SSE")
+        return {"final_response": "ok", "session_id": "sess_auth_bg"}, {}
+
+    adapter._run_agent = fake_run_with_authority
+    async with TestClient(TestServer(_make_stream_app(adapter))) as cli:
+        resp = await cli.post("/api/sessions/sess_auth_bg/chat/stream", json={"message": "hi"})
+        assert resp.status == 200
+        await resp.text()
+    assert pulse_events_seen == []
+    db.close()
+
+
+@pytest.mark.asyncio
+async def test_cleanup_progress_via_user_config_and_load_gateway_config(tmp_path):
+    """BDD 2: cleanup_progress=True deletes card only after all background subagents complete; False keeps it."""
+    _assert_sandbox_imports()
+
+    # Case 1: cleanup_progress=True via gateway_runner.user_config
+    db1 = _make_bound_db(tmp_path / "c1", "sess_clean_1", delivery_enabled=True)
+    tg1 = FakeDeletableTelegramAdapter()
+    adapter1 = _make_adapter(db1, tg1)
+    adapter1.gateway_runner = SimpleNamespace(
+        session_authority=None,
+        user_config={"display": {"platforms": {"telegram": {"cleanup_progress": True}}}},
+        session_db=db1,
+    )
+    adapter1._ensure_session_db = lambda: db1
+    adapter1._ensure_session_db_async = AsyncMock(return_value=db1)
+
+    async def run_bg_parent(**kwargs):
+        cb = kwargs["tool_progress_callback"]
+        cb("subagent.start", None, "BG 1", None, task_index=0, goal="BG 1", delegation_id="d1", subagent_id="s1")
+        await asyncio.sleep(0.02)
+        return {"final_response": "Parent done", "session_id": "sess_clean_1"}, {}
+
+    adapter1._run_agent = run_bg_parent
+    async with TestClient(TestServer(_make_stream_app(adapter1))) as cli:
+        resp = await cli.post("/api/sessions/sess_clean_1/chat/stream", json={"message": "go"})
+        assert resp.status == 200
+        await resp.text()
+    await asyncio.sleep(0.03)
+
+    # Parent finished, subagent still running -> card NOT deleted
+    assert not any(c["op"] == "delete_message" for c in tg1.calls)
+    assert "sess_clean_1" in adapter1._pulse_registry()
+
+    # Now subagent completes -> card IS deleted
+    adapter1.handle_session_subagent_pulse(
+        "sess_clean_1", "subagent.complete", None, "Done", None,
+        task_index=0, status="completed", summary="Done", delegation_id="d1", subagent_id="s1",
+    )
+    await asyncio.sleep(0.05)
+    assert any(c["op"] == "delete_message" for c in tg1.calls)
+    assert "sess_clean_1" not in adapter1._pulse_registry()
+    db1.close()
+
+    # Case 2: cleanup_progress=True via _load_gateway_config() fallback (no user_config on runner)
+    db2 = _make_bound_db(tmp_path / "c2", "sess_clean_2", delivery_enabled=True)
+    tg2 = FakeDeletableTelegramAdapter()
+    adapter2 = _make_adapter(db2, tg2)
+    adapter2._pulse_loop = asyncio.get_running_loop()
+    with patch("gateway.run._load_gateway_config", return_value={"display": {"cleanup_progress": True}}):
+        adapter2.handle_session_subagent_pulse(
+            "sess_clean_2", "subagent.start", None, "BG 2", None,
+            task_index=0, goal="BG 2", delegation_id="d2", subagent_id="s2",
+        )
+        await asyncio.sleep(0.03)
+        adapter2.handle_session_subagent_pulse(
+            "sess_clean_2", "subagent.complete", None, "Done 2", None,
+            task_index=0, status="completed", summary="Done 2", delegation_id="d2", subagent_id="s2",
+        )
+        await asyncio.sleep(0.05)
+    assert any(c["op"] == "delete_message" for c in tg2.calls)
+    db2.close()
+
+    # Case 3: cleanup_progress=False keeps final card
+    db3 = _make_bound_db(tmp_path / "c3", "sess_clean_3", delivery_enabled=True)
+    tg3 = FakeDeletableTelegramAdapter()
+    adapter3 = _make_adapter(db3, tg3)
+    adapter3.gateway_runner = SimpleNamespace(
+        session_authority=None,
+        user_config={"display": {"platforms": {"telegram": {"cleanup_progress": False}}}},
+        session_db=db3,
+    )
+    adapter3._ensure_session_db = lambda: db3
+    adapter3._pulse_loop = asyncio.get_running_loop()
+    adapter3.handle_session_subagent_pulse(
+        "sess_clean_3", "subagent.start", None, "BG 3", None,
+        task_index=0, goal="BG 3", delegation_id="d3", subagent_id="s3",
+    )
+    await asyncio.sleep(0.03)
+    adapter3.handle_session_subagent_pulse(
+        "sess_clean_3", "subagent.complete", None, "Done 3", None,
+        task_index=0, status="completed", summary="Done 3", delegation_id="d3", subagent_id="s3",
+    )
+    await asyncio.sleep(0.05)
+    assert not any(c["op"] == "delete_message" for c in tg3.calls)
+    assert any(w in c.get("content", "").lower() for c in tg3.calls for w in ("завершен", "completed"))
+    db3.close()
+
+
+@pytest.mark.asyncio
+async def test_stop_vs_parent_failure_and_draining_with_cleanup_progress(tmp_path):
+    """BDD 3: /stop (cancelled) and _draining stop ticker without deleting card; parent failure keeps running subagents alive."""
+    _assert_sandbox_imports()
+    db = _make_bound_db(tmp_path, "sess_stop_drain", delivery_enabled=True)
+    tg = FakeDeletableTelegramAdapter()
+    adapter = _make_adapter(db, tg)
+    adapter.gateway_runner = SimpleNamespace(
+        session_authority=None,
+        user_config={"display": {"platforms": {"telegram": {"cleanup_progress": True}}}},
+        session_db=db,
+    )
+    adapter._ensure_session_db = lambda: db
+    adapter._ensure_session_db_async = AsyncMock(return_value=db)
+
+    # Draining parent turn stops ticker with interrupted and does NOT delete card
+    adapter._draining = True
+
+    async def run_draining(**kwargs):
+        cb = kwargs["tool_progress_callback"]
+        cb("subagent.start", None, "Drain task", None, task_index=0, goal="Drain task", delegation_id="dd", subagent_id="sd")
+        await asyncio.sleep(0.02)
+        return {"final_response": "Draining", "session_id": "sess_stop_drain"}, {}
+
+    adapter._run_agent = run_draining
+    async with TestClient(TestServer(_make_stream_app(adapter))) as cli:
+        resp = await cli.post("/api/sessions/sess_stop_drain/chat/stream", json={"message": "go"})
+        assert resp.status == 200
+        await resp.text()
+    await asyncio.sleep(0.04)
+    assert "sess_stop_drain" not in adapter._pulse_registry()
+    assert not any(c["op"] == "delete_message" for c in tg.calls)
+    db.close()
+
+
+@pytest.mark.asyncio
+async def test_wave1_wave2_race_identity_pop_protection(tmp_path):
+    """BDD 2 & 5: Wave 2 started while Wave 1 stop_task is awaiting is NOT popped by Wave 1 cleanup."""
+    _assert_sandbox_imports()
+    from gateway.subagent_pulse_ticker import SubagentPulseTicker
+
+    db = _make_bound_db(tmp_path, "sess_race", delivery_enabled=True)
+    tg = FakeTelegramAdapter()
+    adapter = _make_adapter(db, tg)
+    adapter._pulse_loop = asyncio.get_running_loop()
+
+    stop_entered = asyncio.Event()
+    allow_stop_finish = asyncio.Event()
+    orig_stop = SubagentPulseTicker.stop
+
+    async def slow_first_stop(self, status="completed", summary="", **kwargs):
+        if not stop_entered.is_set():
+            stop_entered.set()
+            await allow_stop_finish.wait()
+        return await orig_stop(self, status=status, summary=summary, **kwargs)
+
+    with patch.object(SubagentPulseTicker, "stop", slow_first_stop):
+        adapter.handle_session_subagent_pulse(
+            "sess_race", "subagent.start", None, "Wave 1", None,
+            task_index=0, goal="Wave 1", delegation_id="w1", subagent_id="s1",
+        )
+        await asyncio.sleep(0.02)
+        adapter.handle_session_subagent_pulse(
+            "sess_race", "subagent.complete", None, "W1 done", None,
+            task_index=0, status="completed", summary="W1 done", delegation_id="w1", subagent_id="s1",
+        )
+        await asyncio.wait_for(stop_entered.wait(), timeout=2.0)
+        wave1_entry = adapter._pulse_registry().get("sess_race")
+        assert wave1_entry is not None
+
+        # Start Wave 2 while Wave 1 stop_task is still awaiting
+        adapter.handle_session_subagent_pulse(
+            "sess_race", "subagent.start", None, "Wave 2", None,
+            task_index=0, goal="Wave 2", delegation_id="w2", subagent_id="s2",
+        )
+        wave2_entry = adapter._pulse_registry().get("sess_race")
+        assert wave2_entry is not None and wave2_entry is not wave1_entry
+
+        # Let Wave 1 stop_task finish -> Wave 2 entry MUST remain in _session_pulse_tickers
+        allow_stop_finish.set()
+        await asyncio.sleep(0.05)
+        assert adapter._pulse_registry().get("sess_race") is wave2_entry
+        assert wave2_entry["ticker"].active is True
+
+    await adapter.disconnect()
+    db.close()
+
+
+@pytest.mark.asyncio
+async def test_wake_turn_delivers_pulse_with_and_without_session_authority(tmp_path):
+    """BDD 6: run_internal_session_turn delivers subagent.* pulse before any /chat/stream (both with and without session_authority)."""
+    _assert_sandbox_imports()
+    from gateway.session_api_turn import observe_api_turn
+
+    # Case A: without session_authority (fallback tool_progress_callback in api_server_runs.py)
+    db_a = _make_bound_db(tmp_path / "wa", "sess_wake_a", delivery_enabled=True)
+    tg_a = FakeTelegramAdapter()
+    adapter_a = _make_adapter(db_a, tg_a)
+    adapter_a._draining_response = lambda: None
+    adapter_a._concurrency_limited_response = lambda: None
+    adapter_a._get_existing_session_or_404 = AsyncMock(return_value=({"id": "sess_wake_a"}, None))
+    adapter_a._conversation_history_for_session = AsyncMock(return_value=[])
+    adapter_a._select_request_route = lambda *a, **kw: (None, {}, None)
+
+    async def fake_wake_run_a(**kwargs):
+        cb = kwargs.get("tool_progress_callback")
+        assert cb is not None
+        cb("subagent.start", None, "Wake A", None, task_index=0, goal="Wake A", delegation_id="dw_a", subagent_id="sw_a")
+        await asyncio.sleep(0.02)
+        cb("subagent.complete", None, "Wake A done", None, task_index=0, status="completed", summary="Wake A done", delegation_id="dw_a", subagent_id="sw_a")
+        return {"final_response": "ok"}, {}
+
+    adapter_a._run_agent = fake_wake_run_a
+    assert adapter_a._pulse_loop is None
+    await adapter_a.run_internal_session_turn(session_id="sess_wake_a", text="wake", profile="default")
+    await asyncio.sleep(0.05)
+    assert adapter_a._pulse_loop is not None
+    assert any(w in c["content"].lower() for c in tg_a.calls for w in ("завершен", "completed"))
+    db_a.close()
+
+    # Case B: with session_authority (via wire_api_observers -> publish_api_subagent_pulse)
+    db_b = _make_bound_db(tmp_path / "wb", "sess_wake_b", delivery_enabled=True)
+    tg_b = FakeTelegramAdapter()
+    adapter_b = _make_adapter(db_b, tg_b)
+    adapter_b._draining_response = lambda: None
+    adapter_b._concurrency_limited_response = lambda: None
+    adapter_b._get_existing_session_or_404 = AsyncMock(return_value=({"id": "sess_wake_b"}, None))
+    adapter_b._conversation_history_for_session = AsyncMock(return_value=[])
+    adapter_b._select_request_route = lambda *a, **kw: (None, {}, None)
+    adapter_b._ensure_session_db = lambda: db_b
+    adapter_b._ensure_session_db_async = AsyncMock(return_value=db_b)
+
+    live_session = SimpleNamespace(
+        source=SimpleNamespace(platform=Platform.API_SERVER),
+        event_stream=SimpleNamespace(
+            lock=MagicMock(__enter__=lambda s: None, __exit__=lambda s, *a: None),
+            execution={"admission_id": "adm_wake_b"},
+        ),
+    )
+    runner_b = SimpleNamespace(
+        adapters={Platform.API_SERVER: adapter_b},
+        _adapter_for_source=lambda src: adapter_b if src.platform == Platform.API_SERVER else None,
+        user_config={"display": {"platforms": {"telegram": {"cleanup_progress": False}}}},
+        session_db=db_b,
+    )
+    authority_b = SimpleNamespace(
+        sessions={"sess_wake_b": live_session},
+        api_observers={},
+        waiters={},
+        db=db_b,
+        runner=runner_b,
+        check_approval_generation=lambda sid, gen: None,
+        _publish_pending=lambda ref: None,
+    )
+    runner_b.session_authority = authority_b
+    adapter_b.gateway_runner = runner_b
+
+    async def fake_wake_run_b(**kwargs):
+        # With session_authority, api_server_runs does not inject fallback tool_progress_callback;
+        # run_api_turn -> wire_api_observers handles delivery.
+        assert "tool_progress_callback" not in kwargs
+        agent = SimpleNamespace(
+            status_callback=None,
+            interim_assistant_callback=None,
+            tool_progress_callback=None,
+            reasoning_callback=None,
+        )
+
+        def _schedule_wake(_ref):
+            wire_api_observers(agent, (authority_b, "sess_wake_b", 1), want_interim=False)
+            agent.tool_progress_callback(
+                "subagent.start", None, "Wake B", None,
+                task_index=0, goal="Wake B", delegation_id="dw_b", subagent_id="sw_b",
+            )
+            agent.tool_progress_callback(
+                "subagent.complete", None, "Wake B done", None,
+                task_index=0, status="completed", summary="Wake B done", delegation_id="dw_b", subagent_id="sw_b",
+            )
+            authority_b.waiters["adm_wake_b"].set_result(None)
+
+        authority_b._schedule = _schedule_wake
+        ref_b = SimpleNamespace(session_id="sess_wake_b")
+        row_b = {"admission_id": "adm_wake_b", "status": "started"}
+        with (
+            patch("gateway.session_retirement.restore_retired", lambda *a, **kw: None),
+            patch("hermes_state_runtime.get_session_admission", return_value={"admission_id": "adm_wake_b", "status": "started", "outcome": "completed"}),
+            patch("gateway.session_api_turn.admission_result", return_value={"result": {"final_response": "ok"}, "usage": {}}),
+        ):
+            await observe_api_turn((authority_b, ref_b, row_b))
+        return {"final_response": "ok"}, {}
+
+    adapter_b._run_agent = fake_wake_run_b
+    await adapter_b.run_internal_session_turn(session_id="sess_wake_b", text="wake", profile="default")
+    await asyncio.sleep(0.05)
+    assert adapter_b._pulse_loop is not None
+    assert any(w in c["content"].lower() for c in tg_b.calls for w in ("завершен", "completed"))
+    db_b.close()
+
+
+@pytest.mark.asyncio
+async def test_disconnect_on_bare_new_fixture_stops_active_tickers(tmp_path):
+    """disconnect() tolerates bare APIServerAdapter.__new__ fixtures and stops active tickers with interrupted."""
+    _assert_sandbox_imports()
+    # Bare __new__ without any pulse attributes
+    bare = APIServerAdapter.__new__(APIServerAdapter)
+    bare._mark_disconnected = lambda: None
+    bare._close_cached_session_dbs = lambda: None
+    bare._memory_sessions = SimpleNamespace(close_all=lambda: None)
+    bare._site = None
+    bare._runner = None
+    await bare.disconnect()
+
+    # Bare __new__ with an active ticker registered via handle_session_subagent_pulse
+    db = _make_bound_db(tmp_path, "sess_bare_disc", delivery_enabled=True)
+    tg = FakeTelegramAdapter()
+    bare2 = APIServerAdapter.__new__(APIServerAdapter)
+    bare2._mark_disconnected = lambda: setattr(bare2, "_disconnected", True)
+    bare2._close_cached_session_dbs = lambda: None
+    bare2._memory_sessions = SimpleNamespace(close_all=lambda: None)
+    bare2._site = None
+    bare2._runner = None
+    bare2._session_db = db
+    bare2._ensure_session_db = lambda: db
+    bare2._telegram_runner_and_adapter = lambda: (None, tg)
+    bare2.is_telegram_bound = lambda sid: sid == "sess_bare_disc"
+    bare2.gateway_runner = None
+    bare2._pulse_loop = asyncio.get_running_loop()
+
+    bare2.handle_session_subagent_pulse(
+        "sess_bare_disc", "subagent.start", None, "Bare task", None,
+        task_index=0, goal="Bare task", delegation_id="dbare", subagent_id="sbare",
+    )
+    await asyncio.sleep(0.03)
+    entry = bare2._pulse_registry().get("sess_bare_disc")
+    assert entry is not None
+    ticker = entry["ticker"]
+    assert ticker.active is True
+
+    await bare2.disconnect()
+    assert ticker.active is False
+    assert bare2._pulse_registry() == {}
     db.close()

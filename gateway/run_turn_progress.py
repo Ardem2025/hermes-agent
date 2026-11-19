@@ -308,17 +308,36 @@ class GatewayTurnProgressMixin:
             return
 
         task_idx = kwargs.get("task_index", 0)
+        delegation_id = kwargs.get("delegation_id")
+        subagent_id = kwargs.get("subagent_id")
         if event_type == "subagent.start":
             goal = kwargs.get("goal") or preview or ""
             transcript = kwargs.get("live_transcript") or kwargs.get("transcript_path")
-            ticker.on_subagent_start(task_idx, goal, transcript)
+            ticker.on_subagent_start(
+                task_idx,
+                goal,
+                transcript,
+                delegation_id=delegation_id,
+                subagent_id=subagent_id,
+            )
         elif event_type == "subagent.progress":
             action = preview or tool_name or ""
-            ticker.on_subagent_progress(task_idx, action)
+            ticker.on_subagent_progress(
+                task_idx,
+                action,
+                delegation_id=delegation_id,
+                subagent_id=subagent_id,
+            )
         elif event_type == "subagent.complete":
             status = kwargs.get("status", "completed")
             summary = kwargs.get("summary") or preview
-            ticker.on_subagent_complete(task_idx, status, summary)
+            ticker.on_subagent_complete(
+                task_idx,
+                status,
+                summary,
+                delegation_id=delegation_id,
+                subagent_id=subagent_id,
+            )
             active_left = any(t.get("status") == "running" for t in ticker.tasks.values())
             if not active_left:
                 failed_task = next(

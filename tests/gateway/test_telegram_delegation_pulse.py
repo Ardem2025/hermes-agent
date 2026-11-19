@@ -507,6 +507,8 @@ async def test_pulse_ticker_stop_cleanup_progress_behavior():
     adapter_sync._status_message_ids = MagicMock()
     ticker_sync = SubagentPulseTicker(adapter=adapter_sync, chat_id="12345", cleanup_progress=True)
     ticker_sync.current_message_id = "msg-del-2"
+    ticker_sync.on_subagent_start(0, "Task")
+    ticker_sync.on_subagent_complete(0, status="completed", summary="Done")
     await ticker_sync.stop(status="completed", summary="Done")
     adapter_sync.delete_message.assert_called_once_with("12345", "msg-del-2")
 
@@ -526,6 +528,32 @@ async def test_pulse_ticker_stop_cleanup_progress_behavior():
     ticker_keep.current_message_id = "msg-keep"
     await ticker_keep.stop(status="completed", summary="Done")
     adapter_keep.delete_message.assert_not_awaited()
+
+    # Case E: cleanup_progress=True with empty tasks or non-completed task does NOT delete card
+    adapter_empty = _make_adapter("msg-empty")
+    adapter_empty.delete_message = AsyncMock()
+    ticker_empty = SubagentPulseTicker(adapter=adapter_empty, chat_id="12345", cleanup_progress=True)
+    ticker_empty.current_message_id = "msg-empty"
+    await ticker_empty.stop(status="completed", summary="Done")
+    adapter_empty.delete_message.assert_not_awaited()
+
+    for bad_status in ("failed", "error", "timeout", "cancelled"):
+        adapter_bad = _make_adapter(f"msg-{bad_status}")
+        adapter_bad.delete_message = AsyncMock()
+        ticker_bad = SubagentPulseTicker(adapter=adapter_bad, chat_id="12345", cleanup_progress=True)
+        ticker_bad.current_message_id = f"msg-{bad_status}"
+        ticker_bad.on_subagent_start(0, "Task")
+        ticker_bad.on_subagent_complete(0, status=bad_status, summary="Err")
+        await ticker_bad.stop(status="completed", summary="Done")
+        adapter_bad.delete_message.assert_not_awaited()
+
+    adapter_running = _make_adapter("msg-running")
+    adapter_running.delete_message = AsyncMock()
+    ticker_running = SubagentPulseTicker(adapter=adapter_running, chat_id="12345", cleanup_progress=True)
+    ticker_running.current_message_id = "msg-running"
+    ticker_running.on_subagent_start(0, "Still running")
+    await ticker_running.stop(status="completed", summary="Done")
+    adapter_running.delete_message.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -627,3 +655,107 @@ def test_child_progress_relay_localization_grouping_and_threadpool_override(tmp_
     ticker = SubagentPulseTicker(adapter=_make_adapter(), chat_id="12345")
     with patch("agent.display._friendly_tool_labels", False):
         assert ticker._parse_action_from_content("2026-11-19 tool -> terminal(pytest -q)") == "⚙️ terminal (pytest -q)"
+
+
+@pytest.mark.asyncio
+async def test_composite_keys_aliases_mixed_render_and_stop_guard():
+    """BDD 4 & 5: composite keys, _subagent_key_aliases, mixed int/str _render_card, and stop('completed') guard."""
+    adapter = _make_adapter("msg-comp")
+    adapter.delete_message = AsyncMock(return_value=True)
+    ticker = SubagentPulseTicker(adapter=adapter, chat_id="12345", cleanup_progress=True)
+    ticker.current_message_id = "msg-comp"
+
+    # Two separate delegate_task calls with task_index=0 and different delegation_id do not overwrite each other
+    ticker.on_subagent_start(0, "First delegation", delegation_id="deleg_1", subagent_id="sub_1")
+    ticker.on_subagent_start(0, "Second delegation", delegation_id="deleg_2", subagent_id="sub_2")
+    assert "deleg_1:0" in ticker.tasks
+    assert "deleg_2:0" in ticker.tasks
+    assert len(ticker.tasks) == 2
+
+    # Alias resolution: start with subagent_id only (no delegation_id), then progress/complete with delegation_id + subagent_id
+    ticker.on_subagent_start(0, "Alias task", subagent_id="sub_alias")
+    assert "subagent:sub_alias" in ticker.tasks
+    ticker.on_subagent_progress(0, "Reading file", delegation_id="deleg_late", subagent_id="sub_alias")
+    assert "deleg_late:0" not in ticker.tasks
+    assert ticker.tasks["subagent:sub_alias"]["last_action"] == "Reading file"
+
+    # Mixed int and str keys in _render_card do not raise TypeError and number #1..#N
+    ticker.on_subagent_start(0, "Legacy int task")
+    assert 0 in ticker.tasks
+    rendered_running = ticker._render_card(final_status="completed")
+    assert "⏳" in rendered_running
+    assert "завершен" not in rendered_running.lower()
+    assert "#1" in rendered_running and "#4" in rendered_running
+
+    # stop(status="completed") while running tasks exist does NOT stop ticker or delete card
+    ticker.active = True
+    ticker.ticker_task = asyncio.create_task(asyncio.sleep(10))
+    try:
+        await ticker.stop(status="completed", summary="Premature")
+        assert ticker.active is True
+        assert not ticker.ticker_task.done()
+        adapter.delete_message.assert_not_awaited()
+
+        # stop(status="interrupted") stops even with running tasks and keeps card
+        await ticker.stop(status="interrupted", summary="Stopped")
+        assert ticker.active is False
+        adapter.delete_message.assert_not_awaited()
+    finally:
+        if ticker.ticker_task and not ticker.ticker_task.done():
+            ticker.ticker_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await ticker.ticker_task
+
+    # stop(status="completed", force=True) stops even with running tasks (without deleting card since not all completed)
+    ticker2 = SubagentPulseTicker(adapter=_make_adapter("msg-force"), chat_id="12345", cleanup_progress=True)
+    ticker2.current_message_id = "msg-force"
+    ticker2.active = True
+    ticker2.ticker_task = asyncio.create_task(asyncio.sleep(10))
+    ticker2.on_subagent_start(0, "Running task", delegation_id="d_force", subagent_id="s_force")
+    await ticker2.stop(status="completed", force=True)
+    assert ticker2.active is False
+    ticker2.adapter.delete_message.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_turn_runner_forwards_delegation_and_subagent_ids():
+    """BDD 5: TurnRunner._handle_subagent_pulse forwards delegation_id and subagent_id to SubagentPulseTicker."""
+    adapter = _make_adapter("msg-fwd")
+    runner = SimpleNamespace(_delivery_adapter_for=lambda _src: adapter, _is_draining=lambda: False)
+    ctx = TurnContext(
+        session_key="tg:12345",
+        source=_make_telegram_source(),
+        tool_progress_enabled=True,
+        _status_adapter=adapter,
+        _loop_for_step=asyncio.get_running_loop(),
+        _run_still_current=lambda: True,
+    )
+    helper = _make_progress_helper(runner, ctx)
+    helper.progress_callback(
+        "subagent.start", None, "Wave A", None,
+        task_index=0, goal="Wave A", delegation_id="dA", subagent_id="sA",
+    )
+    helper.progress_callback(
+        "subagent.start", None, "Wave B", None,
+        task_index=0, goal="Wave B", delegation_id="dB", subagent_id="sB",
+    )
+    await asyncio.sleep(0.03)
+    assert ctx._pulse_ticker is not None
+    assert "dA:0" in ctx._pulse_ticker.tasks
+    assert "dB:0" in ctx._pulse_ticker.tasks
+    helper.progress_callback(
+        "subagent.progress", "terminal", "Step A", None,
+        task_index=0, action="Step A", delegation_id="dA", subagent_id="sA",
+    )
+    helper.progress_callback(
+        "subagent.complete", None, "Done A", None,
+        task_index=0, status="completed", summary="Done A", delegation_id="dA", subagent_id="sA",
+    )
+    helper.progress_callback(
+        "subagent.complete", None, "Done B", None,
+        task_index=0, status="completed", summary="Done B", delegation_id="dB", subagent_id="sB",
+    )
+    await asyncio.sleep(0.03)
+    assert ctx._pulse_ticker.tasks["dA:0"]["status"] == "completed"
+    assert ctx._pulse_ticker.tasks["dB:0"]["status"] == "completed"
+    await ctx._pulse_ticker.stop(status="completed", force=True)
