@@ -1923,7 +1923,9 @@ class APIServerAdapter(
             return sec_fetch_site in {"same-origin", "same-site"}
         if candidate.lower() == "null":
             return False
-        if "*" in self._cors_origins or candidate in self._cors_origins:
+        # Wildcard CORS ('*') is incompatible with ambient credentials/cookies and must
+        # never disable CSRF protection for cross-origin browser mutations lacking Bearer.
+        if candidate != "*" and candidate in self._cors_origins:
             return True
         host = (request.headers.get("Host") or "").strip().lower()
         if host:

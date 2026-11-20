@@ -674,8 +674,8 @@ class _TelegramSyncMixin:
             "session_id": session_id,
             "chat_id": chat_id,
             "thread_id": thread_id,
-            "link": APIServerAdapter._telegram_topic_link(chat_id, thread_id) if chat_id and thread_id else None,
-            "topic_url": APIServerAdapter._telegram_topic_link(chat_id, thread_id) if chat_id and thread_id else None,
+            "link": _api_mod().APIServerAdapter._telegram_topic_link(chat_id, thread_id) if chat_id and thread_id else None,
+            "topic_url": _api_mod().APIServerAdapter._telegram_topic_link(chat_id, thread_id) if chat_id and thread_id else None,
             "delivery_enabled": bool(binding.get("delivery_enabled", True)) if bound else False,
             "last_synced_message_id": binding.get("last_synced_message_id") if bound else None,
             "future_duplication": {

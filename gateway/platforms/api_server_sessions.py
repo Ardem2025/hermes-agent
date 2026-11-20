@@ -674,7 +674,7 @@ class _SessionsMixin:
         try:
             deleted = await _api_mod().asyncio.to_thread(
                 db.delete_session, session_id, sessions_dir=sessions_dir, exclude_active_write_guards=True)
-        except SessionActiveWriteGuardError as exc:
+        except _api_mod().SessionActiveWriteGuardError as exc:
             return _api_mod()._error_response(str(exc), 409, code="session_active_turn")
         if deleted:
             # A hard delete must also drop the gateway's durable channel→session routing entries

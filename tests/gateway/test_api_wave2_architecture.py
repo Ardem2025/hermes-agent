@@ -288,3 +288,233 @@ async def test_csrf_origin_guard_blocks_cross_site_without_breaking_bearer_or_cl
             },
         )
         assert r7.status == 201
+
+
+def test_api_server_modules_have_no_undefined_names():
+    import ast
+    import builtins
+
+    builtin_names = set(dir(builtins)) | {
+        "__name__", "__file__", "__doc__", "__package__", "__spec__", "__builtins__", "__cached__",
+    }
+
+    class _ScopeChecker(ast.NodeVisitor):
+        def __init__(self):
+            self.scopes = [set(builtin_names)]
+            self.undefined = []
+
+        def _define(self, name: str) -> None:
+            self.scopes[-1].add(name)
+
+        def _is_defined(self, name: str) -> bool:
+            return any(name in s for s in self.scopes)
+
+        def _collect_targets(self, node) -> None:
+            if isinstance(node, ast.Name):
+                self._define(node.id)
+            elif isinstance(node, (ast.Tuple, ast.List)):
+                for elt in node.elts:
+                    self._collect_targets(elt)
+            elif isinstance(node, ast.Starred):
+                self._collect_targets(node.value)
+
+        def _precollect(self, stmts) -> None:
+            for stmt in stmts:
+                if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    self._define(stmt.name)
+                elif isinstance(stmt, ast.Import):
+                    for alias in stmt.names:
+                        self._define(alias.asname or alias.name.split(".")[0])
+                elif isinstance(stmt, ast.ImportFrom):
+                    for alias in stmt.names:
+                        if alias.name != "*":
+                            self._define(alias.asname or alias.name)
+                elif isinstance(stmt, ast.Assign):
+                    for t in stmt.targets:
+                        self._collect_targets(t)
+                elif isinstance(stmt, (ast.AnnAssign, ast.AugAssign)):
+                    self._collect_targets(stmt.target)
+                elif isinstance(stmt, (ast.For, ast.AsyncFor)):
+                    self._collect_targets(stmt.target)
+                    self._precollect(stmt.body)
+                    self._precollect(stmt.orelse)
+                elif isinstance(stmt, (ast.With, ast.AsyncWith)):
+                    for item in stmt.items:
+                        if item.optional_vars:
+                            self._collect_targets(item.optional_vars)
+                    self._precollect(stmt.body)
+                elif isinstance(stmt, (ast.If, ast.While)):
+                    self._precollect(stmt.body)
+                    self._precollect(stmt.orelse)
+                elif isinstance(stmt, ast.Try) or (hasattr(ast, "TryStar") and isinstance(stmt, ast.TryStar)):
+                    self._precollect(stmt.body)
+                    for h in stmt.handlers:
+                        if h.name:
+                            self._define(h.name)
+                        self._precollect(h.body)
+                    self._precollect(stmt.orelse)
+                    self._precollect(stmt.finalbody)
+
+        def visit_Module(self, node):
+            self._precollect(node.body)
+            for stmt in node.body:
+                self.visit(stmt)
+
+        def visit_ClassDef(self, node):
+            for dec in node.decorator_list:
+                self.visit(dec)
+            for b in node.bases:
+                self.visit(b)
+            for kw in node.keywords:
+                self.visit(kw.value)
+            self._define(node.name)
+            self.scopes.append(set())
+            self._precollect(node.body)
+            for stmt in node.body:
+                self.visit(stmt)
+            self.scopes.pop()
+
+        def _visit_func(self, node):
+            for dec in node.decorator_list:
+                self.visit(dec)
+            for d in node.args.defaults + [x for x in node.args.kw_defaults if x is not None]:
+                self.visit(d)
+            args = {a.arg for a in node.args.posonlyargs + node.args.args + node.args.kwonlyargs}
+            if node.args.vararg:
+                args.add(node.args.vararg.arg)
+            if node.args.kwarg:
+                args.add(node.args.kwarg.arg)
+            self.scopes.append(args)
+            self._precollect(node.body)
+            for stmt in node.body:
+                self.visit(stmt)
+            self.scopes.pop()
+
+        visit_FunctionDef = _visit_func
+        visit_AsyncFunctionDef = _visit_func
+
+        def visit_Lambda(self, node):
+            args = {a.arg for a in node.args.posonlyargs + node.args.args + node.args.kwonlyargs}
+            if node.args.vararg:
+                args.add(node.args.vararg.arg)
+            if node.args.kwarg:
+                args.add(node.args.kwarg.arg)
+            self.scopes.append(args)
+            self.visit(node.body)
+            self.scopes.pop()
+
+        def _visit_comp(self, node, elts):
+            self.scopes.append(set())
+            for gen in node.generators:
+                self.visit(gen.iter)
+                self._collect_targets(gen.target)
+                for if_c in gen.ifs:
+                    self.visit(if_c)
+            for e in elts:
+                self.visit(e)
+            self.scopes.pop()
+
+        def visit_ListComp(self, node):
+            self._visit_comp(node, [node.elt])
+
+        def visit_SetComp(self, node):
+            self._visit_comp(node, [node.elt])
+
+        def visit_GeneratorExp(self, node):
+            self._visit_comp(node, [node.elt])
+
+        def visit_DictComp(self, node):
+            self._visit_comp(node, [node.key, node.value])
+
+        def visit_NamedExpr(self, node):
+            self.visit(node.value)
+            self._define(node.target.id)
+
+        def visit_Name(self, node):
+            if isinstance(node.ctx, ast.Load) and not self._is_defined(node.id):
+                self.undefined.append((node.lineno, node.id))
+
+    platforms_dir = Path(api_server_mod.__file__).resolve().parent
+    failures = {}
+    for path in sorted(platforms_dir.glob("api_server*.py")):
+        checker = _ScopeChecker()
+        checker.visit(ast.parse(path.read_text(encoding="utf-8"), filename=str(path)))
+        if checker.undefined:
+            failures[path.name] = checker.undefined
+    assert not failures, f"Undefined names in api_server modules: {failures}"
+
+
+@pytest.mark.asyncio
+async def test_telegram_binding_response_returns_topic_link(tmp_path, monkeypatch):
+    payload = APIServerAdapter._telegram_binding_response(
+        "sess-tg-1",
+        {"chat_id": "-1001234567890", "thread_id": "42", "delivery_enabled": True},
+    )
+    assert payload["bound"] is True
+    assert payload["link"] == "https://t.me/c/1234567890/42"
+    assert payload["topic_url"] == "https://t.me/c/1234567890/42"
+
+    adapter = _make_adapter(monkeypatch, tmp_path)
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.create_session(session_id="sess-tg-1", source="webui", model="test-model")
+    adapter._session_db = db
+    app = _build_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.get("/api/sessions/sess-tg-1/telegram-binding")
+        assert resp.status == 200
+        body = await resp.json()
+        assert body["object"] == "hermes.telegram_binding"
+        assert body["session_id"] == "sess-tg-1"
+
+
+@pytest.mark.asyncio
+async def test_csrf_origin_guard_blocks_cross_site_even_with_wildcard_cors(tmp_path, monkeypatch):
+    adapter = _make_adapter(
+        monkeypatch,
+        tmp_path,
+        api_key="secret-token-1234567890",
+        cors_origins="*",
+    )
+    db = SessionDB(db_path=tmp_path / "state.db")
+    adapter._session_db = db
+    app = _build_app(adapter)
+
+    async with TestClient(TestServer(app)) as cli:
+        # Cross-origin + Cookie without Bearer must be blocked by CSRF (403), not reach auth (401)
+        r_cookie = await cli.post(
+            "/api/sessions",
+            json={"title": "evil-wildcard-cookie"},
+            headers={"Origin": "https://evil.example", "Cookie": "hermes_sid=abc"},
+        )
+        assert r_cookie.status == 403
+
+        # Cross-origin without Cookie and without Bearer must also be blocked (403)
+        r_origin = await cli.post(
+            "/api/sessions",
+            json={"title": "evil-wildcard-origin"},
+            headers={"Origin": "https://evil.example"},
+        )
+        assert r_origin.status == 403
+
+        # Cross-origin with valid Bearer token remains allowed under wildcard CORS
+        r_bearer = await cli.post(
+            "/api/sessions",
+            json={"title": "ok-wildcard-bearer"},
+            headers={
+                "Origin": "https://evil.example",
+                "Authorization": "Bearer secret-token-1234567890",
+            },
+        )
+        assert r_bearer.status == 201
+
+        # Same-origin (Origin == Host) + Cookie without Bearer passes CSRF and hits auth (401)
+        r_same = await cli.post(
+            "/api/sessions",
+            json={"title": "same-origin-no-bearer"},
+            headers={
+                "Host": "127.0.0.1:20143",
+                "Origin": "http://127.0.0.1:20143",
+                "Cookie": "hermes_sid=abc",
+            },
+        )
+        assert r_same.status == 401
