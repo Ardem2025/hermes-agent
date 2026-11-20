@@ -3349,6 +3349,7 @@ class APIServerAdapter(
         except Exception:
             logger.debug("Failed to persist auto_resume_on_delegation for %s", session_id, exc_info=True)
 
+    @staticmethod
     def _bind_api_server_session(
         *, chat_id: str = "", session_key: str = "", session_id: str = "", profile: str = "",
         session_history_delivery: str = "", auto_resume_on_delegation: bool = False) -> list:

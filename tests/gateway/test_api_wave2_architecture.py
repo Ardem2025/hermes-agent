@@ -518,3 +518,100 @@ async def test_csrf_origin_guard_blocks_cross_site_even_with_wildcard_cors(tmp_p
             },
         )
         assert r_same.status == 401
+def test_bind_api_server_session_staticmethod_contract_and_bdd(monkeypatch, tmp_path):
+    import inspect
+    from gateway import session_context
+
+    sig = inspect.signature(APIServerAdapter._bind_api_server_session)
+    params = list(sig.parameters.values())
+    assert [p.name for p in params] == [
+        "chat_id",
+        "session_key",
+        "session_id",
+        "profile",
+        "session_history_delivery",
+        "auto_resume_on_delegation",
+    ]
+    assert all(p.kind == inspect.Parameter.KEYWORD_ONLY for p in params)
+
+    adapter = _make_adapter(monkeypatch, tmp_path)
+
+    # BDD-2: class call
+    tokens_cls = APIServerAdapter._bind_api_server_session(
+        chat_id="chat-cls",
+        session_key="key-cls",
+        session_id="sess-cls",
+        profile="prof-cls",
+        session_history_delivery="1",
+        auto_resume_on_delegation=True,
+    )
+    try:
+        assert session_context.get_session_env("HERMES_SESSION_PLATFORM", "") == "api_server"
+        assert session_context.get_session_env("HERMES_SESSION_CHAT_ID", "") == "chat-cls"
+        assert session_context.get_session_env("HERMES_SESSION_KEY", "") == "key-cls"
+        assert session_context.get_session_env("HERMES_SESSION_ID", "") == "sess-cls"
+        assert session_context.get_session_env("HERMES_SESSION_PROFILE", "") == "prof-cls"
+        assert session_context.async_delivery_supported() is False
+        assert session_context.session_history_delivery_supported() is True
+    finally:
+        session_context.clear_session_vars(tokens_cls)
+
+    # BDD-4 & BDD-3: instance call (self._bind_api_server_session / adapter._bind_api_server_session)
+    tokens_inst = adapter._bind_api_server_session(
+        chat_id="chat-inst",
+        session_key="key-inst",
+        session_id="sess-inst",
+        profile="prof-inst",
+        session_history_delivery="",
+    )
+    try:
+        assert session_context.get_session_env("HERMES_SESSION_PLATFORM", "") == "api_server"
+        assert session_context.get_session_env("HERMES_SESSION_CHAT_ID", "") == "chat-inst"
+        assert session_context.get_session_env("HERMES_SESSION_KEY", "") == "key-inst"
+        assert session_context.get_session_env("HERMES_SESSION_ID", "") == "sess-inst"
+        assert session_context.get_session_env("HERMES_SESSION_PROFILE", "") == "prof-inst"
+        assert session_context.async_delivery_supported() is False
+        assert session_context.session_history_delivery_supported() is False
+    finally:
+        session_context.clear_session_vars(tokens_inst)
+
+    # BDD-5: positional args rejected; boundary defaults & auto_resume_on_delegation mapping
+    with pytest.raises(TypeError):
+        APIServerAdapter._bind_api_server_session("x")
+    with pytest.raises(TypeError):
+        adapter._bind_api_server_session("x")
+
+    captured = []
+    monkeypatch.setattr(session_context, "set_session_vars", lambda **kw: captured.append(kw) or ["tok"])
+    assert adapter._bind_api_server_session() == ["tok"]
+    assert adapter._bind_api_server_session(auto_resume_on_delegation=True) == ["tok"]
+    assert captured[0]["auto_resume_on_delegation"] is None
+    assert captured[0]["profile"] == ""
+    assert captured[0]["session_history_delivery"] == ""
+    assert captured[1]["auto_resume_on_delegation"] is True
+
+
+def test_api_server_modules_no_unbound_class_methods_ast():
+    import ast
+
+    platforms_dir = Path(api_server_mod.__file__).resolve().parent
+    anomalies = []
+    for path in sorted(platforms_dir.glob("api_server*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ClassDef):
+                continue
+            for item in node.body:
+                if not isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                decs = {
+                    d.id if isinstance(d, ast.Name) else (d.attr if isinstance(d, ast.Attribute) else "")
+                    for d in item.decorator_list
+                }
+                if "staticmethod" in decs or "classmethod" in decs:
+                    continue
+                pos = list(item.args.posonlyargs) + list(item.args.args)
+                first = pos[0].arg if pos else None
+                if first not in ("self", "cls"):
+                    anomalies.append(f"{path.name}:{item.lineno} {node.name}.{item.name} (first={first})")
+    assert not anomalies, f"Class methods missing self/cls or @staticmethod/@classmethod: {anomalies}"
