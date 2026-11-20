@@ -657,3 +657,237 @@ async def test_scenario6_early_returns_info_logging(tmp_path, caplog):
         "reason=binding_lookup_error",
     ):
         assert any(reason in m for m in info_msgs), f"Missing INFO log for {reason}"
+
+
+# ── BDD Scenarios 1-6: Default placeholder auto-title & WebUI PATCH -> Telegram sync ─────────
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "placeholder",
+    ["New Chat", "New Chat (#402000)", "Hermes Chat", "Новый чат"],
+)
+async def test_bdd1_default_topic_placeholder_uses_derived_and_allows_llm_auto_title(tmp_path, placeholder):
+    from agent.title_generator import _has_upgraded_title
+
+    db = _make_db(tmp_path)
+    adapter = _make_adapter(db)
+    adapter.rename_dm_topic = AsyncMock()
+
+    # Case A: topic created before binding -> stored in _created_topic_names -> _record_telegram_topic_binding
+    thread_a = 402100
+    await adapter._handle_forum_topic_created(_created_update(placeholder, thread_id=thread_a), None)
+    db.create_session("sess-bdd1-a", source="telegram")
+    runner = _DummyRunner(AsyncSessionDB(db), adapter)
+    source_a = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id=str(CHAT_ID),
+        thread_id=str(thread_a),
+        user_id=str(USER_ID),
+        chat_type="dm",
+    )
+    # _record_telegram_topic_binding expects sync SessionDB
+    sync_runner = _DummyRunner(db, adapter)
+    sync_runner._record_telegram_topic_binding(
+        source_a, SimpleNamespace(session_key=f"tg:{CHAT_ID}:{thread_a}", session_id="sess-bdd1-a")
+    )
+
+    row_a = db.get_session("sess-bdd1-a")
+    assert row_a["title"] == placeholder
+    assert row_a["title_source"] == "derived"
+    assert _has_upgraded_title(db, "sess-bdd1-a") is False
+
+    assert db.set_auto_title("sess-bdd1-a", "Настройка деплоя", source="llm") is True
+    assert db.get_session("sess-bdd1-a")["title"] == "Настройка деплоя"
+    assert db.get_session("sess-bdd1-a")["title_source"] == "llm"
+
+    await runner._rename_telegram_topic_for_session_title(source_a, "sess-bdd1-a", "Настройка деплоя")
+    adapter.rename_dm_topic.assert_awaited_once_with(
+        chat_id=str(CHAT_ID), thread_id=str(thread_a), name="Настройка деплоя"
+    )
+
+    # Case B: binding already exists when _handle_forum_topic_created fires
+    thread_b = 402101
+    db.create_session("sess-bdd1-b", source="telegram")
+    db.bind_telegram_topic(
+        chat_id=str(CHAT_ID),
+        thread_id=str(thread_b),
+        user_id=str(USER_ID),
+        session_key=f"tg:{CHAT_ID}:{thread_b}",
+        session_id="sess-bdd1-b",
+        profile_name="default",
+    )
+    await adapter._handle_forum_topic_created(_created_update(placeholder, thread_id=thread_b), None)
+    row_b = db.get_session("sess-bdd1-b")
+    assert row_b["title_source"] == "derived"
+    assert _has_upgraded_title(db, "sess-bdd1-b") is False
+
+
+@pytest.mark.asyncio
+async def test_bdd2_custom_created_topic_name_stays_user_and_blocks_llm_auto_title(tmp_path):
+    from agent.title_generator import _has_upgraded_title
+
+    db = _make_db(tmp_path)
+    adapter = _make_adapter(db)
+
+    await adapter._handle_forum_topic_created(_created_update("Разбор логов", thread_id=402200), None)
+    db.create_session("sess-bdd2", source="telegram")
+    runner = _DummyRunner(db, adapter)
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id=str(CHAT_ID),
+        thread_id="402200",
+        user_id=str(USER_ID),
+        chat_type="dm",
+    )
+    runner._record_telegram_topic_binding(
+        source, SimpleNamespace(session_key=f"tg:{CHAT_ID}:402200", session_id="sess-bdd2")
+    )
+
+    row = db.get_session("sess-bdd2")
+    assert row["title"] == "Разбор логов"
+    assert row["title_source"] == "user"
+    assert _has_upgraded_title(db, "sess-bdd2") is True
+    assert db.set_auto_title("sess-bdd2", "Другое имя", source="llm") is False
+    assert db.get_session("sess-bdd2")["title"] == "Разбор логов"
+
+
+def _build_api_test_app(monkeypatch, tmp_path, db: SessionDB, telegram_adapter):
+    from aiohttp import web
+    from gateway.platforms.api_server import APIServerAdapter
+
+    monkeypatch.delenv("API_SERVER_KEY", raising=False)
+    api_adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={}))
+    api_adapter._session_db = db
+    monkeypatch.setattr(api_adapter, "_telegram_runner_and_adapter", lambda: (None, telegram_adapter))
+    app = web.Application()
+    for method, path, handler in api_adapter._http_route_table():
+        app.router.add_route(method, path, handler)
+    return app
+
+
+@pytest.mark.asyncio
+async def test_bdd3_patch_session_title_syncs_to_bound_telegram_topic(tmp_path, monkeypatch):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    db = _make_db(tmp_path)
+    db.create_session("sess-bdd3", source="telegram")
+    db.bind_telegram_topic(
+        chat_id="139351986",
+        thread_id="401485",
+        user_id=str(USER_ID),
+        session_key="tg:139351986:401485",
+        session_id="sess-bdd3",
+        profile_name="default",
+    )
+    tg_adapter = _make_adapter(db)
+    tg_adapter.rename_dm_topic = AsyncMock()
+
+    app = _build_api_test_app(monkeypatch, tmp_path, db, tg_adapter)
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.patch("/api/sessions/sess-bdd3", json={"title": "Новое имя из WebUI"})
+        assert resp.status == 200
+        payload = await resp.json()
+        assert payload["session"]["title"] == "Новое имя из WebUI"
+
+    row = db.get_session("sess-bdd3")
+    assert row["title"] == "Новое имя из WebUI"
+    assert row["title_source"] == "user"
+    tg_adapter.rename_dm_topic.assert_awaited_once_with(
+        chat_id="139351986", thread_id="401485", name="Новое имя из WebUI"
+    )
+
+
+@pytest.mark.asyncio
+async def test_bdd4_patch_session_title_survives_telegram_api_error(tmp_path, monkeypatch, caplog):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    db = _make_db(tmp_path)
+    db.create_session("sess-bdd4", source="telegram")
+    db.bind_telegram_topic(
+        chat_id="139351986",
+        thread_id="401486",
+        user_id=str(USER_ID),
+        session_key="tg:139351986:401486",
+        session_id="sess-bdd4",
+        profile_name="default",
+    )
+    tg_adapter = _make_adapter(db)
+    tg_adapter.rename_dm_topic = AsyncMock(side_effect=RuntimeError("Flood control"))
+
+    app = _build_api_test_app(monkeypatch, tmp_path, db, tg_adapter)
+    with caplog.at_level(logging.WARNING):
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.patch("/api/sessions/sess-bdd4", json={"title": "Имя при сбое TG"})
+            assert resp.status == 200
+
+    assert db.get_session("sess-bdd4")["title"] == "Имя при сбое TG"
+    assert any("Failed to sync WebUI rename to Telegram topic" in r.message for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_bdd5_patch_session_echo_guard_prevents_loop(tmp_path, monkeypatch, caplog):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    db = _make_db(tmp_path)
+    db.create_session("sess-bdd5", source="telegram")
+    db.bind_telegram_topic(
+        chat_id=str(USER_ID),
+        thread_id="401487",
+        user_id=str(USER_ID),
+        session_key=f"tg:{USER_ID}:401487",
+        session_id="sess-bdd5",
+        profile_name="default",
+    )
+    tg_adapter = _make_adapter(db)
+    tg_adapter._bot = SimpleNamespace(id=BOT_ID, username="hermes_test_bot", edit_forum_topic=AsyncMock())
+
+    app = _build_api_test_app(monkeypatch, tmp_path, db, tg_adapter)
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.patch("/api/sessions/sess-bdd5", json={"title": "Синхронизированное имя"})
+        assert resp.status == 200
+
+    tg_adapter._bot.edit_forum_topic.assert_awaited_once_with(
+        chat_id=USER_ID, message_thread_id=401487, name="Синхронизированное имя"
+    )
+    assert (str(USER_ID), "401487", "Синхронизированное имя") in tg_adapter._recent_bot_topic_renames
+
+    set_title_spy = MagicMock(wraps=db.set_session_title)
+    monkeypatch.setattr(db, "set_session_title", set_title_spy)
+    with caplog.at_level(logging.INFO):
+        await tg_adapter._handle_forum_topic_edited(
+            _edited_update("Синхронизированное имя", chat_id=USER_ID, thread_id=401487, user_id=None),
+            None,
+        )
+    set_title_spy.assert_not_called()
+    assert any("reason=bot_rename_echo" in r.message for r in caplog.records if r.levelno == logging.INFO)
+
+
+@pytest.mark.asyncio
+async def test_bdd6_patch_unbound_or_empty_title_skips_telegram_rename(tmp_path, monkeypatch):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    db = _make_db(tmp_path)
+    db.create_session("sess-bdd6-unbound", source="webui")
+    db.create_session("sess-bdd6-bound", source="telegram")
+    db.set_session_title("sess-bdd6-bound", "Было имя")
+    db.bind_telegram_topic(
+        chat_id="139351986",
+        thread_id="401488",
+        user_id=str(USER_ID),
+        session_key="tg:139351986:401488",
+        session_id="sess-bdd6-bound",
+        profile_name="default",
+    )
+    tg_adapter = _make_adapter(db)
+    tg_adapter.rename_dm_topic = AsyncMock()
+
+    app = _build_api_test_app(monkeypatch, tmp_path, db, tg_adapter)
+    async with TestClient(TestServer(app)) as cli:
+        r1 = await cli.patch("/api/sessions/sess-bdd6-unbound", json={"title": "Локальное имя"})
+        assert r1.status == 200
+        r2 = await cli.patch("/api/sessions/sess-bdd6-bound", json={"title": ""})
+        assert r2.status == 200
+
+    tg_adapter.rename_dm_topic.assert_not_called()
+

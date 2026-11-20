@@ -21,6 +21,7 @@ from gateway.platforms.base import _prefix_within_utf16_limit, utf16_len
 from gateway.platforms.event import MessageEvent
 from gateway.session import SessionSource
 from gateway.session_identity import replace_source
+from hermes_state_titles import is_default_topic_title
 from utils import is_truthy_value
 
 if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
@@ -226,9 +227,18 @@ class GatewayTopicThreadsMixin:
 
     @staticmethod
     def _apply_created_topic_title(session_db, session_id: str, title: str, thread_id: str) -> None:
-        """Persist a user-chosen topic creation name with deterministic conflict fallback."""
+        """Persist a topic creation name; default placeholders use 'derived' so LLM auto-title can upgrade them."""
+        use_derived = is_default_topic_title(title) and callable(getattr(session_db, "set_auto_title", None))
+        derived_source = getattr(session_db, "TITLE_SOURCE_DERIVED", "derived")
+
+        def _persist(candidate: str) -> None:
+            if use_derived:
+                session_db.set_auto_title(session_id, candidate, source=derived_source)
+            else:
+                session_db.set_session_title(session_id, candidate)
+
         try:
-            session_db.set_session_title(session_id, title)
+            _persist(title)
             return
         except ValueError as exc:
             if "canonical Bot Chat" in str(exc):
@@ -240,7 +250,7 @@ class GatewayTopicThreadsMixin:
             base = title[:max_base].rstrip()
             fallback = f"{base}{suffix}" if base else f"#{thread_id}"[:max_len]
             try:
-                session_db.set_session_title(session_id, fallback)
+                _persist(fallback)
             except ValueError as fallback_exc:
                 logger.warning(
                     "Failed to set created topic title for session %s (thread=%s): %s",

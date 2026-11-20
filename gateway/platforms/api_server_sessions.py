@@ -618,6 +618,7 @@ class _SessionsMixin:
         db = await self._ensure_session_db_async()
         if db is None:
             return self._session_db_unavailable()
+        prev_title = session.get("title")
         if "title" in body:
             try:
                 await _api_mod().asyncio.to_thread(
@@ -635,6 +636,12 @@ class _SessionsMixin:
         if body.get("end_reason"):
             await _api_mod().asyncio.to_thread(db.end_session, session_id, str(body["end_reason"]))
         session = await _api_mod().asyncio.to_thread(db.get_session, session_id) or session
+        if "title" in body:
+            updated_title = str(session.get("title") or "").strip()
+            if updated_title and updated_title != prev_title:
+                sync_fn = getattr(self, "_sync_telegram_topic_title", None)
+                if callable(sync_fn):
+                    await sync_fn(session_id, updated_title)
         last_msg = await self._last_message_for_session(str(session.get("id") or session_id))
         return web.json_response({"object": "hermes.session", "session": self._session_response(session, last_msg=last_msg)})
 

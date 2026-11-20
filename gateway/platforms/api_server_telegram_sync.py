@@ -705,6 +705,66 @@ class _TelegramSyncMixin:
             _api_mod().logger.debug("Telegram gateway lookup failed", exc_info=True)
             return None, None
 
+    async def _sync_telegram_topic_title(self, session_id: str, title: str) -> None:
+        """Best-effort sync of a manual WebUI session rename to its bound Telegram DM topic."""
+        clean_title = str(title or "").strip()
+        if not clean_title:
+            return
+        db = await self._ensure_session_db_async()
+        if db is None:
+            return
+        get_binding = getattr(db, "get_telegram_topic_binding_by_session", None)
+        if not callable(get_binding):
+            return
+        try:
+            apply_migration = getattr(db, "apply_telegram_topic_migration", None)
+            if callable(apply_migration):
+                await _api_mod().asyncio.to_thread(apply_migration)
+            binding = await _api_mod().asyncio.to_thread(get_binding, session_id=session_id)
+        except Exception:
+            _api_mod().logger.debug("Telegram topic binding lookup failed for session %s", session_id, exc_info=True)
+            return
+        if not isinstance(binding, dict):
+            return
+        chat_id = str(binding.get("chat_id") or "").strip()
+        thread_id = str(binding.get("thread_id") or "").strip()
+        if not chat_id or not thread_id or thread_id == "1":
+            return
+        _, telegram = self._telegram_runner_and_adapter()
+        if telegram is None:
+            return
+        sanitize_fn = getattr(telegram, "_sanitize_topic_title_for_db", None)
+        sanitized = sanitize_fn(clean_title) if callable(sanitize_fn) else clean_title
+        topic_name = sanitized if isinstance(sanitized, str) else clean_title
+        if not topic_name:
+            return
+        try:
+            rename_fn = getattr(telegram, "rename_dm_topic", None)
+            if callable(rename_fn):
+                await rename_fn(chat_id=chat_id, thread_id=thread_id, name=topic_name)
+                return
+            bot = getattr(telegram, "_bot", None)
+            edit_forum_topic = getattr(bot, "edit_forum_topic", None) or getattr(bot, "editForumTopic", None)
+            if not callable(edit_forum_topic):
+                return
+            try:
+                chat_id_arg: Any = int(chat_id)
+            except (TypeError, ValueError):
+                chat_id_arg = chat_id
+            try:
+                thread_id_arg: Any = int(thread_id)
+            except (TypeError, ValueError):
+                thread_id_arg = thread_id
+            await edit_forum_topic(chat_id=chat_id_arg, message_thread_id=thread_id_arg, name=topic_name)
+            record_echo = getattr(telegram, "_record_bot_topic_rename", None)
+            if callable(record_echo):
+                record_echo(chat_id, thread_id, topic_name)
+        except Exception as exc:
+            _api_mod().logger.warning(
+                "Failed to sync WebUI rename to Telegram topic (session=%s, chat_id=%s, thread_id=%s): %s",
+                session_id, chat_id, thread_id, exc,
+            )
+
     @staticmethod
     def _telegram_topic_link(chat_id: str, thread_id: str) -> Optional[str]:
         """Return Telegram's stable forum-topic URL when the chat id permits it."""

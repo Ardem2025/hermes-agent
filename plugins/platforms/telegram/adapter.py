@@ -36,6 +36,7 @@ from gateway.platforms._shared import (
 )
 from gateway.platforms.helpers import (
     TABLE_SEPARATOR_RE as _TABLE_SEPARATOR_RE, compile_mention_patterns, strip_markdown)
+from hermes_state_titles import is_default_topic_title
 
 
 def _redact_telegram_error_text(error: object, proxy_url: str | None = None) -> str:
@@ -6701,10 +6702,31 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
             cleaned = cleaned[:max_len].rstrip()
         return cleaned or None
 
-    def _apply_topic_title_to_session(self, db: Any, session_id: str, title: str, thread_id: str) -> None:
-        """Persist a user-chosen topic title with deterministic conflict fallback."""
+    def _apply_topic_title_to_session(
+        self,
+        db: Any,
+        session_id: str,
+        title: str,
+        thread_id: str,
+        *,
+        allow_auto_placeholder: bool = False,
+    ) -> None:
+        """Persist a topic title with deterministic conflict fallback."""
+        use_derived = (
+            allow_auto_placeholder
+            and is_default_topic_title(title)
+            and callable(getattr(db, "set_auto_title", None))
+        )
+        derived_source = getattr(db, "TITLE_SOURCE_DERIVED", "derived")
+
+        def _persist(candidate: str) -> None:
+            if use_derived:
+                db.set_auto_title(session_id, candidate, source=derived_source)
+            else:
+                db.set_session_title(session_id, candidate)
+
         try:
-            db.set_session_title(session_id, title)
+            _persist(title)
             return
         except ValueError as exc:
             if "canonical Bot Chat" in str(exc):
@@ -6719,7 +6741,7 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
             base = title[:max_base].rstrip()
             fallback = f"{base}{suffix}" if base else f"#{thread_id}"[:max_len]
             try:
-                db.set_session_title(session_id, fallback)
+                _persist(fallback)
             except ValueError as fallback_exc:
                 logger.warning(
                     "[%s] Failed to set topic title for session %s (thread=%s): %s",

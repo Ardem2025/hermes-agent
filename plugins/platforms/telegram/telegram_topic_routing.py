@@ -87,7 +87,9 @@ class TelegramTopicRoutingMixin:
                 except Exception:
                     session_row = None
                 if session_row is None or session_row.get("title") is None or session_row.get("title_source") != "user":
-                    self._apply_topic_title_to_session(db, session_id, created_name, thread_id_str)
+                    self._apply_topic_title_to_session(
+                        db, session_id, created_name, thread_id_str, allow_auto_placeholder=True,
+                    )
                 return
         self._store_created_topic_name(chat_id_str, thread_id_str, created_name)
 

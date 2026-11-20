@@ -31,6 +31,35 @@ logger = logging.getLogger("hermes_state")
 _TITLE_CONTROL_RE = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]')
 _TITLE_INVISIBLE_RE = re.compile(r'[\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufeff\ufffc\ufff9-\ufffb]')
 _NUMBERED_TITLE_RE = re.compile(r'^(.*?) #(\d+)$')
+_DEFAULT_TOPIC_TITLE_SUFFIX_RE = re.compile(r'\s*\(#\d+\)$')
+_DEFAULT_TOPIC_TITLES = frozenset({
+    "",
+    "new chat",
+    "new topic",
+    "новый чат",
+    "новая тема",
+    "hermes chat",
+    "чат hermes",
+})
+
+
+def is_default_topic_title(title: Optional[str]) -> bool:
+    """Return True when *title* is a generic/default Telegram topic placeholder."""
+    if title is None:
+        return True
+    normalized = _DEFAULT_TOPIC_TITLE_SUFFIX_RE.sub("", str(title).strip()).strip().casefold()
+    if normalized in _DEFAULT_TOPIC_TITLES:
+        return True
+    try:
+        from agent.i18n import t
+        localized = t("gateway.topic.default_title")
+        if isinstance(localized, str):
+            loc_norm = _DEFAULT_TOPIC_TITLE_SUFFIX_RE.sub("", localized.strip()).strip().casefold()
+            if loc_norm and loc_norm != "gateway.topic.default_title" and normalized == loc_norm:
+                return True
+    except Exception:
+        pass
+    return False
 
 
 def next_title_in_lineage(conn, base_title: str) -> str:
