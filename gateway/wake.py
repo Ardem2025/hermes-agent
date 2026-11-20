@@ -166,7 +166,8 @@ def is_session_turn_busy(session_id: str, adapter: Optional[Any] = None) -> bool
 
 
 async def deliver_wake(adapter: Any, *, text: str, session_id: str = "", source: Any = None,
-                       notification_category: str = "result", profile: Optional[str] = None) -> None:
+                       notification_category: str = "result", profile: Optional[str] = None,
+                       delegation_id: str = "", delivery_notice: str = "") -> None:
     """Deliver a wake turn to the session behind ``adapter``. ``session_id`` is the RAW session id
     (``X-Hermes-Session-Id`` / state.db key) — required for non-push adapters. ``source`` is the
     ``SessionSource`` for the synthetic event — required for push-capable adapters. ``profile``
@@ -202,6 +203,10 @@ async def deliver_wake(adapter: Any, *, text: str, session_id: str = "", source:
         extra["profile"] = profile
     if notification_category == "diagnostic":
         extra["notification_category"] = notification_category
+    if delegation_id:
+        extra["delegation_id"] = delegation_id
+    if delivery_notice:
+        extra["delivery_notice"] = delivery_notice
     await _self_post_chat_completion(adapter, text=text, session_id=session_id, **extra)
 
 
@@ -274,7 +279,9 @@ async def persist_delegation_delivery(adapter: Any, *, text: str, session_id: st
 
 async def _self_post_chat_completion(adapter: Any, *, text: str, session_id: str,
                                       notification_category: str = "result",
-                                      profile: Optional[str] = None) -> None:
+                                      profile: Optional[str] = None,
+                                      delegation_id: str = "",
+                                      delivery_notice: str = "") -> None:
     """POST the wake text to the in-pod API server as a normal session turn, using the adapter's
     own bind host/port/key. Session continuation via ``X-Hermes-Session-Id`` is 403-gated on
     ``API_SERVER_KEY``, so a missing key is a hard error rather than a wake in a fresh session
@@ -293,8 +300,13 @@ async def _self_post_chat_completion(adapter: Any, *, text: str, session_id: str
             raise RuntimeError(
                 f"wake self-post for served profile {profile!r} requires in-process session "
                 "delivery; refusing to self-post as the default profile")
+        in_process_kwargs: dict[str, Any] = {}
+        if delegation_id:
+            in_process_kwargs["delegation_id"] = delegation_id
+        if delivery_notice:
+            in_process_kwargs["delivery_notice"] = delivery_notice
         await in_process(session_id=session_id, text=text, profile=str(profile),
-                         notification_category=notification_category)
+                         notification_category=notification_category, **in_process_kwargs)
         sync_tg = getattr(adapter, "_sync_telegram_history", None)
         if callable(sync_tg):
             try:
@@ -316,6 +328,10 @@ async def _self_post_chat_completion(adapter: Any, *, text: str, session_id: str
         host = f"[{host}]"  # bare IPv6 literal
     url = f"http://{host}:{port}/v1/chat/completions"
     headers = {"Authorization": f"Bearer {api_key}", "X-Hermes-Session-Id": session_id}
+    if delegation_id:
+        headers["X-Hermes-Wake-Delegation-Id"] = delegation_id
+        if delivery_notice:
+            headers["X-Hermes-Wake-Delivery-Notice"] = delivery_notice
     payload = {"model": str(getattr(adapter, "_model_name", "") or "hermes-agent"),
                "messages": [{"role": "user", "content": text}], "stream": False}
     if notification_category == "diagnostic":

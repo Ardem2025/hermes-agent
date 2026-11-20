@@ -464,6 +464,24 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin, 
 
         return self._execute_write(_do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S)
 
+    def has_delegation_delivery(self, session_id: str, delegation_id: str, delivery_notice: str = "") -> bool:
+        """Return True if *session_id* (or its compression lineage) already holds a persisted
+        delegation delivery row for *(delegation_id, delivery_notice)*."""
+        if not session_id or not delegation_id:
+            return False
+        row = self._read_one(
+            """WITH RECURSIVE lineage(id) AS (
+                SELECT ? UNION
+                SELECT s.parent_session_id FROM sessions s JOIN lineage l ON s.id = l.id
+                JOIN sessions p ON p.id = s.parent_session_id WHERE p.end_reason = 'compression'
+            ) SELECT 1 FROM messages m JOIN lineage l ON m.session_id = l.id
+            WHERE m.display_kind IN ('async_delegation_complete', 'hidden')
+            AND json_extract(m.display_metadata, '$.delegation_id') = ?
+            AND coalesce(json_extract(m.display_metadata, '$.delivery_notice'), '') = ? LIMIT 1""",
+            (session_id, delegation_id, delivery_notice or ""),
+        )
+        return row is not None
+
     def append_messages_batch(
         self, session_id: str, messages: list[dict[str, Any]], compression_lock_holder: Optional[str] = None,
         turn_lease_holder: Optional[str] = None, chunk_rows: Optional[int] = None,

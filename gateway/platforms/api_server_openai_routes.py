@@ -899,6 +899,8 @@ class OpenAICompatRoutesMixin:
         # X-Hermes-Session-Id continues an existing session (history from state.db, not the body);
         # requires a configured API key or any client could read history by guessing ids.
         provided_session_id = request.headers.get("X-Hermes-Session-Id", "").strip()
+        verified_wake_delegation_id = ""
+        verified_wake_delivery_notice = ""
         if provided_session_id:
             if not self._api_key:
                 logger.warning(
@@ -914,6 +916,8 @@ class OpenAICompatRoutesMixin:
             if len(provided_session_id) > self._MAX_SESSION_HEADER_LEN:
                 return _invalid_request("Session ID too long")
             session_id = provided_session_id
+            wake_delegation_id = request.headers.get("X-Hermes-Wake-Delegation-Id", "").strip()
+            wake_delivery_notice = request.headers.get("X-Hermes-Wake-Delivery-Notice", "").strip()
             try:
                 db = await self._ensure_session_db_async()
                 if db is not None:
@@ -925,6 +929,11 @@ class OpenAICompatRoutesMixin:
                     from gateway.platforms.api_server_runs import _resolve_live_session_id
                     session_id = await _resolve_live_session_id(self, provided_session_id)
                     history = await asyncio.to_thread(db.get_messages_as_conversation, session_id)
+                    if wake_delegation_id and await asyncio.to_thread(
+                        db.has_delegation_delivery, session_id, wake_delegation_id, wake_delivery_notice
+                    ):
+                        verified_wake_delegation_id = wake_delegation_id
+                        verified_wake_delivery_notice = wake_delivery_notice
             except Exception as e:
                 logger.warning("Failed to load session history for %s: %s", session_id, e)
                 history = []
@@ -963,6 +972,10 @@ class OpenAICompatRoutesMixin:
         # above still applies; it grants no internal ingress or control authority.
         if provided_session_id and body.get("hermes_notification_category") == "diagnostic":
             run_kwargs["notification_category"] = "diagnostic"
+        if verified_wake_delegation_id:
+            run_kwargs["wake_delegation_id"] = verified_wake_delegation_id
+            if verified_wake_delivery_notice:
+                run_kwargs["wake_delivery_notice"] = verified_wake_delivery_notice
         if stream:
             _stream_q = ThreadSafeAsyncQueue()
             # tool_call_ids with an emitted "running": a "completed" without one (internal/

@@ -641,7 +641,9 @@ async def _resolve_live_session_id(self, session_id: str) -> str:
 
 
 async def run_internal_session_turn(self, *, session_id: str, text: str, profile: str,
-                                notification_category: str = "result", _api_server) -> None:
+                                notification_category: str = "result",
+                                delegation_id: str = "", delivery_notice: str = "",
+                                _api_server) -> None:
     """Run one background wake turn against a raw session id IN-PROCESS (no HTTP, no API key).
 
     The HTTP wake self-post cannot serve a multiplexed *served* profile: ``/p/<profile>/`` on
@@ -698,6 +700,14 @@ async def run_internal_session_turn(self, *, session_id: str, text: str, profile
             if err is not None:
                 raise RuntimeError(f"internal wake route conflict for session {resolved!r}")
             run_agent_kwargs: dict[str, Any] = {}
+            if delegation_id:
+                db = await self._ensure_session_db_async()
+                if db is not None and await asyncio.to_thread(
+                    db.has_delegation_delivery, resolved, delegation_id, delivery_notice
+                ):
+                    run_agent_kwargs["wake_delegation_id"] = delegation_id
+                    if delivery_notice:
+                        run_agent_kwargs["wake_delivery_notice"] = delivery_notice
             if (
                 getattr(getattr(self, "gateway_runner", None), "session_authority", None) is None
                 and callable(getattr(self, "is_telegram_bound", None))

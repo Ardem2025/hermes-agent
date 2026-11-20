@@ -3741,12 +3741,16 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             return []
 
     async def run_internal_session_turn(self, *, session_id: str, text: str, profile: str,
-                                        notification_category: str = "result") -> None:
+                                        notification_category: str = "result",
+                                        delegation_id: str = "",
+                                        delivery_notice: str = "") -> None:
         """Run one background wake turn against a raw session id IN-PROCESS (no HTTP, no API key);
         see ``api_server_runs.run_internal_session_turn``."""
         await _api_runs.run_internal_session_turn(
             self, session_id=session_id, text=text, profile=profile,
-            notification_category=notification_category, _api_server=sys.modules[__name__])
+            notification_category=notification_category,
+            delegation_id=delegation_id, delivery_notice=delivery_notice,
+            _api_server=sys.modules[__name__])
 
     @_require_auth
     async def _handle_list_sessions(self, request: web.Request) -> web.Response:
@@ -5525,7 +5529,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         session_history_delivery: str = "", auto_resume_on_delegation: bool = False,
         turn_author: Optional[dict[str, Any]] = None,
         relay_metadata: Optional[dict[str, Any]] = None, notification_category: str = "result",
-        resume_unanswered_turn: bool = False, approval_notify_callback=None,
+        resume_unanswered_turn: bool = False, wake_delegation_id: str = "",
+        wake_delivery_notice: str = "", approval_notify_callback=None,
         approval_session_key: Optional[str] = None, walked_from: Optional[str] = None) -> tuple:
         """Create an agent and run one turn in a thread executor -> ``(result, usage)``.
         ``approval_notify_callback`` (with ``approval_session_key``) routes dangerous-command
@@ -5557,7 +5562,9 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 bind_declared_conversation=bind_declared_conversation, request_id=request_id, run_owner_scope=run_owner_scope,
                 history_from_session=history_from_session, session_history_delivery=session_history_delivery,
                 auto_resume_on_delegation=auto_resume_on_delegation,
-                turn_author=turn_author, resume_unanswered_turn=resume_unanswered_turn, relay_metadata=relay_metadata,
+                turn_author=turn_author, resume_unanswered_turn=resume_unanswered_turn,
+                wake_delegation_id=wake_delegation_id, wake_delivery_notice=wake_delivery_notice,
+                relay_metadata=relay_metadata,
                 approval_notify_callback=approval_notify_callback, approval_session_key=approval_session_key)
         loop = asyncio.get_running_loop()
         # ContextVars do not follow run_in_executor threads: capture here, re-enter in _run().
@@ -5587,6 +5594,17 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                         session_model=session_model, confirmed_runtime_lock=confirmed_runtime_lock)
                     if agent_ref is not None:
                         agent_ref[0] = agent
+                    if wake_delegation_id:
+                        from agent.session_persistence import adopt_delegation_delivery_turn
+
+                        conversation_history = list(conversation_history)
+                        adopt_delegation_delivery_turn(
+                            conversation_history,
+                            wake_delegation_id,
+                            wake_delivery_notice,
+                            user_message,
+                            agent,
+                        )
                     if resume_unanswered_turn:
                         # A dispatcher's re-run of a failed delivery turn: the DM's own row is already
                         # in the store (the failed attempt persisted it at turn start), so continue THAT

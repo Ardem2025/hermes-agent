@@ -187,6 +187,45 @@ def adopt_unanswered_turn(history: list[dict[str, Any]], query: Any, agent: Any)
     return True
 
 
+def adopt_delegation_delivery_turn(
+    history: list[dict[str, Any]],
+    delegation_id: str,
+    delivery_notice: str,
+    query: Any,
+    agent: Any,
+) -> bool:
+    """Adopt an already-persisted ``async_delegation_complete`` (or ``hidden``) delivery row
+    from *history* as THIS wake turn's user message so neither SessionDB nor the LLM prompt
+    receives a duplicate ``[ASYNC DELEGATION BATCH COMPLETE]`` block."""
+    if not delegation_id or not isinstance(history, list):
+        return False
+    expected_notice = delivery_notice or ""
+    idx = None
+    for i in range(len(history) - 1, -1, -1):
+        row = history[i]
+        if not isinstance(row, dict) or row.get("role") != "user":
+            continue
+        if row.get("display_kind") not in ("async_delegation_complete", "hidden"):
+            continue
+        meta = row.get("display_metadata")
+        if not isinstance(meta, dict):
+            continue
+        if str(meta.get("delegation_id") or "") != delegation_id:
+            continue
+        if str(meta.get("delivery_notice") or "") != expected_notice:
+            continue
+        idx = i
+        break
+    if idx is None:
+        return False
+    row = history.pop(idx)
+    row[_DB_PERSISTED_MARKER] = True
+    row.pop("api_content", None)
+    row["content"] = query
+    agent._pending_cli_user_message = row
+    return True
+
+
 # --- flush phases (module-level so the flush also works bound onto duck-typed agents) ---
 
 def _db_flush_seed_ids(agent) -> set:

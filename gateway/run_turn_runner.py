@@ -852,6 +852,16 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
         if api is not None and api['history'] is not None:
             from gateway.run import _collect_history_media_paths
             history = api['history']
+            if api.get('wake_delegation_id'):
+                from agent.session_persistence import adopt_delegation_delivery_turn
+                history = list(history)
+                adopt_delegation_delivery_turn(
+                    history,
+                    api['wake_delegation_id'],
+                    api.get('wake_delivery_notice') or '',
+                    api['content'],
+                    agent,
+                )
             tail = history[-1] if history else None
             if api.get('resume_unanswered') and isinstance(tail, dict) and tail.get('role') == 'user':
                 # The door's re-run continues the row its failed attempt persisted (#115325). Only a
@@ -860,12 +870,23 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
                 history = list(history)
                 adopt_unanswered_turn(history, api['content'], agent)
             return history, None, _collect_history_media_paths(history)
+        raw_history = ctx.history
+        if api is not None and api.get('wake_delegation_id') and raw_history:
+            from agent.session_persistence import adopt_delegation_delivery_turn
+            raw_history = list(raw_history)
+            adopt_delegation_delivery_turn(
+                raw_history,
+                api['wake_delegation_id'],
+                api.get('wake_delivery_notice') or '',
+                api['content'],
+                agent,
+            )
         # Transcript rows ({role, content, timestamp}) lose timestamps; interrupt-path agent messages
         # (tool_calls/tool_call_id/reasoning) pass through intact so the API sees valid assistant→tool
         # sequences. Telegram observed=True rows are withheld from replayable history and attached to
         # the current addressed message as API-only context.
         agent_history, observed_group_context = _build_gateway_agent_history(
-            ctx.history, channel_prompt=ctx.channel_prompt, inject_timestamps=_message_timestamps_enabled(ctx.user_config),
+            raw_history, channel_prompt=ctx.channel_prompt, inject_timestamps=_message_timestamps_enabled(ctx.user_config),
         )
         # FTS write-corruption guard: if persistence failed silently the reloaded transcript is stale
         # while the SAME cached agent still holds the live conversation (same-session amnesia). Only

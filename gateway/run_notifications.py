@@ -852,6 +852,10 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         if evt.get("type") == "async_delegation":
             info = "Async delegation completion — persisting delivery row for api_server session %s"
             fail = "Async delegation delivery persist failed for session %s: %s"
+            from gateway.wake import _delegation_display_metadata
+            _meta = _delegation_display_metadata(evt)
+            _delegation_id = str(_meta.get("delegation_id") or "")
+            _delivery_notice = str(_meta.get("delivery_notice") or "")
             async def _deliver_delegation():
                 await persist_delegation_delivery(adapter, text=synth_text, session_id=raw_sid, evt=evt)
                 if check_coordinator_wake_eligibility(raw_sid, adapter, evt):
@@ -859,7 +863,17 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                     increment_consecutive_auto_wakes(raw_sid)
                     async def _background_wake():
                         try:
-                            await deliver_wake(adapter, text=_mark_internal_notification(synth_text), session_id=raw_sid)
+                            wake_kwargs = {}
+                            if _delegation_id:
+                                wake_kwargs["delegation_id"] = _delegation_id
+                            if _delivery_notice:
+                                wake_kwargs["delivery_notice"] = _delivery_notice
+                            await deliver_wake(
+                                adapter,
+                                text=_mark_internal_notification(synth_text),
+                                session_id=raw_sid,
+                                **wake_kwargs,
+                            )
                         except Exception as w_exc:
                             logger.warning("Decoupled coordinator wake failed for session %s: %s", raw_sid, w_exc)
                     asyncio.create_task(_background_wake())
