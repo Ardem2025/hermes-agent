@@ -335,27 +335,24 @@ class SubagentPulseTicker:
         """Render text card according to BDD specifications and active language."""
         now = time.time()
         elapsed = now - self.started_at
-        time_str = self._format_time(elapsed)
-        interim_time_str = self._format_time(elapsed, quantize_secs=30)
         is_ru = _is_ru_language()
 
         if cancelled:
             if is_ru:
-                return f"⏹️ [{time_str}] 🔀 Выполнение отменено пользователем"
-            return f"⏹️ [{time_str}] 🔀 Execution cancelled by user"
+                return "⏹️ 🔀 Выполнение отменено пользователем"
+            return "⏹️ 🔀 Execution cancelled by user"
 
         # Check global timeout
         if elapsed >= 900:
             if is_ru:
-                return "⏱️ [15:00] 🔀 Превышен таймаут выполнения (900s)"
-            return "⏱️ [15:00] 🔀 Execution timeout exceeded (900s)"
+                return "⏱️ 🔀 Превышен таймаут выполнения (900s)"
+            return "⏱️ 🔀 Execution timeout exceeded (900s)"
 
         total_tasks = len(self.tasks)
         if total_tasks == 0:
-            prep_time = time_str if final_status else interim_time_str
             if is_ru:
-                return f"⏳ [{prep_time}] 🔀 Субагент: подготовка..."
-            return f"⏳ [{prep_time}] 🔀 Subagent: preparing..."
+                return "⏳ 🔀 Субагент: подготовка..."
+            return "⏳ 🔀 Subagent: preparing..."
 
         active_tasks = [t for t in self.tasks.values() if t.get("status") == "running"]
         active_count = len(active_tasks)
@@ -375,11 +372,11 @@ class SubagentPulseTicker:
                 summary_snippet = f": {summary[:60]}" if summary else ""
                 if st == "completed":
                     if is_ru:
-                        return f"✅ [{time_str}] 🔀 Субагент 1/1 завершен{summary_snippet}"
-                    return f"✅ [{time_str}] 🔀 Subagent 1/1 completed{summary_snippet}"
+                        return f"✅ 🔀 Субагент 1/1 завершен{summary_snippet}"
+                    return f"✅ 🔀 Subagent 1/1 completed{summary_snippet}"
                 if is_ru:
-                    return f"❌ [{time_str}] 🔀 Субагент 1/1 ошибка ({st}){summary_snippet}"
-                return f"❌ [{time_str}] 🔀 Subagent 1/1 error ({st}){summary_snippet}"
+                    return f"❌ 🔀 Субагент 1/1 ошибка ({st}){summary_snippet}"
+                return f"❌ 🔀 Subagent 1/1 error ({st}){summary_snippet}"
 
             # Running
             action = task.get("last_action") or ""
@@ -389,23 +386,23 @@ class SubagentPulseTicker:
             goal_short = goal[:45] if goal else default_goal
             newline = '\n'
             label = "Субагент 1/1" if is_ru else "Subagent 1/1"
-            return f"⏳ [{interim_time_str}] 🔀 {label}: {goal_short}{newline}↳ {action}"
+            return f"⏳ 🔀 {label}: {goal_short}{newline}↳ {action}"
 
         # Batch mode (N > 1)
         if effective_final_status == "completed" or (active_count == 0 and not effective_final_status):
             if is_ru:
-                return f"✅ [{time_str}] 🔀 Все субагенты ({total_tasks}) завершены"
-            return f"✅ [{time_str}] 🔀 All subagents ({total_tasks}) completed"
+                return f"✅ 🔀 Все субагенты ({total_tasks}) завершены"
+            return f"✅ 🔀 All subagents ({total_tasks}) completed"
 
         if effective_final_status and effective_final_status != "completed":
             if is_ru:
-                return f"❌ [{time_str}] 🔀 Субагенты остановлены ({effective_final_status})"
-            return f"❌ [{time_str}] 🔀 Subagents stopped ({effective_final_status})"
+                return f"❌ 🔀 Субагенты остановлены ({effective_final_status})"
+            return f"❌ 🔀 Subagents stopped ({effective_final_status})"
 
         header = (
-            f"⏳ [{interim_time_str}] 🔀 Субагенты ({active_count} активны):"
+            f"⏳ 🔀 Субагенты ({active_count} активны):"
             if is_ru
-            else f"⏳ [{interim_time_str}] 🔀 Subagents ({active_count} active):"
+            else f"⏳ 🔀 Subagents ({active_count} active):"
         )
         lines = [header]
         ordered_tasks = sorted(
@@ -414,18 +411,17 @@ class SubagentPulseTicker:
         )
         for display_idx, (_, task) in enumerate(ordered_tasks, start=1):
             task_status = task.get("status", "running")
-            task_elapsed = self._format_time(now - task.get("started_at", self.started_at), quantize_secs=30)
             if task_status == "completed":
                 done_txt = "✅ Завершен" if is_ru else "✅ Completed"
-                lines.append(f" • #{display_idx} [{task_elapsed}] {done_txt}")
+                lines.append(f" • #{display_idx} {done_txt}")
             elif task_status in ("failed", "error", "timeout", "cancelled"):
                 err_txt = "❌ Ошибка" if is_ru else "❌ Error"
-                lines.append(f" • #{display_idx} [{task_elapsed}] {err_txt}")
+                lines.append(f" • #{display_idx} {err_txt}")
             else:
                 action = task.get("last_action") or ""
                 if task.get("path"):
                     action = self.safe_read_transcript(task.get("path"))
-                lines.append(f" • #{display_idx} [{task_elapsed}] {action}")
+                lines.append(f" • #{display_idx} {action}")
 
         return "\n".join(lines)
 

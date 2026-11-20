@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import queue
+import re
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -345,7 +346,8 @@ def test_pulse_ticker_interval_defaults_and_minimum():
 
 @pytest.mark.asyncio
 async def test_pulse_ticker_interim_timer_quantization_and_terminal_exact_time():
-    """BDD 2: Interim cards quantize time to 30s steps (avoiding redundant edits); terminal cards show exact MM:SS."""
+    """BDD 1-4: _format_time helper remains intact while _render_card omits [MM:SS] and avoids redundant edits."""
+    timer_re = re.compile(r"\[\d{2}:\d{2}\]")
     adapter = _make_adapter("msg-q")
     ticker = SubagentPulseTicker(adapter=adapter, chat_id="12345")
     assert ticker._format_time(45, quantize_secs=30) == "00:30"
@@ -363,31 +365,139 @@ async def test_pulse_ticker_interim_timer_quantization_and_terminal_exact_time()
         with patch("gateway.subagent_pulse_ticker.time.time", return_value=1025.0):
             card_25 = ticker._render_card()
             await ticker._send_or_edit(card_25, finalize=False)
+        with patch("gateway.subagent_pulse_ticker.time.time", return_value=1065.0):
+            card_65 = ticker._render_card()
+            await ticker._send_or_edit(card_65, finalize=False)
 
-        assert "[00:00]" in card_10
-        assert card_10 == card_25
+        assert not timer_re.search(card_10)
+        assert card_10.startswith("⏳ 🔀 Субагент 1/1: Task A")
+        assert card_10 == card_25 == card_65
         assert adapter.send.await_count == 1
         assert adapter.edit_message.await_count == 0
 
-        with patch("gateway.subagent_pulse_ticker.time.time", return_value=1045.0):
-            card_45 = ticker._render_card()
-            assert "[00:30]" in card_45
-
-        # Batch mode interim quantization vs terminal exact time
+        # Batch mode interim & terminal cards omit [MM:SS]
         ticker.on_subagent_start(1, "Task B")
         ticker.tasks[1]["started_at"] = 1000.0
-        with patch("gateway.subagent_pulse_ticker.time.time", return_value=1045.0):
+        with patch("gateway.subagent_pulse_ticker.time.time", return_value=1065.0):
             batch_interim = ticker._render_card()
-            assert "[00:30]" in batch_interim
-            assert "• #1 [00:30]" in batch_interim
+            assert not timer_re.search(batch_interim)
+            assert batch_interim.startswith("⏳ 🔀 Субагенты (2 активны):")
+            assert " • #1 " in batch_interim
+            assert " • #2 " in batch_interim
 
         ticker.on_subagent_complete(0, status="completed", summary="ok")
         ticker.on_subagent_complete(1, status="completed", summary="ok")
-        with patch("gateway.subagent_pulse_ticker.time.time", return_value=1047.0):
+        with patch("gateway.subagent_pulse_ticker.time.time", return_value=1067.0):
             batch_final = ticker._render_card(final_status="completed")
             cancelled_card = ticker._render_card(cancelled=True)
-            assert "[00:47]" in batch_final
-            assert "[00:47]" in cancelled_card
+            assert not timer_re.search(batch_final)
+            assert not timer_re.search(cancelled_card)
+            assert batch_final == "✅ 🔀 Все субагенты (2) завершены"
+            assert cancelled_card == "⏹️ 🔀 Выполнение отменено пользователем"
+
+
+@pytest.mark.asyncio
+async def test_pulse_ticker_hides_timer_across_all_states_ru_and_en():
+    """BDD 1-5: All _render_card states (RU/EN, batch error, single, prep, timeout, cancel) omit [MM:SS] and [15:00]."""
+    timer_re = re.compile(r"\[\d{2}:\d{2}\]")
+
+    for lang in ("ru", "en"):
+        with patch("agent.i18n.get_language", return_value=lang):
+            adapter = _make_adapter(f"msg-{lang}")
+            ticker = SubagentPulseTicker(adapter=adapter, chat_id="12345")
+            ticker.started_at = 1000.0
+
+            # BDD-2: Preparing (total_tasks == 0) at 45s
+            with patch("gateway.subagent_pulse_ticker.time.time", return_value=1045.0):
+                prep_card = ticker._render_card()
+                assert not timer_re.search(prep_card)
+                assert prep_card == ("⏳ 🔀 Субагент: подготовка..." if lang == "ru" else "⏳ 🔀 Subagent: preparing...")
+
+            # BDD-2 & BDD-3: Single subagent running, completed, error
+            ticker.on_subagent_start(0, "Audit logs")
+            ticker.tasks[0]["started_at"] = 1000.0
+            ticker.on_subagent_progress(0, "⚙️ Reading")
+            with patch("gateway.subagent_pulse_ticker.time.time", return_value=1045.0):
+                single_run = ticker._render_card()
+                assert not timer_re.search(single_run)
+                expected_prefix = "⏳ 🔀 Субагент 1/1: Audit logs" if lang == "ru" else "⏳ 🔀 Subagent 1/1: Audit logs"
+                assert single_run == f"{expected_prefix}\n↳ ⚙️ Reading"
+
+            ticker.on_subagent_complete(0, status="completed", summary="All good")
+            with patch("gateway.subagent_pulse_ticker.time.time", return_value=1050.0):
+                single_done = ticker._render_card(final_status="completed")
+                assert not timer_re.search(single_done)
+                assert single_done == (
+                    "✅ 🔀 Субагент 1/1 завершен: All good"
+                    if lang == "ru"
+                    else "✅ 🔀 Subagent 1/1 completed: All good"
+                )
+
+            ticker.on_subagent_complete(0, status="failed", summary="Boom")
+            with patch("gateway.subagent_pulse_ticker.time.time", return_value=1050.0):
+                single_err = ticker._render_card(final_status="failed")
+                assert not timer_re.search(single_err)
+                assert single_err == (
+                    "❌ 🔀 Субагент 1/1 ошибка (failed): Boom"
+                    if lang == "ru"
+                    else "❌ 🔀 Subagent 1/1 error (failed): Boom"
+                )
+
+            # BDD-1: Batch mode with running, error, and completed tasks at 65s
+            batch_ticker = SubagentPulseTicker(adapter=adapter, chat_id="12345")
+            batch_ticker.started_at = 1000.0
+            batch_ticker.on_subagent_start(0, "Task 1")
+            batch_ticker.on_subagent_start(1, "Task 2")
+            batch_ticker.on_subagent_start(2, "Task 3")
+            batch_ticker.on_subagent_progress(0, "⚙️ Обработка: | execute_code ok 0.1s")
+            batch_ticker.on_subagent_complete(1, status="error", summary="Failed step")
+            batch_ticker.on_subagent_complete(2, status="completed", summary="Done")
+
+            with patch("gateway.subagent_pulse_ticker.time.time", return_value=1065.0):
+                batch_card = batch_ticker._render_card()
+                assert not timer_re.search(batch_card)
+                lines = batch_card.splitlines()
+                assert lines[0] == ("⏳ 🔀 Субагенты (1 активны):" if lang == "ru" else "⏳ 🔀 Subagents (1 active):")
+                assert lines[1] == " • #1 ⚙️ Обработка: | execute_code ok 0.1s"
+                assert lines[2] == (" • #2 ❌ Ошибка" if lang == "ru" else " • #2 ❌ Error")
+                assert lines[3] == (" • #3 ✅ Завершен" if lang == "ru" else " • #3 ✅ Completed")
+
+                # Batch stopped/error terminal card
+                batch_stopped = batch_ticker._render_card(final_status="failed")
+                assert not timer_re.search(batch_stopped)
+                assert batch_stopped == (
+                    "❌ 🔀 Субагенты остановлены (failed)"
+                    if lang == "ru"
+                    else "❌ 🔀 Subagents stopped (failed)"
+                )
+
+                # Batch completed terminal card
+                batch_ticker.on_subagent_complete(0, status="completed", summary="Done 1")
+                batch_done = batch_ticker._render_card(final_status="completed")
+                assert not timer_re.search(batch_done)
+                assert batch_done == (
+                    "✅ 🔀 Все субагенты (3) завершены"
+                    if lang == "ru"
+                    else "✅ 🔀 All subagents (3) completed"
+                )
+
+            # BDD-3: Cancelled and Timeout (>= 900s)
+            with patch("gateway.subagent_pulse_ticker.time.time", return_value=1950.0):
+                timeout_card = batch_ticker._render_card()
+                cancelled_card = batch_ticker._render_card(cancelled=True)
+                assert not timer_re.search(timeout_card)
+                assert "[15:00]" not in timeout_card
+                assert timeout_card == (
+                    "⏱️ 🔀 Превышен таймаут выполнения (900s)"
+                    if lang == "ru"
+                    else "⏱️ 🔀 Execution timeout exceeded (900s)"
+                )
+                assert not timer_re.search(cancelled_card)
+                assert cancelled_card == (
+                    "⏹️ 🔀 Выполнение отменено пользователем"
+                    if lang == "ru"
+                    else "⏹️ 🔀 Execution cancelled by user"
+                )
 
 
 @pytest.mark.asyncio
