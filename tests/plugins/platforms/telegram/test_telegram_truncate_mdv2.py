@@ -259,9 +259,25 @@ def test_scenario_9_collision_and_empty_entity_prevention():
         for ch in c2:
             assert "||||" not in ch, f"Empty spoiler in {ch!r}"
 
-        # (c) _italic __underline___ collision
-        s3 = "_курсив слово1 слово2 __подчёркнутый текст__ конец_"
+        # (c) _italic __underline___ collision (long enough to split across chunks)
+        s3 = "_курсив слово1 слово2 __подчёркнутый текст " + ("слово " * 15) + "__ конец_"
         c3 = truncate_markdown_v2(s3, max_length=max_len, len_fn=utf16_len)
+        assert len(c3) >= 2
         _assert_valid_chunks(c3, max_len)
         for ch in c3:
             assert "___" not in ch, f"Unexpected ___ collision in {ch!r}"
+
+    # Explicit nested ["_", "__"] and ["__", "_"] split checks
+    nested_italic_underline = "_a " + ("w " * 30) + "__b " + ("x " * 30) + "__ c_"
+    chunks_iu = truncate_markdown_v2(nested_italic_underline, max_length=100, len_fn=utf16_len)
+    assert len(chunks_iu) >= 2
+    _assert_valid_chunks(chunks_iu, 100)
+    for ch in chunks_iu:
+        assert "___" not in ch, f"Unexpected ___ collision in {ch!r}"
+
+    nested_underline_italic = "__a " + ("w " * 30) + "_b " + ("x " * 30) + "_ c__"
+    chunks_ui = truncate_markdown_v2(nested_underline_italic, max_length=100, len_fn=utf16_len)
+    assert len(chunks_ui) >= 2
+    _assert_valid_chunks(chunks_ui, 100)
+    for ch in chunks_ui:
+        assert "___" not in ch, f"Unexpected ___ collision in {ch!r}"

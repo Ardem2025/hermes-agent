@@ -420,6 +420,15 @@ def _unit_to_cp(s: str, budget: int, len_fn: Callable[[str], int]) -> int:
     return lo
 
 
+def _ends_with_unescaped_char(s: str, ch: str) -> bool:
+    if not s.endswith(ch):
+        return False
+    stripped = s.rstrip(ch)
+    bs = len(stripped) - len(stripped.rstrip("\\"))
+    trailing = len(s) - len(stripped)
+    return (trailing - (bs % 2)) >= 1
+
+
 def _closing_suffix(state: _Mdv2State, chunk_body: str) -> tuple[str, bool]:
     """Return (suffix, ends_with_newline_indicator) for closing open entities at split."""
     parts: list[str] = []
@@ -433,12 +442,23 @@ def _closing_suffix(state: _Mdv2State, chunk_body: str) -> tuple[str, bool]:
         rev = list(reversed(state.open_marks))
         closed_parts: list[str] = []
         for mk in rev:
-            if closed_parts and closed_parts[-1] == "_" and mk == "__":
+            if closed_parts and {closed_parts[-1], mk} == {"_", "__"}:
                 closed_parts.append(" ")
             closed_parts.append(mk)
+        if (
+            not state.in_inline_code
+            and not state.in_fence
+            and closed_parts[0] in ("_", "__")
+            and _ends_with_unescaped_char(chunk_body, "_")
+        ):
+            closed_parts.insert(0, " ")
         parts.append("".join(closed_parts))
         ends_nl = False
     if state.expandable_quote:
+        if not parts and _ends_with_unescaped_char(chunk_body, "|"):
+            parts.append(" ")
+        elif parts and parts[-1].endswith("||"):
+            parts.append(" ")
         parts.append("||")
         ends_nl = True
     return "".join(parts), ends_nl
@@ -617,11 +637,13 @@ def _is_safe_boundary(
     """Check collision and dangling-opener invariants at boundary *pos*."""
     if tok_kind in ("open_mark", "open_inline_code", "open_fence", "quote_marker"):
         return False
-    if st.open_marks[-2:] == ["__", "_"]:
-        return False
     if st.open_marks[-1:] == ["_"]:
         tail = s[pos:] if st.in_fence else s[pos:].lstrip()
         if tail.startswith("__"):
+            return False
+    if st.open_marks[-1:] == ["__"]:
+        tail = s[pos:] if st.in_fence else s[pos:].lstrip()
+        if tail.startswith("_") and not tail.startswith("__"):
             return False
     return True
 
@@ -679,9 +701,18 @@ def _build_prefix(carry: _Mdv2State, remaining: str) -> str:
                 q = carry.quote_prefix or ">"
                 parts.append(f"{q} ")
     if carry.open_marks:
-        parts.append("".join(carry.open_marks))
-        if carry.open_marks[-1] == "_" and remaining.startswith("__"):
-            parts.append(" ")
+        open_parts: list[str] = []
+        for mk in carry.open_marks:
+            if open_parts and {open_parts[-1], mk} == {"_", "__"}:
+                open_parts.append(" ")
+            open_parts.append(mk)
+        parts.append("".join(open_parts))
+        if not carry.in_fence and not carry.in_inline_code:
+            last_mk = carry.open_marks[-1]
+            if (last_mk == "_" and remaining.startswith("__")) or (
+                last_mk == "__" and remaining.startswith("_")
+            ):
+                parts.append(" ")
     if carry.in_fence:
         parts.append(f"```{carry.fence_lang}\n")
     if carry.in_inline_code:
