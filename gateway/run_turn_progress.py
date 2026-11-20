@@ -884,6 +884,9 @@ class GatewayTurnProgressMixin:
 
     async def _drain_progress_on_cancel(self, st) -> None:
         ctx = self._ctx
+        if not ctx._run_still_current() or self._agent_interrupted():
+            self._drain_progress_queue()
+            return
         with suppress(Exception):
             while not ctx.progress_queue.empty():
                 raw = ctx.progress_queue.get_nowait()
@@ -1010,6 +1013,7 @@ class GatewayTurnProgressMixin:
                         # queued messages before sending a single batched edit.
                         remaining = effective_interval - (time.monotonic() - last_edit_ts)
                         if remaining > 0:
+                            st.flood_pending = True
                             await asyncio.sleep(remaining)
                             continue
                         if not ctx._run_still_current():
@@ -1022,12 +1026,12 @@ class GatewayTurnProgressMixin:
                     if time.monotonic() - last_edit_ts >= effective_interval and await self._deliver_flood_pending_progress(st):
                         last_edit_ts = time.monotonic()
                     await asyncio.sleep(0.3)
-                except asyncio.CancelledError:
-                    await self._drain_progress_on_cancel(st)
-                    return
                 except Exception as e:
                     logger.error("Progress message error: %s", e)
                     await asyncio.sleep(1)
+        except asyncio.CancelledError:
+            await self._drain_progress_on_cancel(st)
+            raise
         finally:
             remaining_loops = _ACTIVE_PROGRESS_LOOPS.get(progress_key, 0) - 1
             if remaining_loops > 0:
