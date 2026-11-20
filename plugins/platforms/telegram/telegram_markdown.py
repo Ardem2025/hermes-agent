@@ -1,7 +1,9 @@
 """Markdown -> Telegram MarkdownV2 conversion (the legacy, non-rich send path)."""
 
 import bisect
+from dataclasses import dataclass, field
 import re
+from typing import Callable, Optional
 
 from gateway.platforms.helpers import (
     convert_table_to_bullets as _wrap_markdown_tables,
@@ -366,3 +368,475 @@ def escape_rich_currency_dollars(text: str) -> str:
     if '$' not in text:
         return text
     return _RICH_DOLLAR_RE.sub(lambda m: m.group(0) if m.group('keep') else '\\$', text)
+
+
+# ---------------------------------------------------------------------------
+# MarkdownV2-aware message chunking (post-format_message)
+# ---------------------------------------------------------------------------
+
+_MDV2_INLINE_MARKERS = ("||", "__", "*", "_", "~")
+_MDV2_QUOTE_MARKER_RE = re.compile(r"(?:\*\*)?>+")
+_MDV2_LINK_RE = re.compile(r"\[((?:\\.|`(?:\\.|[^`\\])*`|[^\]\\`])*)\]\(((?:\\.|[^)\\])*)\)")
+_INDICATOR_RESERVE = 14          # " \(XXX/XXX\)"
+_INDICATOR_NEWLINE_RESERVE = 15  # "\n \(XXX/XXX\)"
+
+
+@dataclass
+class _Mdv2State:
+    in_fence: bool = False
+    fence_lang: str = ""
+    in_inline_code: bool = False
+    in_quote: bool = False
+    quote_prefix: str = ""
+    expandable_quote: bool = False
+    open_marks: list[str] = field(default_factory=list)
+
+    def copy(self) -> "_Mdv2State":
+        return _Mdv2State(
+            in_fence=self.in_fence,
+            fence_lang=self.fence_lang,
+            in_inline_code=self.in_inline_code,
+            in_quote=self.in_quote,
+            quote_prefix=self.quote_prefix,
+            expandable_quote=self.expandable_quote,
+            open_marks=list(self.open_marks),
+        )
+
+
+def _unit_to_cp(s: str, budget: int, len_fn: Callable[[str], int]) -> int:
+    if budget <= 0:
+        return 0
+    if len_fn is len:
+        return min(len(s), budget)
+    if len_fn(s) <= budget:
+        return len(s)
+    lo, hi = 0, len(s)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if len_fn(s[:mid]) <= budget:
+            lo = mid
+        else:
+            hi = mid - 1
+    return lo
+
+
+def _closing_suffix(state: _Mdv2State, chunk_body: str) -> tuple[str, bool]:
+    """Return (suffix, ends_with_newline_indicator) for closing open entities at split."""
+    parts: list[str] = []
+    ends_nl = False
+    if state.in_inline_code:
+        parts.append("`")
+    if state.in_fence:
+        parts.append("```" if chunk_body.endswith("\n") else "\n```")
+        ends_nl = True
+    if state.open_marks:
+        rev = list(reversed(state.open_marks))
+        closed_parts: list[str] = []
+        for mk in rev:
+            if closed_parts and closed_parts[-1] == "_" and mk == "__":
+                closed_parts.append(" ")
+            closed_parts.append(mk)
+        parts.append("".join(closed_parts))
+        ends_nl = False
+    if state.expandable_quote:
+        parts.append("||")
+        ends_nl = True
+    return "".join(parts), ends_nl
+
+
+def _scan_mdv2(
+    s: str,
+    init_state: _Mdv2State,
+    atomic_budget: int,
+) -> tuple[list[tuple[int, _Mdv2State, str]], _Mdv2State, str]:
+    """Scan *s* from *init_state* and return:
+    - boundaries: list of (pos, state_at_pos, last_token_kind) for safe split positions 1..len(s)
+    - end_state: state at len(s)
+    - end_tok_kind: kind of the last token in s
+    """
+    st = init_state.copy()
+    n = len(s)
+    i = 0
+    boundaries: list[tuple[int, _Mdv2State, str]] = []
+    # Track trailing opener positions so we never leave a dangling opener at chunk end.
+    # Each entry is (start_pos, kind) for consecutive openers with no content after them.
+    trailing_openers: list[int] = []
+    last_tok = "text"
+
+    def _record(pos: int, tok_kind: str, is_opener: bool = False, opener_start: int = -1) -> None:
+        nonlocal last_tok
+        last_tok = tok_kind
+        if is_opener:
+            trailing_openers.append(opener_start)
+        else:
+            trailing_openers.clear()
+        boundaries.append((pos, st.copy(), tok_kind))
+
+    while i < n:
+        ch = s[i]
+
+        if st.in_fence:
+            if ch == "\\":
+                step = 2 if i + 1 < n else 1
+                i += step
+                _record(i, "escape")
+                continue
+            if s.startswith("```", i):
+                st.in_fence = False
+                st.fence_lang = ""
+                i += 3
+                _record(i, "close_fence")
+                continue
+            i += 1
+            _record(i, "text")
+            continue
+
+        if st.in_inline_code:
+            if ch == "\\":
+                step = 2 if i + 1 < n else 1
+                i += step
+                _record(i, "escape")
+                continue
+            if ch == "`":
+                st.in_inline_code = False
+                i += 1
+                _record(i, "close_inline_code")
+                continue
+            i += 1
+            _record(i, "text")
+            continue
+
+        # Outside fence and inline code
+        if ch == "\n" and st.in_quote and s[i + 1 : i + 2] != ">":
+            st.in_quote = False
+            st.expandable_quote = False
+            st.quote_prefix = ""
+            i += 1
+            _record(i, "newline")
+            continue
+
+        if ch == "\\":
+            step = 2 if i + 1 < n else 1
+            i += step
+            _record(i, "escape")
+            continue
+
+        if s.startswith("```", i):
+            nl = s.find("\n", i + 3)
+            close_same = s.find("```", i + 3)
+            if nl != -1 and (close_same == -1 or nl < close_same) and (nl - i) <= max(32, atomic_budget // 2):
+                st.in_fence = True
+                st.fence_lang = s[i + 3 : nl]
+                opener_start = i
+                i = nl + 1
+                _record(i, "open_fence", is_opener=True, opener_start=opener_start)
+            else:
+                st.in_fence = True
+                st.fence_lang = ""
+                opener_start = i
+                i += 3
+                _record(i, "open_fence", is_opener=True, opener_start=opener_start)
+            continue
+
+        if ch == "`":
+            # Check if short inline code span fits atomically
+            end = i + 1
+            while end < n and s[end] != "`":
+                end += 2 if s[end] == "\\" else 1
+            if end < n and (end + 1 - i) <= atomic_budget:
+                i = end + 1
+                _record(i, "inline_code_span")
+            else:
+                st.in_inline_code = True
+                opener_start = i
+                i += 1
+                _record(i, "open_inline_code", is_opener=True, opener_start=opener_start)
+            continue
+
+        if ch == "[":
+            m = _MDV2_LINK_RE.match(s, i)
+            if m and not (st.in_quote and re.search(r"\n(?!>)", m.group(0))):
+                if (m.end() - i) <= atomic_budget:
+                    i = m.end()
+                    _record(i, "link")
+                    continue
+            i += 1
+            _record(i, "text")
+            continue
+
+        if i == 0 or s[i - 1] == "\n":
+            qm = _MDV2_QUOTE_MARKER_RE.match(s, i)
+            if qm:
+                st.in_quote = True
+                st.expandable_quote = st.expandable_quote or (s[i] == "*")
+                st.quote_prefix = qm.group(0)
+                opener_start = i
+                i = qm.end()
+                if i < n and s[i] == " ":
+                    i += 1
+                _record(i, "quote_marker", is_opener=True, opener_start=opener_start)
+                continue
+
+        if (
+            st.expandable_quote
+            and s.startswith("||", i)
+            and s[i + 2 : i + 3] in ("", "\n")
+            and st.open_marks[-1:] != ["||"]
+            and s[i + 3 : i + 4] != ">"
+        ):
+            st.expandable_quote = False
+            i += 2
+            _record(i, "close_expandable_quote")
+            continue
+
+        mark = next((mk for mk in _MDV2_INLINE_MARKERS if s.startswith(mk, i)), None)
+        if mark is not None:
+            opener_start = i
+            if st.open_marks and st.open_marks[-1] == mark:
+                st.open_marks.pop()
+                i += len(mark)
+                _record(i, "close_mark")
+            else:
+                st.open_marks.append(mark)
+                i += len(mark)
+                _record(i, "open_mark", is_opener=True, opener_start=opener_start)
+            continue
+
+        i += 1
+        _record(i, "newline" if ch == "\n" else ("space" if ch == " " else "text"))
+
+    return boundaries, st, last_tok
+
+
+def _is_safe_boundary(
+    s: str,
+    pos: int,
+    st: _Mdv2State,
+    tok_kind: str,
+) -> bool:
+    """Check collision and dangling-opener invariants at boundary *pos*."""
+    if tok_kind in ("open_mark", "open_inline_code", "open_fence", "quote_marker"):
+        return False
+    if st.open_marks[-2:] == ["__", "_"]:
+        return False
+    if st.open_marks[-1:] == ["_"]:
+        tail = s[pos:] if st.in_fence else s[pos:].lstrip()
+        if tail.startswith("__"):
+            return False
+    return True
+
+
+def _collapse_leading_closers(remaining: str, carry: _Mdv2State) -> str:
+    """Strip boundary whitespace and collapse immediate closing markers in *remaining*."""
+    if carry.in_fence:
+        if remaining.startswith("\n"):
+            remaining = remaining[1:]
+        if remaining.startswith("```") and (len(remaining) == 3 or remaining[3:4] == "\n"):
+            carry.in_fence = False
+            carry.fence_lang = ""
+            remaining = remaining[3:]
+            if remaining.startswith("\n"):
+                remaining = remaining[1:]
+        return remaining
+
+    remaining = remaining.lstrip()
+    while carry.open_marks:
+        next_mk = next((mk for mk in _MDV2_INLINE_MARKERS if remaining.startswith(mk)), None)
+        if next_mk is not None and next_mk == carry.open_marks[-1]:
+            carry.open_marks.pop()
+            remaining = remaining[len(next_mk):].lstrip()
+        else:
+            break
+
+    if (
+        carry.expandable_quote
+        and remaining.startswith("||")
+        and remaining[2:3] in ("", "\n")
+        and carry.open_marks[-1:] != ["||"]
+        and remaining[3:4] != ">"
+    ):
+        carry.expandable_quote = False
+        remaining = remaining[2:]
+        if not remaining or (remaining.startswith("\n") and remaining[1:2] != ">"):
+            carry.in_quote = False
+            carry.quote_prefix = ""
+        remaining = remaining.lstrip()
+
+    return remaining
+
+
+def _build_prefix(carry: _Mdv2State, remaining: str) -> str:
+    parts: list[str] = []
+    if carry.in_quote:
+        if carry.expandable_quote:
+            if remaining.startswith(">"):
+                parts.append("**")
+            else:
+                q = carry.quote_prefix.lstrip("*") or ">"
+                parts.append(f"**{q} ")
+        else:
+            if not remaining.startswith(">"):
+                q = carry.quote_prefix or ">"
+                parts.append(f"{q} ")
+    if carry.open_marks:
+        parts.append("".join(carry.open_marks))
+        if carry.open_marks[-1] == "_" and remaining.startswith("__"):
+            parts.append(" ")
+    if carry.in_fence:
+        parts.append(f"```{carry.fence_lang}\n")
+    if carry.in_inline_code:
+        parts.append("`")
+    return "".join(parts)
+
+
+def truncate_markdown_v2(
+    content: str,
+    max_length: int = 4096,
+    len_fn: Optional[Callable[[str], int]] = None,
+) -> list[str]:
+    """Split already-formatted Telegram MarkdownV2 *content* into valid chunks <= *max_length*.
+
+    Preserves paired inline entities (``||``, ``__``, ``*``, ``_``, ``~``), escape pairs,
+    inline code, fenced code blocks, links, and blockquotes (``>`` / ``**> ...||``),
+    appending escaped `` \\(i/N\\)`` (or ``\\n \\(i/N\\)`` after closing fence / expandable quote)
+    when split into multiple chunks.
+    """
+    _len = len_fn or len
+    if _len(content) <= max_length:
+        return [content]
+
+    chunks: list[tuple[str, bool]] = []
+    remaining = content
+    carry = _Mdv2State()
+
+    while remaining or carry.open_marks or carry.in_fence or carry.in_inline_code or carry.expandable_quote:
+        if chunks:
+            remaining = _collapse_leading_closers(remaining, carry)
+            if (
+                not remaining
+                and not carry.open_marks
+                and not carry.in_fence
+                and not carry.in_inline_code
+                and not carry.expandable_quote
+            ):
+                break
+
+        prefix = _build_prefix(carry, remaining)
+        prefix_len = _len(prefix)
+        atomic_budget = max(16, max_length - prefix_len - _INDICATOR_NEWLINE_RESERVE - 16)
+
+        boundaries, end_state, end_tok = _scan_mdv2(remaining, carry, atomic_budget)
+        end_suffix, end_suffix_nl = _closing_suffix(end_state, prefix + remaining)
+        final_candidate = prefix + remaining + end_suffix
+        final_ends_nl = end_suffix_nl or (
+            not end_suffix and end_tok in ("close_fence", "close_expandable_quote")
+        )
+        final_ind_reserve = (
+            (_INDICATOR_NEWLINE_RESERVE if final_ends_nl else _INDICATOR_RESERVE)
+            if chunks
+            else 0
+        )
+        if _len(final_candidate) + final_ind_reserve <= max_length:
+            chunks.append((final_candidate, final_ends_nl))
+            break
+
+        # Upper bound on codepoints for remaining[:cp_limit]
+        body_budget = max(1, max_length - prefix_len - _INDICATOR_RESERVE)
+        cp_limit = _unit_to_cp(remaining, body_budget, _len)
+        if cp_limit < 1:
+            cp_limit = 1
+
+        # Filter boundaries <= cp_limit that fit exact length constraint
+        def _fits(pos: int, st: _Mdv2State, tok_kind: str) -> tuple[bool, str, bool]:
+            body = remaining[:pos]
+            suf, suf_nl = _closing_suffix(st, prefix + body)
+            ends_nl = suf_nl or (not suf and tok_kind in ("close_fence", "close_expandable_quote"))
+            ind_res = _INDICATOR_NEWLINE_RESERVE if ends_nl else _INDICATOR_RESERVE
+            return (_len(prefix + body + suf) + ind_res <= max_length), suf, ends_nl
+
+        # Collect candidate indices in boundaries with pos <= cp_limit
+        cand_indices = [idx for idx, (pos, _, _) in enumerate(boundaries) if pos <= cp_limit]
+        if not cand_indices and boundaries:
+            cand_indices = [0]
+
+        chosen_idx: Optional[int] = None
+        half_cp = cp_limit // 2
+
+        # Priority 1: last newline >= cp_limit // 2 (safe & fits)
+        for idx in reversed(cand_indices):
+            pos, st, tok = boundaries[idx]
+            if pos < half_cp:
+                break
+            if pos > 0 and remaining[pos - 1] == "\n" and _is_safe_boundary(remaining, pos, st, tok):
+                # Prefer splitting BEFORE the newline if pos - 1 is also a safe boundary
+                if pos >= 2 and idx > 0 and boundaries[idx - 1][0] == pos - 1:
+                    p_pos, p_st, p_tok = boundaries[idx - 1]
+                    if p_pos >= half_cp and _is_safe_boundary(remaining, p_pos, p_st, p_tok):
+                        ok, _, _ = _fits(p_pos, p_st, p_tok)
+                        if ok:
+                            chosen_idx = idx - 1
+                            break
+                ok, _, _ = _fits(pos, st, tok)
+                if ok:
+                    chosen_idx = idx
+                    break
+
+        # Priority 2: last space >= cp_limit // 2 (safe & fits)
+        if chosen_idx is None:
+            for idx in reversed(cand_indices):
+                pos, st, tok = boundaries[idx]
+                if pos < half_cp:
+                    break
+                if pos > 0 and remaining[pos - 1] == " " and _is_safe_boundary(remaining, pos, st, tok):
+                    ok, _, _ = _fits(pos, st, tok)
+                    if ok:
+                        chosen_idx = idx
+                        break
+
+        # Priority 3: latest safe boundary <= cp_limit that fits
+        if chosen_idx is None:
+            for idx in reversed(cand_indices):
+                pos, st, tok = boundaries[idx]
+                if _is_safe_boundary(remaining, pos, st, tok):
+                    ok, _, _ = _fits(pos, st, tok)
+                    if ok:
+                        chosen_idx = idx
+                        break
+
+        # Fallback: latest boundary <= cp_limit that fits (even if unsafe, to guarantee progress)
+        if chosen_idx is None:
+            for idx in reversed(cand_indices):
+                pos, st, tok = boundaries[idx]
+                ok, _, _ = _fits(pos, st, tok)
+                if ok:
+                    chosen_idx = idx
+                    break
+
+        if chosen_idx is None:
+            chosen_idx = cand_indices[0] if cand_indices else 0
+
+        split_at, split_state, split_tok = boundaries[chosen_idx]
+        chunk_body = remaining[:split_at]
+        suffix, suf_nl = _closing_suffix(split_state, prefix + chunk_body)
+        ends_nl = suf_nl or (not suffix and split_tok in ("close_fence", "close_expandable_quote"))
+        chunks.append((prefix + chunk_body + suffix, ends_nl))
+
+        next_remaining = remaining[split_at:]
+        next_carry = split_state.copy()
+        # If split landed right before a newline that exits a quote, close quote state for next chunk
+        if next_carry.in_quote and next_remaining.startswith("\n") and next_remaining[1:2] != ">":
+            next_carry.in_quote = False
+            next_carry.expandable_quote = False
+            next_carry.quote_prefix = ""
+
+        remaining = next_remaining
+        carry = next_carry
+
+    total = len(chunks)
+    if total > 1:
+        return [
+            f"{text}\n \\({i + 1}/{total}\\)" if ends_nl else f"{text} \\({i + 1}/{total}\\)"
+            for i, (text, ends_nl) in enumerate(chunks)
+        ]
+    return [text for text, _ in chunks]
+
