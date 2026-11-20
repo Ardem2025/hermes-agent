@@ -1403,6 +1403,73 @@ class SessionAuthority:
             with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(released.wait(), _MARKER_RELEASE_WAIT_S)
 
+    async def settle_reset_native_inputs(self, session_id: str) -> int:
+        """Close remaining ``unknown``/``queued`` ``native_text_v1`` admissions on *session_id*
+        after ``/reset`` or ``/new`` ended the conversation with ``session_reset``."""
+        import logging
+        from gateway.session_ingress_media import release_admission_media
+        from gateway.session_results import close_discarded_turn
+        from gateway.session_retirement import restore_retired
+        from gateway.session_unattended_unknown import is_reset_reconcilable_native
+
+        if not session_id:
+            return 0
+        owner_sid = self.logical_owner(session_id)
+        ref = SessionRef(self.profile_id, owner_sid)
+        rows = await asyncio.to_thread(list_session_admissions, self.db, session_id=owner_sid)
+        log = logging.getLogger(__name__)
+        settled = 0
+        for row in rows:
+            if not is_reset_reconcilable_native(row):
+                continue
+            aid = row['admission_id']
+            if owner_sid not in self.sessions:
+                restore_retired(self, owner_sid)
+            if row['status'] == 'unknown':
+                try:
+                    if owner_sid in self.sessions:
+                        await self.resolve_unknown_as_owner(ref, aid, row['generation'], notice=None)
+                    else:
+                        await asyncio.to_thread(
+                            resolve_unknown_session_input, self.db, epoch=self.epoch,
+                            admission_id=aid, generation=row['generation'],
+                            _terminal_write=lambda conn, lost: close_discarded_turn(self.db, conn, lost, None))
+                        self.pending_results.pop(aid, None)
+                        self.native_waiters.discard(aid)
+                        drop_producer_turn(self, aid)
+                        waiter = self.waiters.pop(aid, None)
+                        if waiter is not None and not waiter.done():
+                            waiter.set_result(None)
+                        busy_row_settled(aid, 'interrupted')
+                        await asyncio.to_thread(release_admission_media, self.db, aid)
+                except RuntimeStoreError as exc:
+                    log.warning('Reset unknown admission %s on %s left unknown: %s', aid, owner_sid, exc.reason)
+                    continue
+                settled += 1
+            elif row['status'] == 'queued':
+                try:
+                    if owner_sid in self.sessions:
+                        await self._commit_cancel(ref, aid, self._receipt(row))
+                    else:
+                        await asyncio.to_thread(cancel_session_input, self.db, epoch=self.epoch, admission_id=aid)
+                        self.native_waiters.discard(aid)
+                        drop_producer_turn(self, aid)
+                        waiter = self.waiters.pop(aid, None)
+                        if waiter is not None and not waiter.done():
+                            waiter.set_result(None)
+                        busy_row_settled(aid, 'cancelled')
+                    await asyncio.to_thread(release_admission_media, self.db, aid)
+                except RuntimeStoreError as exc:
+                    log.warning('Reset queued admission %s on %s left queued: %s', aid, owner_sid, exc.reason)
+                    continue
+                settled += 1
+        live = self.sessions.get(owner_sid)
+        if live is not None:
+            live.pause_notified = False
+        if settled:
+            log.info('Settled %d reset native admission(s) on session %s', settled, owner_sid)
+        return settled
+
 
 def backfill_legacy_session_owners(db):
     """Stamp this store's own profile onto pre-ownership NULL rows (#94724).
@@ -1457,8 +1524,9 @@ async def initialize_session_authority(runner, *, profile_id, instance_id, db=No
     # Hot-serve builds a profile while the loop serves the others: both writes stay off it.
     await asyncio.to_thread(recover_session_inputs, db, epoch=epoch)
     # A lost automation turn has nobody to resolve it: it settles interrupted before any FIFO runs.
-    from gateway.session_unattended_unknown import settle_recovered_unattended
+    from gateway.session_unattended_unknown import settle_recovered_unattended, settle_reset_native_admissions
     await asyncio.to_thread(settle_recovered_unattended, db, epoch)
+    await asyncio.to_thread(settle_reset_native_admissions, db, epoch)
     await asyncio.to_thread(backfill_legacy_session_owners, db)
     await asyncio.to_thread(backfill_compression_created_sources, db)
     from gateway.session_local_recovery import release_handed_off_receipts

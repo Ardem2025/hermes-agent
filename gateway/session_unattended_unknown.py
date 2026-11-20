@@ -83,3 +83,89 @@ async def settle_unattended_unknown(authority, ref) -> bool:
             continue
         settled = True
     return settled
+
+
+def is_reset_reconcilable_native(row) -> bool:
+    """True for a messaging ``native_text_v1`` admission (``unknown`` or ``queued``) eligible for
+    reconciliation when its conversation ended via ``session_reset``."""
+    if row.get('status') not in ('unknown', 'queued'):
+        return False
+    principal = row.get('principal_id') or ''
+    if not principal.startswith('messaging:'):
+        return False
+    payload = row.get('payload')
+    if not isinstance(payload, dict) or 'native_text_v1' not in payload:
+        return False
+    return not is_unattended(row)
+
+
+def _is_session_reset_ended(conn, session_id: str) -> bool:
+    """True when *session_id* (or its compression lineage tip) ended with ``session_reset``."""
+    from hermes_state_runtime import RuntimeStoreError, _canonical_chain
+    row = conn.execute("SELECT ended_at, end_reason FROM sessions WHERE id=?", (session_id,)).fetchone()
+    if row is None:
+        return False
+    if row[0] is not None and row[1] == 'session_reset':
+        return True
+    try:
+        tip_id = _canonical_chain(conn, session_id)[-1]
+    except RuntimeStoreError:
+        return False
+    if tip_id == session_id:
+        return False
+    tip = conn.execute("SELECT ended_at, end_reason FROM sessions WHERE id=?", (tip_id,)).fetchone()
+    return bool(tip is not None and tip[0] is not None and tip[1] == 'session_reset')
+
+
+def settle_reset_native_admissions(db, epoch: int) -> int:
+    """Boot recovery: close orphaned ``unknown``/``queued`` ``native_text_v1`` admissions from
+    prior epochs whose conversation already ended with ``session_reset``."""
+    from gateway.session_ingress_media import release_admission_media
+    from gateway.session_results import close_discarded_turn
+    from hermes_state_runtime import (
+        RuntimeStoreError, _row, cancel_session_input, resolve_unknown_session_input,
+    )
+    with db._read_ctx() as conn:
+        raw_rows = conn.execute(
+            "SELECT * FROM session_admissions WHERE status IN ('unknown', 'queued') "
+            "AND (owner_epoch IS NULL OR owner_epoch < ?) ORDER BY seq",
+            (epoch,),
+        ).fetchall()
+        candidates = []
+        reset_cache: dict[str, bool] = {}
+        for raw in raw_rows:
+            row = _row(raw)
+            if not is_reset_reconcilable_native(row):
+                continue
+            sid = row['target_session_id']
+            if sid not in reset_cache:
+                reset_cache[sid] = _is_session_reset_ended(conn, sid)
+            if reset_cache[sid]:
+                candidates.append(row)
+    settled = 0
+    for row in candidates:
+        aid = row['admission_id']
+        sid = row['target_session_id']
+        if row['status'] == 'unknown':
+            try:
+                resolve_unknown_session_input(
+                    db, epoch=epoch, admission_id=aid, generation=row['generation'],
+                    _terminal_write=lambda conn, lost: close_discarded_turn(db, conn, lost, None))
+            except RuntimeStoreError as exc:
+                logger.warning('Orphaned reset unknown admission %s on %s left unknown: %s', aid, sid, exc.reason)
+                continue
+            release_admission_media(db, aid)
+            settled += 1
+            logger.info('Orphaned reset admission %s on session %s settled interrupted', aid, sid)
+        elif row['status'] == 'queued':
+            try:
+                cancel_session_input(db, epoch=epoch, admission_id=aid)
+            except RuntimeStoreError as exc:
+                logger.warning('Orphaned reset queued admission %s on %s left queued: %s', aid, sid, exc.reason)
+                continue
+            release_admission_media(db, aid)
+            settled += 1
+            logger.info('Orphaned reset admission %s on session %s settled cancelled', aid, sid)
+    if settled:
+        logger.info('Settled %d orphaned reset native admission(s)', settled)
+    return settled

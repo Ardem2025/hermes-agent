@@ -228,6 +228,14 @@ class GatewaySessionCommandsMixin:
         async with route_owner_lock(self, _old_sid):
             new_entry = await self.async_session_store.reset_session(session_key)
             await move_route_wakes(self, session_key, _old_sid)  # main #114456: a parked wake survives /new
+        if _old_sid:
+            from gateway.session_authorities import active_authority
+            authority = active_authority(self)
+            if authority is not None:
+                try:
+                    await authority.settle_reset_native_inputs(_old_sid)
+                except Exception:
+                    logger.warning("Failed to settle reset native inputs for %s", _old_sid, exc_info=True)
         await self._fire_session_reset_hooks(source, session_key, _old_sid,
                                              new_entry.session_id if new_entry else None)
         # Scoped to the profile serving this source so a multiplexed /new banner reports the
