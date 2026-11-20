@@ -8,6 +8,60 @@ from collections import OrderedDict
 from functools import wraps
 from typing import Any, Dict, Optional
 
+from gateway.response_filters import (
+    is_intentional_silence_response,
+    is_machinery_display_kind,
+    strip_trailing_silence_marker,
+)
+
+_TELEGRAM_SYNC_MACHINERY_MARKERS = (
+    "[ASYNC DELEGATION BATCH COMPLETE",
+    "[ASYNC DELEGATION COMPLETE",
+    "[INTERNAL NOTIFICATION",
+    "[CONTEXT COMPACTION",
+)
+
+
+def _internal_notification_footer() -> str:
+    from gateway.run_notifications import INTERNAL_NOTIFICATION_FOOTER
+
+    return INTERNAL_NOTIFICATION_FOOTER
+
+
+def _message_display_kind(message: Any) -> Optional[str]:
+    if not isinstance(message, dict):
+        return None
+    display_kind = message.get("display_kind")
+    if display_kind:
+        return str(display_kind)
+    metadata = message.get("metadata")
+    if isinstance(metadata, dict):
+        meta_kind = metadata.get("display_kind")
+        if meta_kind:
+            return str(meta_kind)
+    return None
+
+
+def _should_skip_telegram_sync_message(message: Any, text: Optional[str]) -> bool:
+    if not isinstance(message, dict):
+        return True
+    role = str(message.get("role") or "").strip().lower()
+    if role not in {"user", "assistant"}:
+        return True
+    if is_machinery_display_kind(_message_display_kind(message)):
+        return True
+    if text is None or not str(text).strip():
+        return True
+    text_str = str(text)
+    if any(marker in text_str for marker in _TELEGRAM_SYNC_MACHINERY_MARKERS):
+        return True
+    footer = _internal_notification_footer()
+    if footer and footer in text_str:
+        return True
+    if role == "assistant" and is_intentional_silence_response(text_str):
+        return True
+    return False
+
 try:
     from aiohttp import web
 except ImportError:
@@ -529,7 +583,7 @@ class _TelegramSyncMixin:
 
     def _telegram_sync_text(self, message: Any, text: Optional[str]) -> str:
         res = text or ""
-        if isinstance(message, dict) and message.get("display_kind") == "failed_turn":
+        if _message_display_kind(message) == "failed_turn":
             return f"⚠️ {res}"
         return res
 
@@ -612,14 +666,23 @@ class _TelegramSyncMixin:
                     continue
 
                 text = self._user_facing_message_text(message)
-                if text is None:
+                if _should_skip_telegram_sync_message(message, text):
                     delivery["skipped"] += 1
                     if hasattr(db, "advance_telegram_topic_sync_checkpoint"):
                         db.advance_telegram_topic_sync_checkpoint(session_id=session_id, message_id=message_id)
                     continue
 
+                role = str(message.get("role") or "").strip().lower()
+                if role == "assistant":
+                    text = strip_trailing_silence_marker(text)
+                    if not str(text or "").strip():
+                        delivery["skipped"] += 1
+                        if hasattr(db, "advance_telegram_topic_sync_checkpoint"):
+                            db.advance_telegram_topic_sync_checkpoint(session_id=session_id, message_id=message_id)
+                        continue
+
                 result = await self._forward_to_telegram(
-                    session_id, str(message.get("role")).lower(), self._telegram_sync_text(message, text)
+                    session_id, role, self._telegram_sync_text(message, text)
                 )
                 if result.get("status") in {"sent", "skipped"}:
                     delivery["sent" if result.get("status") == "sent" else "skipped"] += 1
