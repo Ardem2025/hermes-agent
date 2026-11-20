@@ -3516,12 +3516,16 @@ class APIServerAdapter(
                         session_model=session_model, confirmed_runtime_lock=confirmed_runtime_lock)
                     if agent_ref is not None:
                         agent_ref[0] = agent
+                    turn_history = (
+                        list(conversation_history)
+                        if isinstance(conversation_history, list)
+                        else conversation_history
+                    )
                     if wake_delegation_id:
                         from agent.session_persistence import adopt_delegation_delivery_turn
 
-                        conversation_history = list(conversation_history)
                         adopt_delegation_delivery_turn(
-                            conversation_history,
+                            turn_history,
                             wake_delegation_id,
                             wake_delivery_notice,
                             user_message,
@@ -3533,7 +3537,7 @@ class APIServerAdapter(
                         # row instead of appending a second copy of the same text (#115325).
                         from agent.session_persistence import adopt_unanswered_turn
 
-                        adopt_unanswered_turn(conversation_history, user_message, agent)
+                        adopt_unanswered_turn(turn_history, user_message, agent)
                     effective_task_id = session_id or str(uuid.uuid4())
                     # Process baseline for disconnect reaping (this surface bypasses TurnRunner)
                     # + shutdown-interrupt registration, once for every caller.
@@ -3553,7 +3557,7 @@ class APIServerAdapter(
                     author_kwargs = {"turn_author": turn_author} if turn_author is not None else {}
                     conversation_kwargs = dict(
                         user_message=user_message,
-                        conversation_history=conversation_history,
+                        conversation_history=turn_history,
                         task_id=effective_task_id,
                         **author_kwargs,
                     )

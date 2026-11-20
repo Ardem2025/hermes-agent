@@ -571,6 +571,328 @@ class TestAgentExecution:
         assert mock_agent._gateway_turn_process_task_id == ""
         assert mock_agent._gateway_turn_process_baseline == frozenset()
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("wake_delegation_id", "resume_unanswered_turn"),
+        [
+            ("deleg-1", False),  # BDD-1
+            ("", False),         # BDD-2
+            ("", True),          # BDD-3
+            ("deleg-1", True),   # BDD-4
+        ],
+    )
+    async def test_run_agent_turn_history_no_unbound_and_no_caller_mutation(
+        self, adapter, wake_delegation_id, resume_unanswered_turn
+    ):
+        """Regression for UnboundLocalError on conversation_history inside _run_agent._run()
+        across all 4 combinations of wake_delegation_id and resume_unanswered_turn (BDD-1..BDD-4)."""
+        mock_agent = MagicMock()
+        mock_agent.session_prompt_tokens = 0
+        mock_agent.session_completion_tokens = 0
+        mock_agent.session_total_tokens = 0
+        mock_agent._pending_cli_user_message = None
+        captured = {}
+
+        def _capture_run(**kwargs):
+            captured["conversation_history"] = kwargs["conversation_history"]
+            return {"final_response": "ok"}
+
+        mock_agent.run_conversation.side_effect = _capture_run
+
+        delivery_row = {
+            "role": "user",
+            "content": "[ASYNC DELEGATION BATCH COMPLETE]",
+            "display_kind": "async_delegation_complete",
+            "display_metadata": {"delegation_id": "deleg-1", "delivery_notice": ""},
+        }
+        prev_row = {"role": "assistant", "content": "hi"}
+        tail_user_row = {"role": "user", "content": "retry me"}
+
+        if wake_delegation_id and not resume_unanswered_turn:
+            original_history = [prev_row, delivery_row]
+            user_message = "wake prompt"
+        elif not wake_delegation_id and not resume_unanswered_turn:
+            original_history = [{"role": "user", "content": "prev"}]
+            user_message = "hello"
+        elif not wake_delegation_id and resume_unanswered_turn:
+            original_history = [prev_row, tail_user_row]
+            user_message = "retry me"
+        else:
+            original_history = [prev_row, delivery_row, tail_user_row]
+            user_message = "retry me"
+
+        initial_len = len(original_history)
+        initial_refs = list(original_history)
+
+        assert getattr(adapter.gateway_runner, "session_authority", None) is None
+
+        with patch.object(adapter, "_create_agent", return_value=mock_agent):
+            result, _usage = await adapter._run_agent(
+                user_message=user_message,
+                conversation_history=original_history,
+                session_id="session-history-test",
+                requested_model="MiniMax-M3",
+                requested_provider="minimax",
+                model_options={"reasoning": {"enabled": False}, "fast": False},
+                wake_delegation_id=wake_delegation_id,
+                wake_delivery_notice="",
+                resume_unanswered_turn=resume_unanswered_turn,
+            )
+
+        assert result["final_response"] == "ok"
+        passed_history = captured["conversation_history"]
+        assert passed_history is not original_history
+        # Caller's list must never be mutated in-place (length and element refs preserved).
+        assert len(original_history) == initial_len
+        assert original_history == initial_refs
+
+        if wake_delegation_id and not resume_unanswered_turn:
+            assert passed_history == [prev_row]
+            assert mock_agent._pending_cli_user_message is delivery_row
+        elif not wake_delegation_id and not resume_unanswered_turn:
+            assert passed_history == original_history
+            assert mock_agent._pending_cli_user_message is None
+        elif not wake_delegation_id and resume_unanswered_turn:
+            assert passed_history == [prev_row]
+            assert mock_agent._pending_cli_user_message is tail_user_row
+        else:
+            assert passed_history == [prev_row]
+            assert mock_agent._pending_cli_user_message is tail_user_row
+
+    def test_nested_functions_no_closure_shadowing_unbound_local(self):
+        """BDD-5: AST invariant across gateway/platforms/api_server*.py and gateway/session_api_turn.py
+        ensuring nested functions do not shadow enclosing variables in a way that risks UnboundLocalError."""
+        import ast
+
+        repo_root = Path(__file__).resolve().parents[2]
+        target_files = sorted((repo_root / "gateway" / "platforms").glob("api_server*.py"))
+        session_api_turn = repo_root / "gateway" / "session_api_turn.py"
+        if session_api_turn.exists():
+            target_files.append(session_api_turn)
+
+        assert target_files, "Expected api_server*.py files to exist"
+
+        _SCOPE_BOUNDARIES = (
+            ast.FunctionDef,
+            ast.AsyncFunctionDef,
+            ast.ClassDef,
+            ast.ListComp,
+            ast.SetComp,
+            ast.DictComp,
+            ast.GeneratorExp,
+        )
+
+        def _collect_direct_bindings(fn_node):
+            """Collect names bound directly in fn_node's scope (excluding nested scopes)."""
+            bound = set()
+            for arg in (
+                list(fn_node.args.posonlyargs)
+                + list(fn_node.args.args)
+                + list(fn_node.args.kwonlyargs)
+            ):
+                bound.add(arg.arg)
+            if fn_node.args.vararg:
+                bound.add(fn_node.args.vararg.arg)
+            if fn_node.args.kwarg:
+                bound.add(fn_node.args.kwarg.arg)
+
+            def _walk(node):
+                for child in ast.iter_child_nodes(node):
+                    if isinstance(child, _SCOPE_BOUNDARIES):
+                        continue
+                    if isinstance(child, ast.Name) and isinstance(child.ctx, (ast.Store, ast.Del)):
+                        bound.add(child.id)
+                    elif isinstance(child, ast.ExceptHandler) and child.name:
+                        bound.add(child.name)
+                    elif isinstance(child, (ast.Import, ast.ImportFrom)):
+                        for alias in child.names:
+                            bound.add(alias.asname or alias.name.split(".")[0])
+                    _walk(child)
+
+            for stmt in fn_node.body:
+                _walk(stmt)
+            return bound
+
+        def _collect_nonlocal_or_global(fn_node):
+            declared = set()
+            def _walk(node):
+                for child in ast.iter_child_nodes(node):
+                    if isinstance(child, _SCOPE_BOUNDARIES):
+                        continue
+                    if isinstance(child, (ast.Global, ast.Nonlocal)):
+                        declared.update(child.names)
+                    _walk(child)
+            for stmt in fn_node.body:
+                _walk(stmt)
+            return declared
+
+        def _expr_reads(node):
+            reads = set()
+            def _walk(n):
+                if isinstance(n, _SCOPE_BOUNDARIES):
+                    return
+                if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load):
+                    reads.add(n.id)
+                for child in ast.iter_child_nodes(n):
+                    _walk(child)
+            _walk(node)
+            return reads
+
+        def _target_stores(node):
+            stores = set()
+            def _walk(n):
+                if isinstance(n, _SCOPE_BOUNDARIES):
+                    return
+                if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store):
+                    stores.add(n.id)
+                for child in ast.iter_child_nodes(n):
+                    _walk(child)
+            _walk(node)
+            return stores
+
+        def _find_unbound_local_risks(fn_node, enclosing_names):
+            declared = _collect_nonlocal_or_global(fn_node)
+            own_bindings = _collect_direct_bindings(fn_node)
+            shadowed = (own_bindings & enclosing_names) - declared
+            if not shadowed:
+                return []
+
+            risky = set()
+
+            def _check_expr(expr, cur):
+                """Check reads in expr in evaluation order, updating cur for NamedExpr (:=)."""
+                if expr is None:
+                    return
+                if isinstance(expr, _SCOPE_BOUNDARIES):
+                    return
+                if isinstance(expr, ast.NamedExpr):
+                    _check_expr(expr.value, cur)
+                    cur |= _target_stores(expr.target)
+                    return
+                if isinstance(expr, ast.Name) and isinstance(expr.ctx, ast.Load):
+                    if expr.id in shadowed and expr.id not in cur:
+                        risky.add(expr.id)
+                    return
+                for child in ast.iter_child_nodes(expr):
+                    _check_expr(child, cur)
+
+            def _stmt_always_exits(stmt):
+                return isinstance(stmt, (ast.Return, ast.Raise, ast.Continue, ast.Break))
+
+            def _walk_stmts(stmts, assigned):
+                cur = set(assigned)
+                for stmt in stmts:
+                    if isinstance(stmt, ast.Assign):
+                        _check_expr(stmt.value, cur)
+                        for tgt in stmt.targets:
+                            cur |= _target_stores(tgt)
+                    elif isinstance(stmt, ast.AnnAssign):
+                        _check_expr(stmt.value, cur)
+                        if stmt.value is not None:
+                            cur |= _target_stores(stmt.target)
+                    elif isinstance(stmt, ast.AugAssign):
+                        _check_expr(stmt.target, cur)
+                        _check_expr(stmt.value, cur)
+                        cur |= _target_stores(stmt.target)
+                    elif isinstance(stmt, (ast.Import, ast.ImportFrom)):
+                        for alias in stmt.names:
+                            cur.add(alias.asname or alias.name.split(".")[0])
+                    elif isinstance(stmt, ast.For):
+                        _check_expr(stmt.iter, cur)
+                        body_assigned = set(cur) | _target_stores(stmt.target)
+                        _walk_stmts(stmt.body, body_assigned)
+                        _walk_stmts(stmt.orelse, cur)
+                    elif isinstance(stmt, (ast.With, ast.AsyncWith)):
+                        for item in stmt.items:
+                            _check_expr(item.context_expr, cur)
+                            if item.optional_vars is not None:
+                                cur |= _target_stores(item.optional_vars)
+                        cur = _walk_stmts(stmt.body, cur)
+                    elif isinstance(stmt, ast.If):
+                        _check_expr(stmt.test, cur)
+                        body_out = _walk_stmts(stmt.body, cur)
+                        else_out = _walk_stmts(stmt.orelse, cur) if stmt.orelse else set(cur)
+                        body_exits = bool(stmt.body) and _stmt_always_exits(stmt.body[-1])
+                        else_exits = bool(stmt.orelse) and _stmt_always_exits(stmt.orelse[-1])
+                        if body_exits and not else_exits:
+                            cur = else_out
+                        elif else_exits and not body_exits:
+                            cur = body_out
+                        else:
+                            cur = body_out & else_out
+                    elif isinstance(stmt, ast.Try):
+                        body_out = _walk_stmts(stmt.body, cur)
+                        handler_outs = []
+                        for h in stmt.handlers:
+                            _check_expr(h.type, cur)
+                            h_in = set(cur)
+                            if h.name:
+                                h_in.add(h.name)
+                            h_out = _walk_stmts(h.body, h_in)
+                            if not (h.body and _stmt_always_exits(h.body[-1])):
+                                handler_outs.append(h_out)
+                        else_out = _walk_stmts(stmt.orelse, body_out) if stmt.orelse else body_out
+                        if stmt.handlers:
+                            paths = [else_out] + handler_outs
+                            cur = set.intersection(*paths) if paths else body_out
+                        else:
+                            cur = else_out
+                        if stmt.finalbody:
+                            cur = _walk_stmts(stmt.finalbody, cur)
+                    elif isinstance(stmt, ast.While):
+                        _check_expr(stmt.test, cur)
+                        _walk_stmts(stmt.body, cur)
+                        _walk_stmts(stmt.orelse, cur)
+                    else:
+                        _check_expr(stmt, cur)
+                return cur
+
+            init_assigned = set()
+            for arg in (
+                list(fn_node.args.posonlyargs)
+                + list(fn_node.args.args)
+                + list(fn_node.args.kwonlyargs)
+            ):
+                init_assigned.add(arg.arg)
+            if fn_node.args.vararg:
+                init_assigned.add(fn_node.args.vararg.arg)
+            if fn_node.args.kwarg:
+                init_assigned.add(fn_node.args.kwarg.arg)
+
+            _walk_stmts(fn_node.body, init_assigned)
+            return sorted(risky)
+
+        violations = []
+        found_run_agent_run = False
+
+        for path in target_files:
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+
+            def _visit(node, enclosing_stack):
+                nonlocal found_run_agent_run
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    if enclosing_stack:
+                        enclosing_names = set().union(*enclosing_stack)
+                        risky = _find_unbound_local_risks(node, enclosing_names)
+                        if risky:
+                            violations.append(f"{path.name}:{node.name}:{node.lineno} -> {risky}")
+                        if path.name == "api_server.py" and node.name == "_run":
+                            # Explicit check for _run_agent._run: conversation_history must never be stored.
+                            found_run_agent_run = True
+                            assert "conversation_history" not in _collect_direct_bindings(node)
+                    own_bindings = _collect_direct_bindings(node)
+                    new_stack = enclosing_stack + [own_bindings]
+                    for child in node.body:
+                        _visit(child, new_stack)
+                else:
+                    for child in ast.iter_child_nodes(node):
+                        _visit(child, enclosing_stack)
+
+            _visit(tree, [])
+
+        assert found_run_agent_run, "Expected to inspect _run_agent._run in api_server.py"
+        assert not violations, f"Potential UnboundLocalError closure shadows found: {violations}"
+
 
 class TestRelayMetadataForwarding:
     @pytest.mark.asyncio
