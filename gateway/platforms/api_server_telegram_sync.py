@@ -263,6 +263,20 @@ class _TelegramSyncMixin:
         setattr(self, "_pulse_loop", loop)
         return loop
 
+    def _resolve_telegram_user_config(self) -> dict[str, Any]:
+        runner = getattr(self, "gateway_runner", None)
+        user_config = getattr(runner, "user_config", None) if runner is not None else None
+        if isinstance(user_config, dict):
+            return user_config
+        try:
+            from gateway.run import _load_gateway_config
+            loaded = _load_gateway_config()
+            if isinstance(loaded, dict):
+                return loaded
+        except Exception:
+            _api_mod().logger.debug("Failed to load gateway config for telegram display settings", exc_info=True)
+        return {}
+
     def _resolve_telegram_cleanup_progress(self, telegram_adapter: Any) -> bool:
         if telegram_adapter is None:
             return False
@@ -272,18 +286,26 @@ class _TelegramSyncMixin:
         )
         if not has_real_delete:
             return False
-        runner = getattr(self, "gateway_runner", None)
-        user_config = getattr(runner, "user_config", None) if runner is not None else None
-        if not isinstance(user_config, dict):
-            user_config = {}
-            try:
-                from gateway.run import _load_gateway_config
-                loaded = _load_gateway_config()
-                if isinstance(loaded, dict):
-                    user_config = loaded
-            except Exception:
-                _api_mod().logger.debug("Failed to load gateway config for cleanup_progress", exc_info=True)
+        user_config = self._resolve_telegram_user_config()
         return bool(_api_mod().resolve_display_setting(user_config, "telegram", "cleanup_progress"))
+
+    def _resolve_telegram_display_settings(self, telegram_adapter: Any) -> dict[str, Any]:
+        user_config = self._resolve_telegram_user_config()
+        resolve_setting = getattr(_api_mod(), "resolve_display_setting", None)
+        if not callable(resolve_setting):
+            from gateway.display_config import resolve_display_setting as resolve_setting
+        resolve_tp = getattr(_api_mod(), "resolve_tool_progress", None)
+        if not callable(resolve_tp):
+            from gateway.display_config import resolve_tool_progress as resolve_tp
+        tool_progress_mode, _ = resolve_tp(user_config, "telegram")
+        return {
+            "tool_progress": str(tool_progress_mode or "all"),
+            "tool_progress_details": bool(resolve_setting(user_config, "telegram", "tool_progress_details", True)),
+            "friendly_tool_labels": bool(resolve_setting(user_config, "telegram", "friendly_tool_labels", True)),
+            "tool_preview_length": int(resolve_setting(user_config, "telegram", "tool_preview_length", 0) or 0),
+            "tool_progress_grouping": str(resolve_setting(user_config, "telegram", "tool_progress_grouping", "accumulate") or "accumulate"),
+            "cleanup_progress": self._resolve_telegram_cleanup_progress(telegram_adapter),
+        }
 
     def _prune_stale_pulse_entries(self, now: Optional[float] = None) -> None:
         tickers = self._pulse_registry()
@@ -419,6 +441,9 @@ class _TelegramSyncMixin:
                     _runner, telegram = self._telegram_runner_and_adapter()
                     if not telegram:
                         return
+                    display_settings = self._resolve_telegram_display_settings(telegram)
+                    if display_settings["tool_progress"] in ("off", "log"):
+                        return
                     db = self._ensure_session_db()
                     if not db:
                         return
@@ -432,7 +457,7 @@ class _TelegramSyncMixin:
                         return
                     thread_id = binding.get("thread_id") or binding.get("message_thread_id")
                     metadata = {"thread_id": str(thread_id)} if thread_id else {}
-                    cleanup_progress = self._resolve_telegram_cleanup_progress(telegram)
+                    cleanup_progress = display_settings["cleanup_progress"]
                     from gateway.subagent_pulse_ticker import SubagentPulseTicker
                     ticker = SubagentPulseTicker(
                         adapter=telegram,
@@ -440,6 +465,10 @@ class _TelegramSyncMixin:
                         thread_id=thread_id,
                         metadata=metadata,
                         cleanup_progress=cleanup_progress,
+                        tool_progress_details=display_settings["tool_progress_details"],
+                        friendly_tool_labels=display_settings["friendly_tool_labels"],
+                        tool_preview_length=display_settings["tool_preview_length"],
+                        tool_progress_grouping=display_settings["tool_progress_grouping"],
                     )
                 except Exception:
                     _api_mod().logger.debug("Failed to initialize SubagentPulseTicker for session %s", session_id, exc_info=True)

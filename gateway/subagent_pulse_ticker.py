@@ -45,6 +45,10 @@ class SubagentPulseTicker:
         turn_context: Optional[Any] = None,
         metadata: Optional[dict[str, Any]] = None,
         cleanup_progress: Optional[bool] = None,
+        tool_progress_details: Optional[bool] = None,
+        friendly_tool_labels: Optional[bool] = None,
+        tool_preview_length: Optional[int] = None,
+        tool_progress_grouping: Optional[str] = None,
     ) -> None:
         self.adapter = adapter
         self.chat_id = str(chat_id)
@@ -55,6 +59,24 @@ class SubagentPulseTicker:
             self.cleanup_progress = bool(getattr(turn_context, "_cleanup_progress", False))
         else:
             self.cleanup_progress = bool(cleanup_progress)
+        if tool_progress_details is None:
+            self.tool_progress_details = bool(getattr(turn_context, "tool_progress_details", True))
+        else:
+            self.tool_progress_details = bool(tool_progress_details)
+        if friendly_tool_labels is None:
+            self.friendly_tool_labels = bool(getattr(turn_context, "friendly_tool_labels", True))
+        else:
+            self.friendly_tool_labels = bool(friendly_tool_labels)
+        if tool_preview_length is None:
+            raw_preview_len = getattr(turn_context, "tool_preview_length", 0)
+        else:
+            raw_preview_len = tool_preview_length
+        self.tool_preview_length = int(raw_preview_len or 0)
+        self._preview_cap = self.tool_preview_length if self.tool_preview_length > 0 else 40
+        if tool_progress_grouping is None:
+            self.tool_progress_grouping = str(getattr(turn_context, "progress_grouping", "accumulate") or "accumulate")
+        else:
+            self.tool_progress_grouping = str(tool_progress_grouping or "accumulate")
         self.metadata = dict(metadata or {})
         if thread_id and "message_thread_id" not in self.metadata:
             self.metadata["message_thread_id"] = thread_id
@@ -274,7 +296,13 @@ class SubagentPulseTicker:
                 self.ticker_task.add_done_callback(bg_tasks.discard)
 
     @staticmethod
-    def safe_read_transcript(path: Optional[Path | str]) -> str:
+    def safe_read_transcript(
+        path: Optional[Path | str],
+        *,
+        tool_progress_details: bool = True,
+        friendly_tool_labels: bool = True,
+        preview_length: int = 40,
+    ) -> str:
         """Safely read tail of live transcript log and map to localized tool action."""
         is_ru = _is_ru_language()
         init_msg = "🚀 Инициализация окружения..." if is_ru else "🚀 Initializing environment..."
@@ -293,14 +321,26 @@ class SubagentPulseTicker:
                 if stat.st_size > read_size:
                     f.seek(stat.st_size - read_size)
                 content = f.read()
-            return SubagentPulseTicker._parse_action_from_content(content)
+            return SubagentPulseTicker._parse_action_from_content(
+                content,
+                tool_progress_details=tool_progress_details,
+                friendly_tool_labels=friendly_tool_labels,
+                preview_length=preview_length,
+            )
         except (FileNotFoundError, OSError, UnicodeDecodeError):
             return running_msg
 
     @staticmethod
-    def _parse_action_from_content(content: str) -> str:
+    def _parse_action_from_content(
+        content: str,
+        *,
+        tool_progress_details: bool = True,
+        friendly_tool_labels: bool = True,
+        preview_length: int = 40,
+    ) -> str:
         """Extract tool action line from transcript tail."""
         is_ru = _is_ru_language()
+        cap = preview_length if preview_length > 0 else 40
         lines = [line.strip() for line in content.splitlines() if line.strip()]
         for line in reversed(lines):
             if " tool " in line and "->" in line:
@@ -309,19 +349,58 @@ class SubagentPulseTicker:
                 match = re.match(r"^([a-zA-Z0-9_-]+)\((.*)\)$", action_part)
                 if match:
                     tool_name, args = match.groups()
-                    tool_label = get_tool_verb(tool_name) or tool_name
-                    arg_preview = args.strip()[:35]
+                    tool_label = (get_tool_verb(tool_name) or tool_name) if friendly_tool_labels else tool_name
+                    if not tool_progress_details:
+                        return f"⚙️ {tool_label}"
+                    arg_preview = args.strip()[:cap]
                     if arg_preview:
                         return f"⚙️ {tool_label} ({arg_preview})"
                     return f"⚙️ {tool_label}"
-                return f"⚙️ {action_part[:40]}"
+                if not tool_progress_details:
+                    name_match = re.match(r"^([a-zA-Z0-9_-]+)\b", action_part)
+                    if name_match:
+                        tool_name = name_match.group(1)
+                        tool_label = (get_tool_verb(tool_name) or tool_name) if friendly_tool_labels else tool_name
+                        return f"⚙️ {tool_label}"
+                    return "⚙️ Выполнение..." if is_ru else "⚙️ Running..."
+                return f"⚙️ {action_part[:cap]}"
             if " result " in line:
-                result_part = line.split(" result ", 1)[-1].strip()
                 prefix = "Обработка" if is_ru else "Processing"
-                return f"⚙️ {prefix}: {result_part[:35]}"
+                if not tool_progress_details:
+                    return f"⚙️ {prefix}"
+                result_part = line.split(" result ", 1)[-1].strip()
+                return f"⚙️ {prefix}: {result_part[:cap]}"
             if " start " in line:
                 return "🚀 Запуск шага..." if is_ru else "🚀 Starting step..."
         return "⚙️ Выполнение..." if is_ru else "⚙️ Running..."
+
+    def _sanitize_action_no_details(self, action: str, *, is_ru: bool) -> str:
+        """Strip arguments/paths from raw subagent.progress action when tool_progress_details=False."""
+        text = str(action or "").strip()
+        running_msg = "⚙️ Выполнение..." if is_ru else "⚙️ Running..."
+        if not text:
+            return running_msg
+        if text.startswith(("🚀", "✅", "❌", "⏳", "⏹️", "⏱️")):
+            return text
+        if text.startswith("⚙️ "):
+            inner = text[2:].strip()
+            if not any(ch in inner for ch in ("(", ":", "/", "\\")):
+                return text
+            text = inner
+        match = re.match(r"^([a-zA-Z0-9_-]+)\(.*\)$", text)
+        if match:
+            tool_name = match.group(1)
+            tool_label = (get_tool_verb(tool_name) or tool_name) if self.friendly_tool_labels else tool_name
+            return f"⚙️ {tool_label}"
+        colon_match = re.match(r"^([a-zA-Z0-9_-]+)\s*[:\-]\s+.*$", text)
+        if colon_match:
+            tool_name = colon_match.group(1)
+            tool_label = (get_tool_verb(tool_name) or tool_name) if self.friendly_tool_labels else tool_name
+            return f"⚙️ {tool_label}"
+        if re.match(r"^[a-zA-Z0-9_-]+$", text):
+            tool_label = (get_tool_verb(text) or text) if self.friendly_tool_labels else text
+            return f"⚙️ {tool_label}"
+        return running_msg
 
     def _format_time(self, seconds: float, *, quantize_secs: int = 0) -> str:
         """Format seconds into MM:SS (optionally quantized down to quantize_secs)."""
@@ -369,7 +448,7 @@ class SubagentPulseTicker:
             if effective_final_status or status != "running":
                 st = effective_final_status or status
                 summary = task.get("summary") or ""
-                summary_snippet = f": {summary[:60]}" if summary else ""
+                summary_snippet = f": {summary[:self._preview_cap]}" if (self.tool_progress_details and summary) else ""
                 if st == "completed":
                     if is_ru:
                         return f"✅ 🔀 Субагент 1/1 завершен{summary_snippet}"
@@ -381,12 +460,21 @@ class SubagentPulseTicker:
             # Running
             action = task.get("last_action") or ""
             if task.get("path"):
-                action = self.safe_read_transcript(task.get("path"))
-            default_goal = "Выполнение задачи" if is_ru else "Running task"
-            goal_short = goal[:45] if goal else default_goal
+                action = self.safe_read_transcript(
+                    task.get("path"),
+                    tool_progress_details=self.tool_progress_details,
+                    friendly_tool_labels=self.friendly_tool_labels,
+                    preview_length=self._preview_cap,
+                )
+            elif not self.tool_progress_details:
+                action = self._sanitize_action_no_details(action, is_ru=is_ru)
             newline = '\n'
             label = "Субагент 1/1" if is_ru else "Subagent 1/1"
-            return f"⏳ 🔀 {label}: {goal_short}{newline}↳ {action}"
+            if self.tool_progress_details:
+                default_goal = "Выполнение задачи" if is_ru else "Running task"
+                goal_short = goal[:self._preview_cap] if goal else default_goal
+                return f"⏳ 🔀 {label}: {goal_short}{newline}↳ {action}"
+            return f"⏳ 🔀 {label}{newline}↳ {action}" 
 
         # Batch mode (N > 1)
         if effective_final_status == "completed" or (active_count == 0 and not effective_final_status):
@@ -420,7 +508,14 @@ class SubagentPulseTicker:
             else:
                 action = task.get("last_action") or ""
                 if task.get("path"):
-                    action = self.safe_read_transcript(task.get("path"))
+                    action = self.safe_read_transcript(
+                        task.get("path"),
+                        tool_progress_details=self.tool_progress_details,
+                        friendly_tool_labels=self.friendly_tool_labels,
+                        preview_length=self._preview_cap,
+                    )
+                elif not self.tool_progress_details:
+                    action = self._sanitize_action_no_details(action, is_ru=is_ru)
                 lines.append(f" • #{display_idx} {action}")
 
         return "\n".join(lines)

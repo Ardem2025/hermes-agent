@@ -1994,15 +1994,29 @@ class BasePlatformAdapter(ABC):
         elif isinstance(event, Commentary) and event.text:
             sink.on_commentary(event.text)
 
-    def format_tool_event(self, event: Any, *, mode: str = "all", preview_max_len: int = 40) -> Optional[str]:
+    def format_tool_event(
+        self,
+        event: Any,
+        *,
+        mode: str = "all",
+        preview_max_len: int = 40,
+        tool_progress_details: bool = True,
+        friendly_tool_labels: bool = True,
+    ) -> Optional[str]:
         """Rendered chrome for a ToolCallChunk, or None to eat it (adapters without editing/rich
         text override to None). ``mode``: tool-progress mode ("all"/"new"/"verbose");
         ``preview_max_len`` mirrors ``tool_preview_length`` (0 = no cap in verbose)."""
         from gateway.stream_events import ToolCallChunk
         if not isinstance(event, ToolCallChunk):
             return None
-        from agent.display import get_tool_emoji, prepare_tool_preview, verbose_tool_args_text
+        from agent.display import get_tool_emoji, get_tool_verb, prepare_tool_preview, verbose_tool_args_text
         emoji, tool = get_tool_emoji(event.tool_name, default='⚙️'), event.tool_name
+        if not tool_progress_details:
+            if friendly_tool_labels:
+                verb = get_tool_verb(event.tool_name)
+                if verb:
+                    return f"{emoji} {verb}"
+            return t("gateway.progress.tool_pending", emoji=emoji, tool=tool)
         if mode == "verbose" and event.args:
             args_str = verbose_tool_args_text(event.args, preview_max_len, self.supports_code_blocks)
             return t("gateway.progress.tool_verbose", emoji=emoji, tool=tool, keys=list(event.args.keys()), args=args_str)

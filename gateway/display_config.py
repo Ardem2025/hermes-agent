@@ -15,6 +15,8 @@ from typing import Any
 # Settings configurable per-platform; other display settings are CLI-only.
 _GLOBAL_DEFAULTS: dict[str, Any] = {
     "tool_progress": "all",
+    "tool_progress_details": True,
+    "friendly_tool_labels": True,
     "tool_progress_grouping": "accumulate",  # "accumulate" = edit one bubble; "separate" = one msg per tool; "replace" = edit one bubble with latest line
     "show_reasoning": False,
     "reasoning_style": "code",  # "code" (💭 **Reasoning:** + fence), "blockquote" ("> "), "subtext" ("-# " Discord)
@@ -182,6 +184,8 @@ def _norm_int(value: Any) -> int:
 
 _NORMALISERS: dict[str, Any] = {
     "tool_progress": _norm_tristate("all", "off", {"off", "new", "all", "verbose", "log", "summary"}, extra_truthy={"edit"}),
+    "tool_progress_details": _norm_bool,
+    "friendly_tool_labels": _norm_bool,
     "show_reasoning": _norm_bool,
     "streaming": _norm_bool,
     "interim_assistant_messages": _norm_bool,

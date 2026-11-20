@@ -28,6 +28,9 @@ class TurnContext:
     progress_mode: str = "off"
     progress_grouping: str = "grouped"
     tool_progress_enabled: bool = False
+    tool_progress_details: bool = True
+    friendly_tool_labels: bool = True
+    tool_preview_length: int = 0
     progress_queue: Any = None
     log_queue: Any = None
     # mutable single-element containers (shared with the outer body)

@@ -277,6 +277,8 @@ class GatewayTurnProgressMixin:
     def _uses_telegram_pulse_ticker(self) -> bool:
         """True when Telegram SubagentPulseTicker owns delegation progress for this turn."""
         ctx = self._ctx
+        if not getattr(ctx, "tool_progress_enabled", False) or getattr(ctx, "log_mode_enabled", False):
+            return False
         if getattr(ctx, "_pulse_ticker", None) is not None:
             return True
         raw_platform = getattr(getattr(ctx, "source", None), "platform", None)
@@ -289,6 +291,8 @@ class GatewayTurnProgressMixin:
     def _handle_subagent_pulse(self, event_type: str, tool_name: str | None, preview: str | None, args: dict | None, kwargs: dict) -> None:
         """Route subagent events to SubagentPulseTicker for Telegram."""
         ctx = self._ctx
+        if not getattr(ctx, "tool_progress_enabled", False) or getattr(ctx, "log_mode_enabled", False):
+            return
         raw_platform = getattr(getattr(ctx, "source", None), "platform", None)
         platform = getattr(raw_platform, "value", raw_platform)
         if platform != "telegram":
@@ -314,6 +318,10 @@ class GatewayTurnProgressMixin:
                     turn_context=ctx,
                     metadata=metadata,
                     cleanup_progress=bool(getattr(ctx, "_cleanup_progress", False)),
+                    tool_progress_details=bool(getattr(ctx, "tool_progress_details", True)),
+                    friendly_tool_labels=bool(getattr(ctx, "friendly_tool_labels", True)),
+                    tool_preview_length=int(getattr(ctx, "tool_preview_length", 0) or 0),
+                    tool_progress_grouping=str(getattr(ctx, "progress_grouping", "accumulate") or "accumulate"),
                 )
                 ctx._pulse_ticker = ticker
                 self._schedule(ticker.start(), "subagent pulse ticker start")
@@ -417,11 +425,13 @@ class GatewayTurnProgressMixin:
         except Exception as err:
             logger.debug("tool-progress onboarding hint failed: %s", err)
 
-    @staticmethod
-    def _preview_cap() -> int:
+    def _preview_cap(self) -> int:
         """tool_preview_length (default 40): the one-line preview budget for "all"/"new" modes."""
-        from agent.display import get_tool_preview_max_len
-        pl = get_tool_preview_max_len()
+        ctx = getattr(self, "_ctx", None)
+        pl = int(getattr(ctx, "tool_preview_length", 0) or 0) if ctx is not None else 0
+        if pl <= 0:
+            from agent.display import get_tool_preview_max_len
+            pl = get_tool_preview_max_len()
         return pl if pl > 0 else 40
 
     def _tool_progress_command_enabled(self) -> bool:
@@ -445,6 +455,8 @@ class GatewayTurnProgressMixin:
         command; "all"/"new" truncate to one line capped at ``tool_preview_length``. Consecutive
         terminal calls drop the repeated header so back-to-back commands render as adjacent blocks.
         """
+        if not getattr(self._ctx, "tool_progress_details", True):
+            return None, None
         if not self._tool_progress_command_enabled():
             return None, None
         if not (
@@ -468,6 +480,16 @@ class GatewayTurnProgressMixin:
         ctx = self._ctx
         from agent.display import get_tool_emoji
         emoji = get_tool_emoji(tool_name, default="⚙️")
+        friendly = bool(getattr(ctx, "friendly_tool_labels", True))
+        if not getattr(ctx, "tool_progress_details", True):
+            ctx.last_was_terminal_block[0] = False
+            from agent.display import get_tool_verb
+            verb = get_tool_verb(tool_name) if friendly else None
+            line = f"{emoji} {verb}" if verb else f"{emoji} {tool_name}"
+            if ctx.progress_mode == "verbose":
+                ctx.progress_queue.put(line)
+                return None
+            return line
         try:
             adapter = self._runner._delivery_adapter_for(ctx.source)
         except Exception:
@@ -481,7 +503,10 @@ class GatewayTurnProgressMixin:
                 from agent.display import get_tool_preview_max_len, verbose_tool_args_text
                 # tool_preview_length 0 (default) = no truncation in verbose mode; the user asked
                 # for full detail and platform message-length limits handle the rest.
-                args_str = verbose_tool_args_text(args, get_tool_preview_max_len(),
+                pl = int(getattr(ctx, "tool_preview_length", 0) or 0)
+                if pl <= 0:
+                    pl = get_tool_preview_max_len()
+                args_str = verbose_tool_args_text(args, pl,
                                                   getattr(adapter, "supports_code_blocks", False))
                 code = t("gateway.progress.tool_verbose", emoji=emoji, tool=tool_name, keys=list(args.keys()), args=args_str)
             elif code is None:
@@ -498,11 +523,11 @@ class GatewayTurnProgressMixin:
         preview = adapter.format_tool_preview(prepared) if adapter is not None else prepared.text
         # Friendly labels: human-phrased line for built-in tools ("🔍 Searching the web for ...")
         # by prefixing the verb onto the computed preview, so the command/url/query is kept.
-        verb = get_tool_verb(tool_name)
+        verb = get_tool_verb(tool_name) if friendly else None
         if not verb:
             return t("gateway.progress.tool_preview", emoji=emoji, tool=tool_name, preview=preview)
         drop_preview = verb_drops_preview(tool_name) and not (tool_name == "terminal" and self._tool_progress_command_enabled())
-        return f"{emoji} {verb}" if drop_preview else f"{emoji} {verb}{tool_verb_connector(tool_name)}{preview}"
+        return f"{emoji} {verb}" if drop_preview else f"{emoji} {verb}{tool_verb_connector(tool_name)}{preview}" 
 
     def _progress_emit(self, msg: str) -> None:
         """Dedup consecutive identical lines (execute_code boilerplate), then route to the native

@@ -914,6 +914,9 @@ DEFAULT_CONFIG = {
         # Human-phrased status labels for built-in tools ("Reading <file>") in CLI spinner and
         # gateway/desktop tool-progress; custom/plugin/MCP tools use the raw preview.
         "friendly_tool_labels": True,
+        # Show tool arguments, previews, terminal blocks, and subagent goals/summaries in gateway
+        # progress; false keeps only the action label/status.
+        "tool_progress_details": True,
         # CLI-only post-turn line: "⋯ 12.4s · edited 2 files +18 -3 · read 4 files · ran 3
         # commands". Never in quiet/non-interactive or gateway surfaces (own footer).
         "turn_summary": True,
