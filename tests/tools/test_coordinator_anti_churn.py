@@ -71,7 +71,8 @@ def test_bdd3_active_siblings_and_no_reply_in_notifications(monkeypatch):
     assert 'deleg_running' in single_msg
     assert 'Foreign session goal' not in single_msg
     assert 'SECRET_CONTEXT_MUST_NOT_LEAK' not in single_msg
-    assert 'NO_REPLY' in single_msg
+    assert 'NO_REPLY' not in single_msg
+    assert 'Briefly report the current status or act on this result, then end your turn and wait for the remaining subagents to finish.' in single_msg
     assert "delegate_task(action='list')" in single_msg
 
     batch_msg = format_process_notification({
@@ -83,7 +84,9 @@ def test_bdd3_active_siblings_and_no_reply_in_notifications(monkeypatch):
         'results': [{'task_index': 0, 'status': 'completed', 'summary': 'OK'}],
     })
     assert 'Still running in this session (1):' in batch_msg
-    assert 'NO_REPLY' in batch_msg
+    assert 'NO_REPLY' not in batch_msg
+    assert 'Briefly report the current status or act on this result, then end your turn and wait for the remaining subagents to finish.' in batch_msg
+    assert "delegate_task(action='list')" in batch_msg
 
     # When no siblings remain running
     ad._records['deleg_running']['status'] = 'completed'
@@ -96,6 +99,9 @@ def test_bdd3_active_siblings_and_no_reply_in_notifications(monkeypatch):
         'goal': 'Finished task',
     })
     assert 'No other background subagents are currently running in this session.' in idle_msg
+    assert 'NO_REPLY' not in idle_msg
+    assert 'Act on this result or summarize the outcome for the user.' in idle_msg
+    assert "delegate_task(action='list')" in idle_msg
     assert async_delegation_batch_display_text(3) == '3 Subagent Tasks Completed'
 
 

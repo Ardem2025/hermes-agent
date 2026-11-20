@@ -347,7 +347,7 @@ def _format_async_delegation(evt: dict) -> str:
 
 
 def _active_siblings_lines(evt: dict) -> list[str]:
-    """Compact list of still-running sibling delegations in the same session + NO_REPLY guidance."""
+    """Compact list of still-running sibling delegations in the same session + anti-polling guidance."""
     try:
         from tools.async_delegation import list_active_delegations_for_session
         siblings = list_active_delegations_for_session(
@@ -366,12 +366,17 @@ def _active_siblings_lines(evt: dict) -> list[str]:
             age_part = f" [{_format_age(s['elapsed_s'])}]" if s.get("elapsed_s") is not None else ""
             goal_part = f": {s['goal']}" if s.get("goal") else ""
             lines.append(f"- {s['delegation_id']}{sid_part}{age_part}{goal_part}")
+        guidance = (
+            "Do NOT call delegate_task(action='list') or read subagent transcripts to check progress. "
+            "Briefly report the current status or act on this result, then end your turn and wait for the remaining subagents to finish."
+        )
     else:
         lines.append("No other background subagents are currently running in this session.")
-    lines.append(
-        "Do NOT call delegate_task(action='list') or read subagent transcripts to check progress. "
-        "If there is nothing new to report to the user until remaining subagents finish, reply with exactly NO_REPLY."
-    )
+        guidance = (
+            "Do NOT call delegate_task(action='list') or read subagent transcripts to check progress. "
+            "Act on this result or summarize the outcome for the user."
+        )
+    lines.append(guidance)
     return lines
 
 
