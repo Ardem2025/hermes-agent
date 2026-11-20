@@ -123,3 +123,98 @@ class _UnboundedThreadExecutor(concurrent.futures.Executor):
         if wait:
             for t in threads:
                 t.join()
+
+
+class BoundedThreadExecutor(_UnboundedThreadExecutor):
+    """Bounded worker-thread executor with idle-thread reuse and clean shutdown.
+
+    Caps concurrent worker threads at ``max_workers`` while queuing excess tasks
+    in a FIFO queue instead of spawning unbounded OS threads.
+    """
+
+    def __init__(
+        self,
+        max_workers: int = 16,
+        thread_name_prefix: str = "",
+        idle_timeout: float = _IDLE_TIMEOUT_S,
+    ):
+        super().__init__(thread_name_prefix=thread_name_prefix, idle_timeout=idle_timeout)
+        self._max_workers = max(1, int(max_workers))
+        self._pending: queue.SimpleQueue = queue.SimpleQueue()
+        self._pending_count = 0
+
+    @property
+    def max_workers(self) -> int:
+        return self._max_workers
+
+    def submit(self, fn, /, *args, **kwargs):
+        fut: concurrent.futures.Future = concurrent.futures.Future()
+        item = (fut, fn, args, kwargs)
+        with self._lock:
+            if self._shutdown:
+                raise RuntimeError("cannot schedule new futures after shutdown")
+            if self._idle:
+                worker = self._idle.pop()
+                self._threads.add(worker.thread)
+                worker.inbox.put(item)
+                return fut
+            if len(self._threads) < self._max_workers:
+                self._n += 1
+                worker = _Worker()
+                t = threading.Thread(
+                    target=self._work,
+                    args=(worker, item),
+                    name=f"{self._prefix}_{self._n}",
+                    daemon=True,
+                )
+                worker.thread = t
+                t.start()
+                self._threads.add(t)
+                return fut
+            self._pending.put(item)
+            self._pending_count += 1
+        return fut
+
+    def _park(self, worker: _Worker):
+        from gateway.turn_thread_reset import reset_reused_thread_state
+
+        try:
+            reset_reused_thread_state()
+            reusable = True
+        except Exception:
+            logger.warning("turn worker state reset failed; retiring the thread", exc_info=True)
+            reusable = False
+        with self._lock:
+            if self._shutdown or not reusable:
+                self._threads.discard(worker.thread)
+                return None
+            if self._pending_count > 0:
+                self._pending_count -= 1
+                return self._pending.get_nowait()
+            self._threads.discard(worker.thread)
+            self._idle.append(worker)
+        try:
+            return worker.inbox.get(timeout=self._idle_timeout)
+        except queue.Empty:
+            with self._lock:
+                if worker in self._idle:
+                    self._idle.remove(worker)
+                    return None
+            return worker.inbox.get()
+
+    def shutdown(self, wait: bool = True, *, cancel_futures: bool = False):
+        with self._lock:
+            self._shutdown = True
+            threads = list(self._threads)
+            idle, self._idle = self._idle, []
+            if cancel_futures:
+                while self._pending_count > 0:
+                    self._pending_count -= 1
+                    fut, *_ = self._pending.get_nowait()
+                    fut.cancel()
+        for worker in idle:
+            worker.inbox.put(None)
+        if wait:
+            for t in threads:
+                t.join()
+

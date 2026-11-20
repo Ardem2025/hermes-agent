@@ -23,7 +23,24 @@ _active_subagents: dict[str, dict[str, Any]] = {}
 # after the summary was delivered); their completion notifications reach the parent via the shared completion_queue
 # and need delegation attribution even though the live registry entry is gone.
 _RECENT_SUBAGENTS_CAP = 200
+_RECENT_SUBAGENTS_TTL_S = 900.0
 _recent_subagents: dict[str, dict[str, Any]] = {}
+
+
+def _prune_recent_subagents_locked(now: float) -> None:
+    """Evict expired (> TTL) and excess (> CAP) entries from ``_recent_subagents``. Caller holds ``_active_subagents_lock``."""
+    expired = [
+        sid
+        for sid, rec in _recent_subagents.items()
+        if isinstance(rec.get("ended_at"), (int, float))
+        and not isinstance(rec.get("ended_at"), bool)
+        and (now - float(rec["ended_at"])) > _RECENT_SUBAGENTS_TTL_S
+    ]
+    for sid in expired:
+        _recent_subagents.pop(sid, None)
+    while len(_recent_subagents) > _RECENT_SUBAGENTS_CAP:
+        _recent_subagents.pop(next(iter(_recent_subagents)), None)
+
 
 def get_subagent_attribution(task_id: Optional[str]) -> Optional[dict[str, Any]]:
     """``{subagent_id, goal, delegation_id}`` for a process task_id that belongs to a live or recently-finished child
@@ -31,10 +48,48 @@ def get_subagent_attribution(task_id: Optional[str]) -> Optional[dict[str, Any]]
     if not task_id or not isinstance(task_id, str):
         return None
     with _active_subagents_lock:
+        _prune_recent_subagents_locked(time.time())
         record = _active_subagents.get(task_id) or _recent_subagents.get(task_id)
     if record is None:
         return None
     return {"subagent_id": task_id, "goal": record.get("goal"), "delegation_id": record.get("delegation_id")}
+
+
+def _mark_subagent_terminal(
+    subagent_id: str,
+    *,
+    status: str,
+    duration_seconds: Optional[float] = None,
+    ended_at: Optional[float] = None,
+    failure_reason: Optional[str] = None,
+    error: Optional[str] = None,
+    agent: Any = None,
+) -> None:
+    """Stamp terminal fields onto a live ``_active_subagents`` record before ``_unregister_subagent`` runs."""
+    if not subagent_id:
+        return
+    with _active_subagents_lock:
+        record = _active_subagents.get(subagent_id)
+        if record is None or not (agent is None or record.get("agent") is agent):
+            return
+        final_ended_at = (
+            float(ended_at)
+            if isinstance(ended_at, (int, float)) and not isinstance(ended_at, bool)
+            else time.time()
+        )
+        record["status"] = status
+        record["ended_at"] = final_ended_at
+        record["completed_at"] = final_ended_at
+        if isinstance(duration_seconds, (int, float)) and not isinstance(duration_seconds, bool):
+            record["duration_seconds"] = float(duration_seconds)
+        else:
+            started = record.get("started_at")
+            if isinstance(started, (int, float)) and not isinstance(started, bool):
+                record["duration_seconds"] = round(max(0.0, final_ended_at - float(started)), 1)
+        if failure_reason is not None:
+            record["failure_reason"] = failure_reason
+        if error is not None:
+            record["error"] = error
 
 def set_spawn_paused(paused: bool) -> bool:
     """Globally block/unblock NEW delegate_task spawns (active children keep running). Returns the new state."""
@@ -55,8 +110,15 @@ def _register_subagent(record: dict[str, Any]) -> None:
     with _active_subagents_lock:
         _active_subagents[sid] = record
 
-def _unregister_subagent(subagent_id: str, *, agent: Any = None) -> None:
-    """Drop the live record (exact agent identity when given) and keep a bounded attribution stub."""
+def _unregister_subagent(
+    subagent_id: str,
+    *,
+    agent: Any = None,
+    status: Optional[str] = None,
+    ended_at: Optional[float] = None,
+    duration_seconds: Optional[float] = None,
+) -> None:
+    """Drop the live record (exact agent identity when given) and keep a bounded terminal/attribution stub."""
     with _active_subagents_lock:
         record = _active_subagents.get(subagent_id)
         if record is None or not (agent is None or record.get("agent") is agent):
@@ -65,9 +127,71 @@ def _unregister_subagent(subagent_id: str, *, agent: Any = None) -> None:
         sid = record.get("subagent_id")
         if not sid:
             return
-        _recent_subagents[sid] = {k: record.get(k) for k in ("goal", "delegation_id", "owner_agent_session_id")}
-        while len(_recent_subagents) > _RECENT_SUBAGENTS_CAP:
-            _recent_subagents.pop(next(iter(_recent_subagents)), None)
+        raw_status = status if status is not None else record.get("status")
+        final_status = str(raw_status or "completed")
+        if final_status.lower() == "running":
+            final_status = "completed"
+        raw_ended = ended_at if ended_at is not None else (record.get("ended_at") or record.get("completed_at"))
+        final_ended_at = (
+            float(raw_ended)
+            if isinstance(raw_ended, (int, float)) and not isinstance(raw_ended, bool)
+            else time.time()
+        )
+        raw_duration = duration_seconds if duration_seconds is not None else record.get("duration_seconds")
+        started = record.get("started_at")
+        if isinstance(raw_duration, (int, float)) and not isinstance(raw_duration, bool):
+            final_duration: Optional[float] = float(raw_duration)
+        elif isinstance(started, (int, float)) and not isinstance(started, bool):
+            final_duration = round(max(0.0, final_ended_at - float(started)), 1)
+        else:
+            final_duration = None
+        _recent_subagents[sid] = {
+            "subagent_id": sid,
+            "parent_id": record.get("parent_id"),
+            "depth": record.get("depth", 0),
+            "goal": record.get("goal"),
+            "delegation_id": record.get("delegation_id"),
+            "model": record.get("model"),
+            "owner_agent_session_id": record.get("owner_agent_session_id"),
+            "owner_session_id": record.get("owner_session_id"),
+            "parent_session_id": record.get("parent_session_id"),
+            "gateway_session_key": record.get("gateway_session_key"),
+            "status": final_status,
+            "started_at": started if isinstance(started, (int, float)) and not isinstance(started, bool) else None,
+            "ended_at": final_ended_at,
+            "completed_at": final_ended_at,
+            "duration_seconds": final_duration,
+            "tool_count": record.get("tool_count", 0),
+            "last_tool": record.get("last_tool"),
+            "failure_reason": record.get("failure_reason"),
+            "error": record.get("error"),
+        }
+        _prune_recent_subagents_locked(final_ended_at)
+
+
+def get_recent_subagents_for_session(
+    session_id: str,
+    *,
+    exclude_ids: Optional[set[str]] = None,
+) -> list[dict[str, Any]]:
+    """Return recently finished subagent records matching ``session_id`` (excluding still-active IDs)."""
+    if not session_id:
+        return []
+    excluded = set(exclude_ids or ())
+    with _active_subagents_lock:
+        _prune_recent_subagents_locked(time.time())
+        active_ids = set(_active_subagents.keys())
+        matches: list[dict[str, Any]] = []
+        for sid, rec in _recent_subagents.items():
+            if sid in active_ids or sid in excluded:
+                continue
+            owner_agent_sid = str(rec.get("owner_agent_session_id") or "")
+            owner_sid = str(rec.get("owner_session_id") or "")
+            parent_sid = str(rec.get("parent_session_id") or "")
+            gw_key = str(rec.get("gateway_session_key") or "")
+            if session_id in (owner_agent_sid, owner_sid, parent_sid, gw_key):
+                matches.append(dict(rec))
+        return matches
 
 def _close_subagent_steering(subagent_id: str, agent: Any) -> Optional[str]:
     """Atomically close steer acceptance and drain its final durable artifact. ``steer_subagent`` holds the same

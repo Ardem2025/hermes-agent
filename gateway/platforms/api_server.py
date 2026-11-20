@@ -13,6 +13,7 @@ import hashlib
 import hmac
 import itertools
 import json
+from collections import OrderedDict
 from contextlib import contextmanager, nullcontext, suppress
 from contextvars import ContextVar, copy_context
 from functools import partial, wraps
@@ -27,11 +28,12 @@ import uuid
 from datetime import datetime, timezone, UTC
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 from zoneinfo import ZoneInfo
 
 MEDIA_URL_TTL_SECONDS = 86400
 MAX_UPLOAD_BYTES = 20 * 1024 * 1024
+MAX_TELEGRAM_SYNC_LOCKS = 1024
 
 
 class _UploadTooLargeError(Exception):
@@ -333,6 +335,12 @@ def _transform_media_paths(text: str, api_key: Optional[str] = None) -> str:
         logger.debug("Error transforming media paths: %s", e)
 
     return text
+
+
+async def _transform_media_paths_async(text: str, api_key: Optional[str] = None) -> str:
+    """Async wrapper around ``_transform_media_paths`` offloading filesystem I/O to a thread."""
+    return await asyncio.to_thread(_transform_media_paths, text, api_key)
+
 
 # _resolve_request_profile result for a /p/<profile>/ prefix this gateway does not serve (-> 404);
 # distinct from None (no prefix / multiplexing off -> default profile).
@@ -970,6 +978,8 @@ if AIOHTTP_AVAILABLE:
         if adapter is not None:
             if not adapter._origin_allowed(origin):
                 return web.Response(status=403)
+            if request.method in {"POST", "PUT", "PATCH", "DELETE"} and not adapter._csrf_request_allowed(request):
+                return web.Response(status=403)
             cors_headers = adapter._cors_headers_for_origin(origin)
         if request.method == "OPTIONS":
             if cors_headers is None:
@@ -1174,6 +1184,10 @@ class _IdempotencyCache:
             def _clear_inflight(done_task: asyncio.Task[Any]) -> None:
                 if self._inflight.get(inflight_key) is done_task:
                     self._inflight.pop(inflight_key, None)
+                if not done_task.cancelled():
+                    exc = done_task.exception()
+                    if exc is not None:
+                        logger.error("Idempotency cache background task failed: %s", exc, exc_info=exc)
             task.add_done_callback(_clear_inflight)
         return await asyncio.shield(task)
 
@@ -1273,71 +1287,6 @@ class _ProviderAuthResolutionError(RuntimeError):
         return t("platform.api_server.provider_error_line", label=label, error=self)
 
 
-class _SessionEventQueue:
-    """Ordered SSE event queue for one /api/sessions/{id}/chat/stream run. ``payload`` stamps
-    session_id/run_id/seq/ts; ``enqueue`` is executor-thread safe (hops onto the owning loop)."""
-
-    def __init__(self, session_id: str, run_id: str):
-        self.loop = asyncio.get_running_loop()
-        self.queue: asyncio.Queue[Optional[tuple[str, dict[str, Any]]]] = asyncio.Queue(maxsize=500)
-        self.session_id = session_id
-        self.run_id = run_id
-        self.seq = 0
-        # Cross-thread puts handed to the loop and not yet applied. The loop does not order them
-        # against the worker future's completion, so the turn's terminal frames wait on flush().
-        self._inflight = 0
-        self._inflight_lock = threading.Lock()
-
-    def payload(self, name: str, payload: dict[str, Any]) -> tuple[str, dict[str, Any]]:
-        self.seq += 1
-        payload.setdefault("session_id", self.session_id)
-        payload.setdefault("run_id", self.run_id)
-        payload.setdefault("seq", self.seq)
-        payload.setdefault("ts", time.time())
-        return name, payload
-
-    def enqueue(self, name: str, payload: dict[str, Any]) -> None:
-        event = self.payload(name, payload)
-        try:
-            running_loop = asyncio.get_running_loop()
-        except RuntimeError:
-            running_loop = None
-        if running_loop is self.loop:
-            if self.queue.full():
-                try:
-                    self.queue.get_nowait()
-                except Exception:
-                    pass
-            self.queue.put_nowait(event)
-            return
-        with self._inflight_lock:
-            self._inflight += 1
-
-        def _apply() -> None:
-            try:
-                self.queue.put_nowait(event)
-            finally:
-                self._settle_one()
-        try:
-            self.loop.call_soon_threadsafe(_apply)
-        except RuntimeError:  # loop closed: the stream is gone, nothing left to deliver to
-            self._settle_one()
-
-    def _settle_one(self) -> None:
-        with self._inflight_lock:
-            self._inflight -= 1
-
-    async def flush(self) -> None:
-        """Wait until every event a worker thread enqueued has reached the queue. Call it before
-        the terminal frames: a commentary/delta/approval handed over before the worker returned
-        otherwise lands after ``done``/``None`` and the reader never sees it."""
-        while True:
-            with self._inflight_lock:
-                if not self._inflight:
-                    return
-            await asyncio.sleep(0)
-
-
 def _room_grant_delegate(name: str):
     """Adapter method forwarding to ``api_server_room_grants.<name>`` (looked up at call time so
     test patches on that module take effect) with this module's error/profile bindings."""
@@ -1357,7 +1306,18 @@ def _run_route_delegate(name: str):
     return _handler
 
 
-class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
+from gateway.platforms.api_server_chat import _SessionChatMixin, _SessionEventQueue
+from gateway.platforms.api_server_sessions import _SessionsMixin
+from gateway.platforms.api_server_telegram_sync import _SessionCoordinator, _TelegramSyncMixin
+
+
+class APIServerAdapter(
+    _SessionsMixin,
+    _TelegramSyncMixin,
+    _SessionChatMixin,
+    OpenAICompatRoutesMixin,
+    BasePlatformAdapter,
+):
     """aiohttp server routing OpenAI-format requests through hermes-agent's AIAgent."""
 
     # Stateless request/response (``send()`` is a stub): async-delivery tools must not promise
@@ -1585,490 +1545,6 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             logger.exception("Error handling file upload: %s", e)
             return web.json_response(_openai_error(f"Upload error: {e}"), status=500)
 
-    def _get_telegram_sync_lock(self, session_id: str) -> asyncio.Lock:
-        lock = self._telegram_sync_locks.get(session_id)
-        if lock is None:
-            lock = asyncio.Lock()
-            self._telegram_sync_locks[session_id] = lock
-        return lock
-
-    def _telegram_delivery_enabled(self, session_id: str) -> bool:
-        """Return the binding's durable delivery preference (unbound is off)."""
-        db = self._ensure_session_db()
-        if not db:
-            return False
-        try:
-            if hasattr(db, "apply_telegram_topic_migration"):
-                db.apply_telegram_topic_migration()
-            binding = db.get_telegram_topic_binding_by_session(session_id=session_id)
-        except Exception:
-            logger.debug("Failed to get Telegram delivery state for session %s", session_id, exc_info=True)
-            return False
-        return bool(binding and binding.get("delivery_enabled", True))
-
-    def is_telegram_bound(self, session_id: str) -> bool:
-        """Return True if session has an active Telegram topic binding with delivery enabled."""
-        return self._telegram_delivery_enabled(session_id)
-
-    def _pulse_registry(self) -> dict[str, dict[str, Any]]:
-        reg = getattr(self, "_session_pulse_tickers", None)
-        if reg is None:
-            reg = {}
-            setattr(self, "_session_pulse_tickers", reg)
-        return reg
-
-    def _pulse_locks(self) -> dict[str, asyncio.Lock]:
-        locks = getattr(self, "_session_pulse_locks", None)
-        if locks is None:
-            locks = {}
-            setattr(self, "_session_pulse_locks", locks)
-        return locks
-
-    def _pulse_lock_for(self, session_id: str) -> asyncio.Lock:
-        locks = self._pulse_locks()
-        lock = locks.get(session_id)
-        if lock is None:
-            lock = asyncio.Lock()
-            locks[session_id] = lock
-        return lock
-
-    def _pulse_prefs(self) -> dict[str, bool]:
-        prefs = getattr(self, "_session_pulse_prefs", None)
-        if prefs is None:
-            prefs = {}
-            setattr(self, "_session_pulse_prefs", prefs)
-        return prefs
-
-    def _ensure_pulse_loop(self) -> Optional[asyncio.AbstractEventLoop]:
-        loop = getattr(self, "_pulse_loop", None)
-        if loop is not None and not loop.is_closed():
-            return loop
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            return None
-        setattr(self, "_pulse_loop", loop)
-        return loop
-
-    def _resolve_telegram_cleanup_progress(self, telegram_adapter: Any) -> bool:
-        if telegram_adapter is None:
-            return False
-        has_real_delete = getattr(type(telegram_adapter), "delete_message", None) not in (
-            None,
-            BasePlatformAdapter.delete_message,
-        )
-        if not has_real_delete:
-            return False
-        runner = getattr(self, "gateway_runner", None)
-        user_config = getattr(runner, "user_config", None) if runner is not None else None
-        if not isinstance(user_config, dict):
-            user_config = {}
-            try:
-                from gateway.run import _load_gateway_config
-                loaded = _load_gateway_config()
-                if isinstance(loaded, dict):
-                    user_config = loaded
-            except Exception:
-                logger.debug("Failed to load gateway config for cleanup_progress", exc_info=True)
-        return bool(resolve_display_setting(user_config, "telegram", "cleanup_progress"))
-
-    def _prune_stale_pulse_entries(self, now: Optional[float] = None) -> None:
-        tickers = self._pulse_registry()
-        locks = self._pulse_locks()
-        prefs = self._pulse_prefs()
-        ts = time.monotonic() if now is None else now
-        stale_sids: list[str] = []
-        for sid, entry in list(tickers.items()):
-            last_at = float(entry.get("last_event_at") or 0.0)
-            if ts - last_at <= _SESSION_PULSE_TTL_SECONDS:
-                continue
-            ticker = entry.get("ticker")
-            is_active = bool(getattr(ticker, "active", False))
-            if not is_active or (ts - last_at > _SESSION_PULSE_TTL_SECONDS):
-                stale_sids.append(sid)
-        for sid in stale_sids:
-            entry = tickers.pop(sid, None)
-            if entry is not None:
-                start_task = entry.get("start_task")
-                if start_task is not None and not start_task.done():
-                    start_task.cancel()
-                ticker = entry.get("ticker")
-                if ticker is not None and getattr(ticker, "active", False):
-                    try:
-                        asyncio.create_task(ticker.stop(status="interrupted"))
-                    except Exception:
-                        pass
-            lock = locks.get(sid)
-            if lock is not None and not lock.locked():
-                locks.pop(sid, None)
-            prefs.pop(sid, None)
-        for sid in list(locks.keys()):
-            if sid not in tickers and not locks[sid].locked():
-                locks.pop(sid, None)
-        for sid in list(prefs.keys()):
-            if sid not in tickers:
-                # Keep explicit prefs only while session has an active entry or recent turn;
-                # stale prefs without entries are safe to prune when locks are gone.
-                if sid not in locks:
-                    pass
-
-    async def _start_pulse_entry(
-        self,
-        session_id: str,
-        target_entry: dict[str, Any],
-        prev_stop_task: Optional[asyncio.Task],
-    ) -> None:
-        try:
-            async with self._pulse_lock_for(session_id):
-                if prev_stop_task is not None and not prev_stop_task.done():
-                    try:
-                        await prev_stop_task
-                    except Exception:
-                        logger.debug("Previous pulse ticker stop_task failed (non-fatal)", exc_info=True)
-                await target_entry["ticker"].start()
-        except Exception:
-            logger.debug("Failed to start SubagentPulseTicker for session %s (non-fatal)", session_id, exc_info=True)
-        finally:
-            target_entry["starting"] = False
-
-    async def _stop_pulse_entry(
-        self,
-        session_id: str,
-        target_entry: dict[str, Any],
-        status: str,
-        summary: str,
-        *,
-        force: bool = False,
-    ) -> None:
-        try:
-            async with self._pulse_lock_for(session_id):
-                start_task = target_entry.get("start_task")
-                if start_task is not None and not start_task.done():
-                    try:
-                        await start_task
-                    except Exception:
-                        logger.debug("Pulse ticker start_task failed before stop (non-fatal)", exc_info=True)
-                ticker = target_entry["ticker"]
-                if ticker.active or ticker.ticker_task is not None:
-                    if force:
-                        await ticker.stop(status=status, summary=summary, force=True)
-                    else:
-                        await ticker.stop(status=status, summary=summary)
-        except Exception:
-            logger.debug("Failed to stop SubagentPulseTicker for session %s (non-fatal)", session_id, exc_info=True)
-        finally:
-            tickers = self._pulse_registry()
-            if tickers.get(session_id) is target_entry:
-                tickers.pop(session_id, None)
-
-    def _apply_pulse_event_on_loop(
-        self,
-        session_id: str,
-        event_type: str,
-        tool_name: str | None,
-        preview: str | None,
-        args: Any,
-        kwargs: dict[str, Any],
-    ) -> None:
-        if not session_id or getattr(self, "_disconnected", False):
-            return
-        source_platform = kwargs.get("source_platform")
-        if kwargs.get("telegram_pulse_owned") or source_platform in (
-            Platform.TELEGRAM,
-            Platform.TELEGRAM.value,
-            "telegram",
-        ):
-            return
-        prefs = self._pulse_prefs()
-        if session_id in prefs:
-            allowed = bool(prefs[session_id])
-        else:
-            allowed = bool(self.is_telegram_bound(session_id))
-        if not allowed:
-            return
-
-        now = time.monotonic()
-        self._prune_stale_pulse_entries(now)
-        tickers = self._pulse_registry()
-        task_idx = kwargs.get("task_index", 0)
-        delegation_id = kwargs.get("delegation_id")
-        subagent_id = kwargs.get("subagent_id")
-
-        if event_type == "subagent.start":
-            entry = tickers.get(session_id)
-            need_new_ticker = (
-                entry is None
-                or entry["stopped"]
-                or (not entry["ticker"].active and not entry["starting"])
-            )
-            if need_new_ticker:
-                try:
-                    _runner, telegram = self._telegram_runner_and_adapter()
-                    if not telegram:
-                        return
-                    db = self._ensure_session_db()
-                    if not db:
-                        return
-                    if hasattr(db, "apply_telegram_topic_migration"):
-                        db.apply_telegram_topic_migration()
-                    binding = db.get_telegram_topic_binding_by_session(session_id=session_id)
-                    if not binding or not binding.get("delivery_enabled", True):
-                        return
-                    chat_id = binding.get("chat_id")
-                    if not chat_id:
-                        return
-                    thread_id = binding.get("thread_id") or binding.get("message_thread_id")
-                    metadata = {"thread_id": str(thread_id)} if thread_id else {}
-                    cleanup_progress = self._resolve_telegram_cleanup_progress(telegram)
-                    from gateway.subagent_pulse_ticker import SubagentPulseTicker
-                    ticker = SubagentPulseTicker(
-                        adapter=telegram,
-                        chat_id=chat_id,
-                        thread_id=thread_id,
-                        metadata=metadata,
-                        cleanup_progress=cleanup_progress,
-                    )
-                except Exception:
-                    logger.debug("Failed to initialize SubagentPulseTicker for session %s", session_id, exc_info=True)
-                    return
-                prev_stop_task = entry.get("stop_task") if entry is not None else None
-                entry = {
-                    "ticker": ticker,
-                    "starting": True,
-                    "stopped": False,
-                    "start_task": None,
-                    "stop_task": None,
-                    "terminal_status": None,
-                    "terminal_summary": "",
-                    "last_event_at": now,
-                    "cleanup_progress": cleanup_progress,
-                }
-                tickers[session_id] = entry
-                entry["start_task"] = asyncio.create_task(
-                    self._start_pulse_entry(session_id, entry, prev_stop_task)
-                )
-            else:
-                entry["last_event_at"] = now
-            goal = kwargs.get("goal") or preview or ""
-            transcript = kwargs.get("live_transcript") or kwargs.get("transcript_path")
-            entry["ticker"].on_subagent_start(
-                task_idx,
-                goal,
-                transcript,
-                delegation_id=delegation_id,
-                subagent_id=subagent_id,
-            )
-        elif event_type in ("subagent.progress", "subagent_progress"):
-            entry = tickers.get(session_id)
-            if entry is None or entry["stopped"]:
-                return
-            entry["last_event_at"] = now
-            action = kwargs.get("action") or preview or tool_name or ""
-            entry["ticker"].on_subagent_progress(
-                task_idx,
-                action,
-                delegation_id=delegation_id,
-                subagent_id=subagent_id,
-            )
-        elif event_type == "subagent.complete":
-            entry = tickers.get(session_id)
-            if entry is None or entry["stopped"]:
-                return
-            entry["last_event_at"] = now
-            status = kwargs.get("status") or "completed"
-            summary = kwargs.get("summary") or preview
-            ticker = entry["ticker"]
-            ticker.on_subagent_complete(
-                task_idx,
-                status,
-                summary,
-                delegation_id=delegation_id,
-                subagent_id=subagent_id,
-            )
-            active_left = any(t.get("status") == "running" for t in ticker.tasks.values())
-            if not active_left:
-                failed_task = next(
-                    (t for t in ticker.tasks.values() if t.get("status") in _SUBAGENT_FAILURE_STATUSES),
-                    None,
-                )
-                if failed_task is not None:
-                    terminal_status = str(failed_task.get("status"))
-                    terminal_summary = str(failed_task.get("summary") or summary or "")
-                else:
-                    terminal_status = status if status in _SUBAGENT_FAILURE_STATUSES else "completed"
-                    terminal_summary = str(summary or "")
-                entry["terminal_status"] = terminal_status
-                entry["terminal_summary"] = terminal_summary
-                entry["stopped"] = True
-                if (ticker.active or entry["starting"]) and entry["stop_task"] is None:
-                    entry["stop_task"] = asyncio.create_task(
-                        self._stop_pulse_entry(session_id, entry, terminal_status, terminal_summary)
-                    )
-
-    def handle_session_subagent_pulse(
-        self,
-        session_id: str,
-        event_type: str,
-        tool_name: str | None = None,
-        preview: str | None = None,
-        args: Any = None,
-        **kwargs,
-    ) -> None:
-        """Thread-safe session-level sink for subagent.* pulse events."""
-        if not session_id or event_type not in _SUBAGENT_PULSE_EVENTS:
-            return
-        if getattr(self, "_disconnected", False):
-            return
-        loop = self._ensure_pulse_loop()
-        if loop is None or loop.is_closed():
-            return
-        try:
-            running_loop = asyncio.get_running_loop()
-        except RuntimeError:
-            running_loop = None
-        payload_kwargs = dict(kwargs)
-        if running_loop is loop:
-            self._apply_pulse_event_on_loop(session_id, event_type, tool_name, preview, args, payload_kwargs)
-        else:
-            try:
-                loop.call_soon_threadsafe(
-                    self._apply_pulse_event_on_loop,
-                    session_id,
-                    event_type,
-                    tool_name,
-                    preview,
-                    args,
-                    payload_kwargs,
-                )
-            except RuntimeError:
-                logger.debug("Pulse loop closed before scheduling event for %s", session_id, exc_info=True)
-
-    def _is_preserved(self, session_id: str, initial_flag: bool) -> bool:
-        """Dynamic disconnect preservation: initial flag or dynamic Telegram binding check."""
-        if initial_flag:
-            return True
-        try:
-            return bool(self.is_telegram_bound(session_id))
-        except Exception:
-            return initial_flag
-
-    def _user_facing_message_text(self, message: Any) -> Optional[str]:
-        if not isinstance(message, dict):
-            return None
-        content = message.get("content")
-        if isinstance(content, str):
-            return content
-        if isinstance(content, list):
-            parts = []
-            for p in content:
-                if isinstance(p, dict) and p.get("type") == "text":
-                    parts.append(p.get("text", ""))
-            return "\n".join(parts)
-        return str(content) if content is not None else None
-
-    def _telegram_sync_text(self, message: Any, text: Optional[str]) -> str:
-        res = text or ""
-        if isinstance(message, dict) and message.get("display_kind") == "failed_turn":
-            return f"⚠️ {res}"
-        return res
-
-    async def _forward_to_telegram(self, session_id: str, role: str, content: Any) -> Dict[str, Any]:
-        """Forward a web turn to its bound Telegram topic."""
-        db = self._ensure_session_db()
-        if not db:
-            return {"status": "unavailable", "error": "session_db_unavailable"}
-        try:
-            binding = db.get_telegram_topic_binding_by_session(session_id=session_id)
-        except Exception as e:
-            logger.debug("Failed to get Telegram topic binding for session %s: %s", session_id, e)
-            return {"status": "failed", "error": "binding_lookup_failed"}
-
-        if not binding:
-            return {"status": "unbound"}
-
-        chat_id = binding.get("chat_id")
-        thread_id = binding.get("thread_id")
-        if not chat_id or not thread_id:
-            return {"status": "invalid_binding", "error": "missing_chat_or_thread"}
-
-        _, telegram_adapter = self._telegram_runner_and_adapter()
-        if not telegram_adapter:
-            return {"status": "unavailable", "error": "telegram_not_connected"}
-
-        if not content:
-            return {"status": "skipped", "reason": "empty_content"}
-
-        if role == "user":
-            formatted_content = f"👤 **User:**\n{content}"
-        else:
-            formatted_content = content
-
-        try:
-            result = await telegram_adapter.send(
-                chat_id=str(chat_id),
-                content=formatted_content,
-                metadata={"thread_id": str(thread_id)}
-            )
-            if getattr(result, "success", True) is False:
-                return {"status": "failed", "error": str(getattr(result, "error", "telegram_send_failed"))}
-            return {"status": "sent", "chat_id": str(chat_id), "thread_id": str(thread_id)}
-        except Exception as e:
-            logger.exception("Failed to send forwarded message to Telegram chat %s, thread %s: %s", chat_id, thread_id, e)
-            return {"status": "failed", "error": str(e)[:500]}
-
-    async def _sync_telegram_history(self, session_id: str) -> Dict[str, Any]:
-        """Incrementally deliver a bound transcript and durably checkpoint rows."""
-        lock = self._get_telegram_sync_lock(session_id)
-        async with lock:
-            delivery = {"mode": "incremental", "status": "completed", "sent": 0, "failed": 0, "skipped": 0}
-            db = self._ensure_session_db()
-            if not db:
-                delivery.update(status="not_requested")
-                return delivery
-            binding = db.get_telegram_topic_binding_by_session(session_id=session_id)
-            if not binding or not binding.get("delivery_enabled", True):
-                delivery.update(status="not_requested")
-                return delivery
-            checkpoint = binding.get("last_synced_message_id")
-            resolved_id = db.resolve_resume_session_id(session_id) if hasattr(db, "resolve_resume_session_id") else session_id
-            raw_messages = db.get_messages(resolved_id) if hasattr(db, "get_messages") else []
-
-            if checkpoint is None:
-                max_id = max((m.get("id") for m in raw_messages if isinstance(m.get("id"), int)), default=None)
-                if max_id is not None and hasattr(db, "advance_telegram_topic_sync_checkpoint"):
-                    db.advance_telegram_topic_sync_checkpoint(session_id=session_id, message_id=max_id)
-                delivery["skipped"] = len(raw_messages)
-                return delivery
-
-            for message in raw_messages:
-                message_id = message.get("id")
-                if not isinstance(message_id, int) or (checkpoint is not None and message_id <= checkpoint):
-                    continue
-                if message.get("platform_message_id"):
-                    delivery["skipped"] += 1
-                    if hasattr(db, "advance_telegram_topic_sync_checkpoint"):
-                        db.advance_telegram_topic_sync_checkpoint(session_id=session_id, message_id=message_id)
-                    continue
-
-                text = self._user_facing_message_text(message)
-                if text is None:
-                    delivery["skipped"] += 1
-                    if hasattr(db, "advance_telegram_topic_sync_checkpoint"):
-                        db.advance_telegram_topic_sync_checkpoint(session_id=session_id, message_id=message_id)
-                    continue
-
-                result = await self._forward_to_telegram(
-                    session_id, str(message.get("role")).lower(), self._telegram_sync_text(message, text)
-                )
-                if result.get("status") in {"sent", "skipped"}:
-                    delivery["sent" if result.get("status") == "sent" else "skipped"] += 1
-                    if hasattr(db, "advance_telegram_topic_sync_checkpoint"):
-                        db.advance_telegram_topic_sync_checkpoint(session_id=session_id, message_id=message_id)
-                    continue
-                delivery["failed"] += 1
-                delivery["status"] = "partial" if delivery["sent"] or delivery["skipped"] else "failed"
-                break
-            return delivery
 
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.API_SERVER)
@@ -2109,8 +1585,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         self._session_dbs: dict[str, Any] = {}  # per-profile-home SessionDB cache
         self._session_db_cache_lock = threading.Lock()
         self._session_db_cache_closed = False
-        self._immediately_forwarded_user_hashes: dict[str, set[str]] = {}
-        self._telegram_sync_locks: dict[str, asyncio.Lock] = {}
+        self._session_coordinator = _SessionCoordinator(self, max_sync_locks=MAX_TELEGRAM_SYNC_LOCKS)
+        self._telegram_sync_locks: OrderedDict[str, asyncio.Lock] = self._session_coordinator.telegram_sync_locks
         self._session_pulse_tickers: dict[str, dict[str, Any]] = {}
         self._session_pulse_locks: dict[str, asyncio.Lock] = {}
         self._session_pulse_prefs: dict[str, bool] = {}
@@ -2128,9 +1604,11 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         # gateway.api_server.max_concurrent_runs; 0 disables the cap.
         # Bounds CPU / memory / upstream-LLM-quota exhaustion from a request flood (#7483).
         self._inflight_agent_runs: int = 0
-        # Every agent inside _run_agent() for shutdown interrupt, keyed by id() (the strong ref
-        # keeps the id() from recycling); distinct from the run_id-keyed _active_run_agents.
-        self._shutdown_interruptible_agents: dict[int, Any] = {}
+        # Canonical registry of every active adapter-owned agent keyed by id() (the strong ref
+        # keeps the id() from recycling); ``_shutdown_interruptible_agents`` aliases it for
+        # backward compatibility while ``_active_run_agents`` indexes by run_id.
+        self._active_agents_by_id: dict[int, Any] = self._session_coordinator.active_agents_by_id
+        self._shutdown_interruptible_agents: dict[int, Any] = self._active_agents_by_id
         # One memory provider per session across requests (this surface rebuilds the agent per turn).
         self._memory_sessions = ApiServerMemorySessions()
         self.gateway_runner: Optional[Any] = None  # set by gateway/run.py
@@ -2155,6 +1633,49 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         except Exception:
             return 0
 
+    def _register_active_agent(
+        self, agent: Any, run_id: Optional[str] = None, session_id: Optional[str] = None
+    ) -> None:
+        """Register an active agent in the canonical registry and optional run_id/session index."""
+        coord = getattr(self, "_session_coordinator", None)
+        if coord is not None:
+            coord.register_active_agent(agent, run_id=run_id, session_id=session_id)
+            return
+        if agent is None:
+            return
+        registry = getattr(self, "_active_agents_by_id", None)
+        if not isinstance(registry, dict):
+            registry = {}
+            self._active_agents_by_id = registry
+        registry[id(agent)] = agent
+        shutdown_reg = getattr(self, "_shutdown_interruptible_agents", None)
+        if isinstance(shutdown_reg, dict) and shutdown_reg is not registry:
+            shutdown_reg[id(agent)] = agent
+        if run_id:
+            self._active_run_agents[run_id] = agent
+
+    def _unregister_active_agent(
+        self, agent: Any = None, run_id: Optional[str] = None, session_id: Optional[str] = None
+    ) -> None:
+        """Remove an agent from the run_id index and canonical registry when no run holds it."""
+        coord = getattr(self, "_session_coordinator", None)
+        if coord is not None:
+            coord.unregister_active_agent(agent=agent, run_id=run_id, session_id=session_id)
+            return
+        if run_id:
+            popped = self._active_run_agents.pop(run_id, None)
+            if agent is None:
+                agent = popped
+        if agent is not None:
+            still_in_run = any(a is agent for a in self._active_run_agents.values())
+            if not still_in_run:
+                registry = getattr(self, "_active_agents_by_id", None)
+                if isinstance(registry, dict):
+                    registry.pop(id(agent), None)
+                shutdown_reg = getattr(self, "_shutdown_interruptible_agents", None)
+                if isinstance(shutdown_reg, dict) and shutdown_reg is not registry:
+                    shutdown_reg.pop(id(agent), None)
+
     def interrupt_active_runs(self, reason: str) -> int:
         """Interrupt every adapter-owned agent during shutdown (they are not in
         ``GatewayRunner._running_agents``): exactly the set the drain waits on. Returns count."""
@@ -2162,10 +1683,17 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             run_id for run_id, task in self._active_run_tasks.items() if not task.done()
         } | set(self._active_run_agents)
         _api_runs._mark_shutdown_interrupted_runs(self, run_ids)
-        # Dedupe by identity: an agent in both registries must be interrupted once.
-        agents = {id(agent): agent for agent in (
-            *self._active_run_agents.values(), *self._shutdown_interruptible_agents.values())
-            if agent is not None}
+        # Iterate the canonical registry (plus legacy/test-double dicts merged by identity).
+        agents: dict[int, Any] = {}
+        for source in (
+            getattr(self, "_active_agents_by_id", None),
+            getattr(self, "_shutdown_interruptible_agents", None),
+            getattr(self, "_active_run_agents", None),
+        ):
+            if isinstance(source, dict):
+                for agent in source.values():
+                    if agent is not None:
+                        agents[id(agent)] = agent
         interrupted = 0
         for agent in agents.values():
             try:
@@ -2371,6 +1899,38 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
     def _origin_allowed(self, origin: str) -> bool:
         """Allow non-browser clients and explicitly configured browser origins."""
         return not origin or "*" in self._cors_origins or origin in self._cors_origins
+
+    def _csrf_request_allowed(self, request: web.Request) -> bool:
+        """Reject cross-site browser mutations lacking a Bearer token."""
+        auth_header = request.headers.get("Authorization", "")
+        if auth_header.startswith("Bearer ") and auth_header[7:].strip():
+            return True
+        origin = (request.headers.get("Origin") or "").strip()
+        referer = (request.headers.get("Referer") or "").strip()
+        cookie = (request.headers.get("Cookie") or "").strip()
+        sec_fetch_site = (request.headers.get("Sec-Fetch-Site") or "").strip().lower()
+        if not (origin or referer or cookie or sec_fetch_site):
+            return True
+        if sec_fetch_site == "cross-site":
+            return False
+        candidate = origin
+        if not candidate and referer:
+            parsed_ref = urlsplit(referer)
+            if not parsed_ref.scheme or not parsed_ref.netloc:
+                return False
+            candidate = f"{parsed_ref.scheme}://{parsed_ref.netloc}"
+        if not candidate:
+            return sec_fetch_site in {"same-origin", "same-site"}
+        if candidate.lower() == "null":
+            return False
+        if "*" in self._cors_origins or candidate in self._cors_origins:
+            return True
+        host = (request.headers.get("Host") or "").strip().lower()
+        if host:
+            parsed_cand = urlsplit(candidate)
+            if parsed_cand.netloc and parsed_cand.netloc.lower() == host:
+                return True
+        return False
 
     @staticmethod
     def _clean_log_value(value: Any, *, max_len: int = 200) -> str:
@@ -3456,1675 +3016,11 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
 
     # -- /api/sessions: thin client/session resource API -------------------------------
 
-    @staticmethod
-    def _parse_nonnegative_int(value: Any, default: int, maximum: int) -> int:
-        try:
-            parsed = int(value)
-        except (TypeError, ValueError):
-            return default
-        return default if parsed < 0 else min(parsed, maximum)
-
-    @staticmethod
-    def _session_db_unavailable() -> web.Response:
-        return _error_response("Session database unavailable", 503, code="session_db_unavailable")
-
-    def _get_active_subagents_for_session(self, session_id: str) -> list[dict[str, Any]]:
-        if not session_id:
-            return []
-        active = []
-        try:
-            from tools.delegate_tool_registry import _active_subagents, _active_subagents_lock
-            with _active_subagents_lock:
-                for sid, rec in _active_subagents.items():
-                    owner_sid = str(rec.get("owner_agent_session_id") or rec.get("owner_session_id") or "")
-                    parent_sid = str(rec.get("parent_session_id") or "")
-                    gw_key = str(rec.get("gateway_session_key") or "")
-                    is_match = (
-                        owner_sid == session_id
-                        or parent_sid == session_id
-                        or gw_key == session_id
-                    )
-                    if is_match:
-                        started = rec.get("started_at")
-                        active.append({
-                            "subagent_id": rec.get("subagent_id", sid),
-                            "parent_id": rec.get("parent_id"),
-                            "depth": rec.get("depth", 0),
-                            "goal": rec.get("goal", ""),
-                            "model": rec.get("model", ""),
-                            "status": rec.get("status", "running"),
-                            "last_tool": rec.get("last_tool"),
-                            "tool_count": rec.get("tool_count", 0),
-                            "started_at": started if isinstance(started, (int, float)) and not isinstance(started, bool) else None,
-                            "running_seconds": round(time.time() - started, 1) if isinstance(started, (int, float)) and not isinstance(started, bool) else None,
-                        })
-        except Exception as e:
-            logger.debug("Failed to query live subagents for session %s: %s", session_id, e)
-        return active
-
-    def _session_response(
-        self,
-        session: dict[str, Any],
-        *,
-        last_msg: Optional[dict[str, Any]] = None,
-    ) -> dict[str, Any]:
-        """Return a stable, client-safe session representation."""
-        safe_keys = (
-            "id", "source", "user_id", "model", "title", "started_at", "ended_at", "end_reason",
-            "message_count", "tool_call_count", "input_tokens", "output_tokens",
-            "cache_read_tokens", "cache_write_tokens", "reasoning_tokens", "estimated_cost_usd",
-            "actual_cost_usd", "api_call_count", "parent_session_id", "last_active", "preview",
-            "_lineage_root_id", "pinned", "archived", "hidden")
-        payload = {key: session.get(key) for key in safe_keys if key in session}
-        # SQLite stores the flags as 0/1.
-        payload.update(
-            {f: bool(payload[f]) for f in ("pinned", "archived", "hidden") if f in payload})
-        # Full system prompts / model_config never cross the client API; only their presence.
-        payload["has_system_prompt"] = bool(session.get("system_prompt"))
-        payload["has_model_config"] = bool(session.get("model_config"))
-        raw_model_config = session.get("model_config")
-        try:
-            model_config = (
-                json.loads(raw_model_config)
-                if isinstance(raw_model_config, str)
-                else raw_model_config
-            )
-        except (TypeError, json.JSONDecodeError):
-            model_config = None
-        # Exact-id consumers may inspect/resume delegate children even though
-        # list endpoints intentionally omit them. Project only the provenance
-        # bit the client needs so it cannot accidentally promote such a row
-        # into an ordinary session list; never expose the model snapshot.
-        payload["is_internal_child"] = bool(
-            isinstance(model_config, dict)
-            and model_config.get("_delegate_from") is not None
-        )
-
-        session_id = str(session.get("id") or "")
-        active_subagents = self._get_active_subagents_for_session(session_id)
-        running_subagents = [
-            s for s in active_subagents
-            if str(s.get("status") or "running").lower() == "running"
-        ]
-        has_async = False
-        try:
-            from tools.async_delegation import has_active_or_pending_for_session
-            has_async = has_active_or_pending_for_session(session_key=session_id, origin_ui_session_id=session_id, parent_session_id=session_id)
-        except Exception as e:
-            logger.debug("Failed to check async delegations for session %s: %s", session_id, e)
-        has_active_subagents = bool(running_subagents or has_async)
-
-        active_run = None
-        if session_id and hasattr(self, "_run_statuses"):
-            for r_id, r_info in list(self._run_statuses.items()):
-                if str(r_info.get("session_id") or "") == session_id and r_info.get("status") in {"queued", "running", "waiting_for_approval"}:
-                    active_run = (r_id, r_info)
-                    break
-        waiting_approval = False
-        if active_run:
-            r_id, r_info = active_run
-            run_status = str(r_info.get("status") or "")
-            if run_status == "waiting_for_approval":
-                waiting_approval = True
-                payload["is_generating"] = False
-                payload["active_run_id"] = r_id
-                payload["tool_status"] = r_info.get("tool_status") or "Ожидает подтверждения..."
-                payload["current_tool"] = r_info.get("current_tool")
-            else:
-                payload["is_generating"] = True
-                payload["active_run_id"] = r_id
-                payload["tool_status"] = r_info.get("tool_status") or "Ассистент думает над задачей..."
-                payload["current_tool"] = r_info.get("current_tool")
-        else:
-            is_gen = False
-            tool_status = None
-            current_tool = None
-            runner = getattr(self, "gateway_runner", None)
-            if runner:
-                adapters_to_check = list(getattr(runner, "adapters", {}).values())
-                prof_adapters = getattr(runner, "_profile_adapters", {})
-                if isinstance(prof_adapters, dict):
-                    for p_dict in prof_adapters.values():
-                        if isinstance(p_dict, dict):
-                            adapters_to_check.extend(p_dict.values())
-                chat_id_val = str(session.get("chat_id") or "")
-                for ad in adapters_to_check:
-                    active_sess = getattr(ad, "_active_sessions", {})
-                    if not isinstance(active_sess, dict):
-                        continue
-                    for sk, guard in active_sess.items():
-                        sk_str = str(sk)
-                        is_match = False
-                        if session_id and (sk_str == session_id or sk_str.endswith(f":{session_id}")):
-                            is_match = True
-                        elif chat_id_val and (sk_str == chat_id_val or sk_str.endswith(f":{chat_id_val}")):
-                            is_match = True
-                        elif session.get("gateway_session_key") and sk_str == str(session.get("gateway_session_key")):
-                            is_match = True
-
-                        if is_match:
-                            is_gen = True
-                            tool_status = (getattr(ad, "_last_status", {}) or {}).get(sk) or "Ассистент думает над задачей..."
-                            break
-                    if is_gen:
-                        break
-            if not is_gen and has_active_subagents:
-                is_gen = True
-                if running_subagents and running_subagents[0].get("last_tool"):
-                    last_tool = str(running_subagents[0]["last_tool"])
-                    verb = None
-                    try:
-                        from agent.display import get_tool_verb
-                        verb = get_tool_verb(last_tool)
-                    except Exception:
-                        verb = None
-                    if verb:
-                        tool_status = f"Подзадача: {verb}..."
-                    else:
-                        tool_status = f"Подзадача выполняет {last_tool}..."
-                elif running_subagents:
-                    tool_status = f"Выполняются подзадачи ({len(running_subagents)} в работе)..."
-                else:
-                    tool_status = "Выполняется фоновая подзадача..."
-                current_tool = "delegate_task"
-
-            payload["is_generating"] = is_gen
-            payload["active_run_id"] = None
-            payload["tool_status"] = tool_status
-            payload["current_tool"] = current_tool
-
-        payload["has_active_subagents"] = has_active_subagents
-        active_subagents_count = len(running_subagents)
-        payload["active_subagents_count"] = active_subagents_count
-        payload["active_subagents"] = active_subagents
-        payload["subagents"] = active_subagents
-
-        last_role = last_msg.get("role") if isinstance(last_msg, dict) else None
-        last_content = str(last_msg.get("content") or "") if isinstance(last_msg, dict) else ""
-        last_has_tool_calls = bool(last_msg.get("has_tool_calls")) if isinstance(last_msg, dict) else False
-        last_finish_reason = str(last_msg.get("finish_reason") or "") if isinstance(last_msg, dict) else ""
-
-        last_read_at = session.get("last_read_at")
-        if last_read_at is not None:
-            last_active_ts = (
-                session.get("last_active")
-                or (last_msg.get("timestamp") if isinstance(last_msg, dict) else None)
-                or session.get("started_at")
-            )
-            session_unread = float(last_active_ts or 0) > float(last_read_at)
-        else:
-            session_unread = False
-
-        is_generating = bool(payload.get("is_generating", False))
-        is_gen = bool(is_generating or has_active_subagents or active_subagents_count > 0)
-        waiting_reason: Optional[str] = None
-        is_unread_completion = False
-
-        if is_gen:
-            status = "running"
-        elif waiting_approval:
-            status = "waiting_input"
-            waiting_reason = "approval"
-        elif last_role == "assistant" and not last_has_tool_calls and last_finish_reason != "tool_calls":
-            if _assistant_expects_user_reply(last_content):
-                status = "waiting_input"
-                waiting_reason = "question"
-            elif session_unread:
-                status = "completed"
-                is_unread_completion = True
-            else:
-                status = "idle"
-        elif session.get("ended_at") or session.get("end_reason"):
-            if session_unread:
-                status = "completed"
-                is_unread_completion = True
-            else:
-                status = "idle"
-        else:
-            status = "idle"
-
-        payload["status"] = status
-        payload["waiting_reason"] = waiting_reason
-        payload["last_role"] = last_role
-        payload["is_unread_completion"] = is_unread_completion
-        return payload
-
-    def _resolve_message_media(self, text: str, *, api_key: Optional[str] = None) -> str:
-        resolved_key = api_key if api_key is not None else self._expected_api_key()
-        return _resolve_message_media_text(
-            text,
-            api_key=resolved_key,
-            ref_secret=getattr(self, "_media_ref_secret", _PROCESS_MEDIA_REF_SECRET),
-        )
-
-    @_DualMethod
-    def _message_response(self, message: dict[str, Any]) -> dict[str, Any]:
-        message = _project_client_message(message)
-        safe_keys = (
-            "id", "session_id", "role", "content", "tool_call_id", "tool_calls", "tool_name",
-            "timestamp", "token_count", "finish_reason", "reasoning", "reasoning_content",
-            "display_kind")
-        res = {key: message.get(key) for key in safe_keys if key in message}
-        if res.get("role") in ("assistant", "user") and isinstance(res.get("content"), str):
-            if self is not None:
-                res["content"] = self._resolve_message_media(res["content"])
-            else:
-                res["content"] = _resolve_message_media_text(res["content"])
-        return res
-
-    async def _read_json_body(self, request: web.Request) -> tuple[dict[str, Any], Optional[web.Response]]:
-        try:
-            body = await request.json()
-        except Exception:
-            return {}, _error_response("Invalid JSON in request body", 400)
-        if not isinstance(body, dict):
-            return {}, _error_response("Request body must be a JSON object", 400)
-        return body, None
-
-    async def _get_existing_session_or_404(self, session_id: str) -> tuple[Optional[dict[str, Any]], Optional[web.Response]]:
-        db = await self._ensure_session_db_async()
-        if db is None:
-            return None, self._session_db_unavailable()
-        session = await asyncio.to_thread(db.get_session, session_id)
-        if not session:
-            return None, _error_response(f"Session not found: {session_id}", 404, code="session_not_found")
-        return session, None
-
-    async def _conversation_history_for_session(self, session_id: str) -> list[dict[str, Any]]:
-        db = await self._ensure_session_db_async()
-        if db is None:
-            return []
-        try:
-            return await asyncio.to_thread(db.get_messages_as_conversation, session_id)
-        except Exception as exc:
-            logger.warning("Failed to load session history for %s: %s", session_id, exc)
-            return []
-
-    async def run_internal_session_turn(self, *, session_id: str, text: str, profile: str,
-                                        notification_category: str = "result",
-                                        delegation_id: str = "",
-                                        delivery_notice: str = "") -> None:
-        """Run one background wake turn against a raw session id IN-PROCESS (no HTTP, no API key);
-        see ``api_server_runs.run_internal_session_turn``."""
-        await _api_runs.run_internal_session_turn(
-            self, session_id=session_id, text=text, profile=profile,
-            notification_category=notification_category,
-            delegation_id=delegation_id, delivery_notice=delivery_notice,
-            _api_server=sys.modules[__name__])
-
-    @_require_auth
-    async def _handle_list_sessions(self, request: web.Request) -> web.Response:
-        """GET /api/sessions — list persisted Hermes sessions."""
-        db = await self._ensure_session_db_async()
-        if db is None:
-            return self._session_db_unavailable()
-        limit = self._parse_nonnegative_int(request.query.get("limit"), default=50, maximum=200)
-        offset = self._parse_nonnegative_int(request.query.get("offset"), default=0, maximum=1_000_000)
-        source = request.query.get("source") or None
-        exclude_sources_raw = request.query.get("exclude_sources")
-        exclude_sources = [s.strip() for s in exclude_sources_raw.split(",") if s.strip()] if exclude_sources_raw else None
-        include_children = _coerce_request_bool(request.query.get("include_children"), default=False)
-        # Exact-title lookup (`hermes peer dm` -> canonical "Bot Chat"). include_hidden is honored
-        # ONLY with a title filter: a blanket hidden listing stays off this client surface.
-        title_filter = (request.query.get("title") or "").strip() or None
-        include_hidden = bool(title_filter) and _coerce_request_bool(
-            request.query.get("include_hidden"), default=False)
-
-        async def _list() -> list:
-            # include_pinned back-fills pins past the recency window; search_query pushes the
-            # title needle into SQL (substring) so a hidden/old row is found, exact match below.
-            rows = await asyncio.to_thread(
-                db.list_sessions_rich, source=source, exclude_sources=exclude_sources, limit=limit, offset=offset,
-                include_children=include_children, order_by_last_active=True, include_pinned=True,
-                search_query=title_filter, include_hidden=include_hidden)
-            if title_filter:
-                rows = [s for s in rows if (s.get("title") or "").strip() == title_filter]
-            return rows
-
-        sessions = await _list() or (await reset_local_title_owner(db, title_filter, include_hidden, source))
-        if title_filter and not sessions:
-            # A canonical Bot Chat auto-archived by the orphan reaper would make `hermes peer dm`
-            # mint transient sessions: resurrect and re-list; deliberate archives stay put.
-            try:
-                # Recoverable-archive resurrection (#92687): a canonical Bot Chat archived by the ws-orphan
-                # reaper / older agent cleanup is invisible to list_sessions_rich (include_archived=False),
-                # which would fail `hermes peer dm` resolution and mint transient sessions — same accident
-                # the tui_gateway lookups heal.
-                from tools.bot_mode_probe import BOT_CHAT_TITLE
-
-                def _resurrect() -> bool:
-                    # Lookup + unarchive (a WRITE with the full write patience) as one worker-thread
-                    # hop: a contended lock parks this thread, never the event loop (#113772).
-                    stale = db.get_session_by_title(title_filter)
-                    return bool(stale and stale.get("archived") and db.unarchive_recoverable_session(stale["id"]))
-
-                if title_filter == BOT_CHAT_TITLE and await asyncio.to_thread(_resurrect):
-                    sessions = await _list()
-            except Exception:
-                pass  # resolution degrades to today's no-row behavior
-        session_ids = [str(s.get("id") or "") for s in sessions if s.get("id")]
-        last_msgs = (
-            await asyncio.to_thread(db.session_last_messages, session_ids)
-            if session_ids and hasattr(db, "session_last_messages")
-            else {}
-        )
-        # Back-filled pins arrive PAST the limit: counting them would report a page that doesn't exist.
-        windowed = sum(1 for s in sessions if not s.get("pinned"))
-        return web.json_response({
-            "object": "list",
-            "data": [self._session_response(s, last_msg=last_msgs.get(str(s.get("id") or ""))) for s in sessions],
-            "limit": limit, "offset": offset, "has_more": windowed >= limit})
-
-    @_require_auth
-    async def _handle_create_session(self, request: web.Request) -> web.Response:
-        """POST /api/sessions -- create an empty Hermes session row. Existence check, insert and
-        title handling run as ONE off-loop write so concurrent same-id creates can't both 201."""
-        body, err = await self._read_json_body(request)
-        if err:
-            return err
-        from gateway.platforms.api_server_bot_chat import create_peer_bot_chat
-        if (bot_chat := await create_peer_bot_chat(self, body)) is not None:
-            return bot_chat  # the owner minted the canonical Bot Chat (#139370)
-        db = await self._ensure_session_db_async()
-        if db is None:
-            return self._session_db_unavailable()
-        raw_id = body.get("id") or body.get("session_id")
-        session_id = str(raw_id).strip() if raw_id else f"api_{int(time.time())}_{uuid.uuid4().hex[:8]}"
-        from gateway.session import _is_path_unsafe
-        if not session_id or re.search(r'[\r\n\x00]', session_id) or _is_path_unsafe(session_id):
-            return _error_response("Invalid session ID", 400, code="invalid_session_id")
-        if len(session_id) > self._MAX_SESSION_HEADER_LEN:
-            return _error_response("Session ID too long", 400, code="invalid_session_id")
-        system_prompt = body.get("system_prompt")
-        if system_prompt is not None and not isinstance(system_prompt, str):
-            return _error_response("system_prompt must be a string", 400, code="invalid_system_prompt")
-        source = self._normalize_session_source(body.get("source") or "api_server")
-        runtime_request = self._session_runtime_request_from_body(body)
-        lock_error = self._runtime_lock_error(runtime_request)
-        if lock_error is not None:
-            return lock_error
-        requested = runtime_request.get("requested") or {}
-        # The normalized requested["model"] (prefix split, virtual alias nulled) — the raw body
-        # would persist "hermes-agent" and later send it to the provider literally.
-        model_name = self._clean_runtime_id(requested.get("model")) or None
-        model_config = None
-        if requested.get("model") or requested.get("provider"):
-            model_config = {"browser_model_lock": {
-                "provider": requested.get("provider") or "", "model": requested.get("model") or "",
-                "model_options": runtime_request.get("model_options") or {},
-                "route_source": runtime_request.get("route_source") or "",
-                "confirmed": bool(runtime_request.get("require_model_lock")),
-                "updated_at": time.time()}}
-        raw_source = str(body.get("source") or "").strip().lower()
-        if raw_source == "webui" or source == "webui":
-            model_config = dict(model_config) if isinstance(model_config, dict) else {}
-            model_config["auto_resume_on_delegation"] = True
-        title = body.get("title")
-
-        def _atomic(conn):
-            from hermes_state_mutation_retirement import create_conflict
-            if conflict := create_conflict(conn, session_id):  # one BEGIN IMMEDIATE write: a racing create sees the row
-                return None, conflict
-            conn.execute(
-                """INSERT INTO sessions (
-                   id, source, model, model_config, system_prompt, started_at
-                ) VALUES (?, ?, ?, ?, ?, ?)""",
-                (session_id, source, model_name, json.dumps(model_config) if model_config else None,
-                 system_prompt, time.time()))
-            if title is not None:
-                clean_title = db.sanitize_title(str(title))
-                if clean_title:
-                    try:
-                        db._resolve_title_conflict(conn, session_id, clean_title)
-                    except ValueError as exc:  # the DB's uniqueness rule; undo the INSERT
-                        conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
-                        return None, f"title:{exc}"
-                conn.execute("UPDATE sessions SET title = ? WHERE id = ?", (clean_title, session_id))
-            session_row = conn.execute("SELECT * FROM sessions WHERE id = ?", (session_id,)).fetchone()
-            return (dict(session_row) if session_row else {
-                "id": session_id, "source": source, "model": model_name, "title": title}), None
-        session, err = await asyncio.to_thread(db._execute_write, _atomic)
-        if isinstance(err, tuple):  # a live row, or a deleted id's fence: refused now, not on every turn
-            return _error_response(f"{err[1]}: {session_id}", 409, code=err[0])
-        if err and err.startswith("title:"):
-            return _error_response(err[len("title:"):], 400, code="invalid_title")
-        return web.json_response({"object": "hermes.session", "session": self._session_response(session)}, status=201)
-
-    async def _last_message_for_session(self, session_id: str) -> Optional[dict[str, Any]]:
-        if not session_id:
-            return None
-        db = await self._ensure_session_db_async()
-        if db is None or not hasattr(db, "session_last_messages"):
-            return None
-        try:
-            last_msgs = await asyncio.to_thread(db.session_last_messages, [session_id])
-            return last_msgs.get(session_id)
-        except Exception:
-            return None
-
-    @_require_auth
-    async def _handle_get_session(self, request: web.Request) -> web.Response:
-        """GET /api/sessions/{session_id}."""
-        session_id = request.match_info["session_id"]
-        session, err = await self._get_existing_session_or_404(session_id)
-        if err:
-            return err
-        last_msg = await self._last_message_for_session(str(session.get("id") or session_id))
-        return web.json_response({"object": "hermes.session", "session": self._session_response(session, last_msg=last_msg)})
-
-    @_require_auth
-    async def _handle_patch_session(self, request: web.Request) -> web.Response:
-        """PATCH /api/sessions/{session_id} — update client-safe session metadata."""
-        session_id = request.match_info["session_id"]
-        session, err = await self._get_existing_session_or_404(session_id)
-        if err:
-            return err
-        body, err = await self._read_json_body(request)
-        if err:
-            return err
-        # pinned/archived/unread are durable desktop-sidebar flags.
-        unknown = sorted(set(body) - {"title", "end_reason", "pinned", "archived", "hidden", "unread"})
-        if unknown:
-            return _error_response(
-                f"Unsupported session fields: {', '.join(unknown)}", 400, code="unsupported_session_field")
-        for flag in ("pinned", "archived", "hidden", "unread"):
-            if flag in body and not isinstance(body[flag], bool):
-                return _error_response(f"'{flag}' must be a boolean", 400, code="invalid_session_field")
-        db = await self._ensure_session_db_async()
-        if db is None:
-            return self._session_db_unavailable()
-        if "title" in body:
-            try:
-                await asyncio.to_thread(
-                    db.set_session_title, session_id, "" if body["title"] is None else str(body["title"]))
-            except ValueError as exc:
-                return _error_response(str(exc), 400, code="invalid_title")
-        # Pinned last: set_session_pinned clears hidden, so a pin in the same request
-        # wins over an explicit hidden (same order as the dashboard's _RENAME_FLAG_SETTERS).
-        for flag, setter in (("archived", db.set_session_archived), ("hidden", db.set_session_hidden),
-                             ("pinned", db.set_session_pinned)):
-            if flag in body:
-                await asyncio.to_thread(setter, session_id, body[flag])
-        if "unread" in body:
-            await asyncio.to_thread(db.set_session_read, session_id, read=not body["unread"])
-        if body.get("end_reason"):
-            await asyncio.to_thread(db.end_session, session_id, str(body["end_reason"]))
-        session = await asyncio.to_thread(db.get_session, session_id) or session
-        last_msg = await self._last_message_for_session(str(session.get("id") or session_id))
-        return web.json_response({"object": "hermes.session", "session": self._session_response(session, last_msg=last_msg)})
-
-    @_require_auth
-    async def _handle_read_session(self, request: web.Request) -> web.Response:
-        """POST /api/sessions/{session_id}/read — mark session read up to now."""
-        session_id = request.match_info["session_id"]
-        session, err = await self._get_existing_session_or_404(session_id)
-        if err:
-            return err
-        db = await self._ensure_session_db_async()
-        if db is None:
-            return self._session_db_unavailable()
-        await asyncio.to_thread(db.set_session_read, session_id, True)
-        session = await asyncio.to_thread(db.get_session, session_id) or session
-        last_msg = await self._last_message_for_session(str(session.get("id") or session_id))
-        return web.json_response({"object": "hermes.session", "session": self._session_response(session, last_msg=last_msg)})
-
-    @_require_auth
-    async def _handle_delete_session(self, request: web.Request) -> web.Response:
-        """DELETE /api/sessions/{session_id}."""
-        session_id = request.match_info["session_id"]
-        _session, err = await self._get_existing_session_or_404(session_id)
-        if err:
-            return err
-        db = await self._ensure_session_db_async()
-        if db is None:
-            return self._session_db_unavailable()
-        # Same profile home the DB was resolved from (the profile middleware scopes
-        # get_hermes_home() for this request) — without it the transcript/dump scrub is skipped.
-        sessions_dir = None
-        try:
-            from hermes_constants import get_hermes_home
-            sessions_dir = Path(get_hermes_home()) / "sessions"
-        except Exception:
-            logger.debug("sessions dir unavailable for delete of %s", session_id, exc_info=True)
-        try:
-            deleted = await asyncio.to_thread(
-                db.delete_session, session_id, sessions_dir=sessions_dir, exclude_active_write_guards=True)
-        except SessionActiveWriteGuardError as exc:
-            return _error_response(str(exc), 409, code="session_active_turn")
-        if deleted:
-            # A hard delete must also drop the gateway's durable channel→session routing entries
-            # for the id, or the next inbound message resolves the SAME id and run_agent's
-            # INSERT OR IGNORE resurrects the deleted row (#42422).
-            runner = self.gateway_runner or request.app.get("gateway_runner")
-            store = getattr(runner, "session_store", None)
-            if store is not None:
-                await asyncio.to_thread(store.remove_by_session_id, session_id)
-            # Retirement erased the chat's image references; bytes nothing else holds go too. Off the
-            # loop like every other media release: its holder check and unlink are one write txn.
-            from gateway.session_ingress_media import collect_unheld_api_images
-            await asyncio.to_thread(collect_unheld_api_images, db)
-        return web.json_response({"object": "hermes.session.deleted", "id": session_id, "deleted": bool(deleted)})
-
-    @_require_auth
-    async def _handle_session_messages(self, request: web.Request) -> web.Response:
-        """GET /api/sessions/{session_id}/messages."""
-        session_id = request.match_info["session_id"]
-        _, err = await self._get_existing_session_or_404(session_id)
-        if err:
-            return err
-        db = await self._ensure_session_db_async()
-        resolved_id = await asyncio.to_thread(db.resolve_resume_session_id, session_id)
-        raw_limit, raw_offset = request.query.get("limit"), request.query.get("offset", "0")
-        order = request.query.get("order")
-        if order not in (None, "oldest", "latest"):
-            return _error_response("order must be one of: oldest, latest", 400, code="invalid_pagination")
-        try:
-            offset = int(raw_offset)
-            requested_limit = None if raw_limit is None else int(raw_limit)
-        except (TypeError, ValueError):
-            offset = requested_limit = -1
-        if offset < 0 or (requested_limit is not None and requested_limit < 0):
-            return _error_response("limit and offset must be non-negative integers", 400, code="invalid_pagination")
-        default_page = requested_limit is None
-        latest_page = order == "latest" or (order is None and default_page)
-        limit = 500 if default_page else min(requested_limit, 500)
-        include_compacted = _coerce_request_bool(request.query.get("include_compacted"), default=False)
-        # Compression lineage: return root→tip messages, matching the REST router (#51058).
-        messages = await asyncio.to_thread(
-            db.get_messages, resolved_id, limit=limit, offset=offset, latest=latest_page,
-            include_compacted=include_compacted, include_ancestors=True)
-        return web.json_response({
-            "object": "list", "session_id": resolved_id,
-            "data": [self._message_response(m) for m in messages],
-            "pagination": {
-                "limit": limit, "offset": offset,
-                "order": order or ("latest" if default_page else "oldest"),
-                "returned": len(messages)}})
 
     # -- Telegram topic binding helpers -----------------------------------------------
 
-    def _telegram_runner_and_adapter(self) -> tuple[Optional[Any], Optional[Any]]:
-        """Return the live gateway runner and Telegram adapter, if available."""
-        try:
-            from gateway.run import _gateway_runner_ref
-            runner = _gateway_runner_ref()
-            telegram = runner.adapters.get(Platform.TELEGRAM) if runner and hasattr(runner, "adapters") else None
-            return runner, telegram
-        except Exception:
-            logger.debug("Telegram gateway lookup failed", exc_info=True)
-            return None, None
 
-    @staticmethod
-    def _telegram_topic_link(chat_id: str, thread_id: str) -> Optional[str]:
-        """Return Telegram's stable forum-topic URL when the chat id permits it."""
-        chat = str(chat_id)
-        if chat.startswith("-100") and len(chat) > 4:
-            return f"https://t.me/c/{chat[4:]}/{thread_id}"
-        return None
 
-    @staticmethod
-    def _telegram_binding_response(
-        session_id: str,
-        binding: Optional[dict[str, Any]],
-        *,
-        delivery: Optional[dict[str, Any]] = None,
-        ended: bool = False,
-        end_reason: Optional[str] = None,
-        rebound_to_session_id: Optional[str] = None,
-        fallback_thread_id: Optional[str] = None,
-        fallback_chat_id: Optional[str] = None,
-    ) -> dict[str, Any]:
-        bound = bool(binding)
-        chat_id = str(binding.get("chat_id")) if bound else (str(fallback_chat_id) if fallback_chat_id else None)
-        thread_id = str(binding.get("thread_id")) if bound else (str(fallback_thread_id) if fallback_thread_id else None)
-        return {
-            "object": "hermes.telegram_binding",
-            "bound": bound,
-            "ended": ended,
-            "end_reason": end_reason,
-            "rebound_to_session_id": rebound_to_session_id,
-            "session_id": session_id,
-            "chat_id": chat_id,
-            "thread_id": thread_id,
-            "link": APIServerAdapter._telegram_topic_link(chat_id, thread_id) if chat_id and thread_id else None,
-            "topic_url": APIServerAdapter._telegram_topic_link(chat_id, thread_id) if chat_id and thread_id else None,
-            "delivery_enabled": bool(binding.get("delivery_enabled", True)) if bound else False,
-            "last_synced_message_id": binding.get("last_synced_message_id") if bound else None,
-            "future_duplication": {
-                "persistent": True,
-                "enabled": bool(binding.get("delivery_enabled", True)) if bound else False,
-                "default": "binding_delivery_enabled",
-                "request_field": "duplicate_to_telegram",
-                "request_override": True,
-            },
-            "backfill": delivery or {"mode": "incremental", "status": "not_requested", "sent": 0, "failed": 0, "skipped": 0},
-        }
-
-    @_require_auth
-    async def _handle_get_telegram_binding(self, request: web.Request) -> web.Response:
-        """GET /api/sessions/{session_id}/telegram-binding — current topic binding."""
-        session_id = request.match_info["session_id"]
-        existing_sess, err = await self._get_existing_session_or_404(session_id)
-        if err:
-            return err
-        db = await self._ensure_session_db_async()
-        if db is None:
-            return self._session_db_unavailable()
-        try:
-            binding = await asyncio.to_thread(db.get_telegram_topic_binding_by_session, session_id=session_id)
-            sess_dict = existing_sess if isinstance(existing_sess, dict) else {}
-            is_ended = bool(sess_dict.get("ended_at") or sess_dict.get("end_reason"))
-            end_reason = sess_dict.get("end_reason")
-            sess_thread = str(sess_dict.get("thread_id") or "").strip()
-            if not sess_thread:
-                origin_raw = sess_dict.get("origin_json") or ""
-                if isinstance(origin_raw, str) and origin_raw.startswith("{"):
-                    try:
-                        import json as _json
-                        origin_data = _json.loads(origin_raw)
-                        sess_thread = str(origin_data.get("thread_id") or "").strip()
-                    except Exception:
-                        pass
-            chat_id = str(sess_dict.get("user_id") or sess_dict.get("chat_id") or getattr(self, "home_chat_id", "") or "").strip()
-
-            if is_ended:
-                rebound_to_sid = None
-                if chat_id and sess_thread and hasattr(db, "get_telegram_topic_binding"):
-                    try:
-                        curr_b = await asyncio.to_thread(db.get_telegram_topic_binding, chat_id=chat_id, thread_id=sess_thread)
-                        if curr_b and curr_b.get("session_id") != session_id:
-                            rebound_to_sid = curr_b.get("session_id")
-                    except Exception:
-                        pass
-                return web.json_response(self._telegram_binding_response(
-                    session_id,
-                    binding,
-                    ended=True,
-                    end_reason=end_reason,
-                    rebound_to_session_id=rebound_to_sid,
-                    fallback_thread_id=sess_thread or None,
-                    fallback_chat_id=chat_id or None,
-                ))
-
-            if not binding:
-                if chat_id and sess_thread and hasattr(db, "bind_telegram_topic"):
-                    try:
-                        uid = chat_id
-                        runner, _ = self._telegram_runner_and_adapter()
-                        from gateway.session import SessionSource, build_session_key
-                        source = SessionSource(Platform.TELEGRAM, chat_id, chat_type="dm", user_id=uid, thread_id=sess_thread)
-                        session_key = runner._session_key_for_source(source) if runner and hasattr(runner, "_session_key_for_source") else build_session_key(source)
-                        await asyncio.to_thread(
-                            db.bind_telegram_topic,
-                            chat_id=chat_id,
-                            thread_id=sess_thread,
-                            user_id=uid,
-                            session_key=session_key,
-                            session_id=session_id,
-                            managed_mode="auto",
-                            delivery_enabled=True,
-                        )
-                        resolved_id = db.resolve_resume_session_id(session_id) if hasattr(db, "resolve_resume_session_id") else session_id
-                        raw_messages = await asyncio.to_thread(db.get_messages, resolved_id) if hasattr(db, "get_messages") else []
-                        max_id = max((m.get("id") for m in raw_messages if isinstance(m.get("id"), int)), default=None)
-                        if max_id is not None and hasattr(db, "advance_telegram_topic_sync_checkpoint"):
-                            await asyncio.to_thread(db.advance_telegram_topic_sync_checkpoint, session_id=session_id, message_id=max_id)
-                        binding = await asyncio.to_thread(db.get_telegram_topic_binding_by_session, session_id=session_id)
-                        logger.info("[WebUI] Auto-recovered topic binding for session %s to thread %s (checkpoint=%s)", session_id, sess_thread, max_id)
-                    except Exception as recover_err:
-                        logger.warning("[WebUI] Auto-recovery of binding failed for %s: %s", session_id, recover_err)
-        except Exception:
-            logger.exception("Failed to read Telegram binding for %s", session_id)
-            return web.json_response(_openai_error("Telegram binding lookup failed", code="telegram_binding_failed"), status=503)
-        return web.json_response(self._telegram_binding_response(session_id, binding, ended=is_ended, end_reason=end_reason))
-
-    @_require_auth
-    async def _handle_post_telegram_binding(self, request: web.Request) -> web.Response:
-        """POST /api/sessions/{session_id}/telegram-binding."""
-        try:
-            session_id = request.match_info["session_id"]
-            session, err = await self._get_existing_session_or_404(session_id)
-            if err:
-                return err
-            body, err = await self._read_json_body(request)
-            if err:
-                return err
-            chat_id = str(body.get("chat_id") or body.get("telegram_chat_id") or session.get("user_id") or session.get("chat_id") or getattr(self, "home_chat_id", "") or "").strip()
-            thread_id = str(body.get("thread_id") or "").strip()
-            topic_name = str(body.get("topic_name") or session.get("title") or f"Hermes {session_id[:24]}").strip()
-            delivery_enabled = bool(body.get("delivery_enabled", True))
-            db = await self._ensure_session_db_async()
-            if db is None:
-                return self._session_db_unavailable()
-            if hasattr(db, "apply_telegram_topic_migration"):
-                await asyncio.to_thread(db.apply_telegram_topic_migration)
-            existing = await asyncio.to_thread(db.get_telegram_topic_binding_by_session, session_id=session_id)
-            if existing:
-                if chat_id and chat_id != str(existing.get("chat_id")):
-                    return web.json_response(_openai_error("Session is already bound to another Telegram chat", code="telegram_binding_conflict"), status=409)
-                if thread_id and thread_id != str(existing.get("thread_id")):
-                    return web.json_response(_openai_error("Session is already bound to another Telegram topic", code="telegram_binding_conflict"), status=409)
-                if "delivery_enabled" in body and hasattr(db, "set_telegram_topic_delivery_enabled"):
-                    await asyncio.to_thread(db.set_telegram_topic_delivery_enabled, session_id=session_id, delivery_enabled=delivery_enabled)
-                    existing = await asyncio.to_thread(db.get_telegram_topic_binding_by_session, session_id=session_id)
-                return web.json_response(self._telegram_binding_response(session_id, existing))
-            if not chat_id:
-                return web.json_response(_openai_error("chat_id is required", code="missing_chat_id"), status=400)
-            runner, telegram = self._telegram_runner_and_adapter()
-            if not thread_id:
-                sess_thread = str(session.get("thread_id") or "").strip()
-                if sess_thread:
-                    thread_id = sess_thread
-                elif telegram:
-                    create_topic = getattr(telegram, "create_handoff_thread", None)
-                    if callable(create_topic):
-                        try:
-                            thread_id = str(await create_topic(chat_id, topic_name) or "")
-                        except Exception as exc:
-                            logger.exception("Failed creating Telegram topic for session %s", session_id)
-                            return web.json_response(_openai_error(f"Failed to create Telegram topic: {exc}", code="telegram_topic_create_failed"), status=502)
-            if not thread_id:
-                return web.json_response(_openai_error("Telegram did not create a topic", code="telegram_topic_create_failed"), status=502)
-            from gateway.session import SessionSource, build_session_key
-            source = SessionSource(Platform.TELEGRAM, chat_id, chat_type="dm", user_id=str(body.get("user_id") or chat_id), thread_id=thread_id)
-            session_key = runner._session_key_for_source(source) if runner and hasattr(runner, "_session_key_for_source") else build_session_key(source)
-            if hasattr(db, "bind_telegram_topic"):
-                await asyncio.to_thread(
-                    db.bind_telegram_topic,
-                    chat_id=chat_id, thread_id=thread_id, user_id=source.user_id or "",
-                    session_key=session_key, session_id=session_id, managed_mode="api", delivery_enabled=delivery_enabled
-                )
-            binding = await asyncio.to_thread(db.get_telegram_topic_binding_by_session, session_id=session_id)
-            return web.json_response(self._telegram_binding_response(session_id, binding), status=201)
-        except Exception as e:
-            logger.exception("Error in telegram binding: %s", e)
-            return web.json_response(_openai_error(f"Error in telegram binding: {e}", code="telegram_binding_failed"), status=500)
-
-    @_require_auth
-    async def _handle_delete_telegram_binding(self, request: web.Request) -> web.Response:
-        """DELETE /api/sessions/{session_id}/telegram-binding."""
-        session_id = request.match_info["session_id"]
-        _, err = await self._get_existing_session_or_404(session_id)
-        if err:
-            return err
-        db = await self._ensure_session_db_async()
-        if db is None:
-            return self._session_db_unavailable()
-        binding = await asyncio.to_thread(db.get_telegram_topic_binding_by_session, session_id=session_id)
-        if binding and hasattr(db, "unbind_telegram_topic"):
-            try:
-                await asyncio.to_thread(db.unbind_telegram_topic, chat_id=str(binding["chat_id"]), thread_id=str(binding["thread_id"]))
-            except Exception:
-                logger.exception("Failed to remove Telegram binding for %s", session_id)
-                return web.json_response(_openai_error("Failed to remove Telegram binding", code="telegram_binding_failed"), status=503)
-        payload = self._telegram_binding_response(session_id, None)
-        payload["deleted"] = bool(binding)
-        return web.json_response(payload)
-
-    @_require_auth
-    async def _handle_fork_session(self, request: web.Request) -> web.Response:
-        """POST /api/sessions/{session_id}/fork — branch via current SessionDB primitives."""
-        source_id = request.match_info["session_id"]
-        source, err = await self._get_existing_session_or_404(source_id)
-        if err:
-            return err
-        body, err = await self._read_json_body(request)
-        if err:
-            return err
-        db = await self._ensure_session_db_async()
-        fork_id = str(body.get("id") or body.get("session_id") or f"api_{int(time.time())}_{uuid.uuid4().hex[:8]}").strip()
-        if not fork_id or re.search(r'[\r\n\x00]', fork_id):
-            return _error_response("Invalid session ID", 400, code="invalid_session_id")
-        if await asyncio.to_thread(db.get_session, fork_id):
-            return _error_response(f"Session already exists: {fork_id}", 409, code="session_exists")
-
-        # CLI /branch semantics: create the child, then end the original as branched (child first, so
-        # a failed create never leaves the source ended with no fork, #11030).
-        # ``_branched_from`` is the durable branch marker (same as CLI /branch): with the child created
-        # first, the timestamp fallback in _BRANCH_CHILD_SQL (child.started_at >= parent.ended_at) no
-        # longer holds, and an unmarked child would vanish from default session listings.
-        await asyncio.to_thread(
-            db.create_session, fork_id, "api_server", model=source.get("model"),
-            system_prompt=source.get("system_prompt"), parent_session_id=source_id,
-            model_config={"_branched_from": source_id})
-        await asyncio.to_thread(db.end_session, source_id, "branched")
-        messages = await asyncio.to_thread(db.get_messages, source_id)
-        await asyncio.to_thread(db.replace_messages, fork_id, messages)
-        title = body.get("title")
-        if title is None:
-            base = source.get("title") or "fork"
-            title = f"{base} fork"
-            with suppress(Exception):
-                title = await asyncio.to_thread(db.get_next_title_in_lineage, base)
-        try:
-            await asyncio.to_thread(db.set_session_title, fork_id, str(title))
-        except ValueError as exc:
-            return _error_response(str(exc), 400, code="invalid_title")
-        fork = await asyncio.to_thread(db.get_session, fork_id) or {"id": fork_id, "parent_session_id": source_id}
-        return web.json_response({"object": "hermes.session", "session": self._session_response(fork)}, status=201)
-
-    async def _prepare_session_chat(self, request: web.Request) -> tuple:
-        """Shared prelude for /api/sessions/{id}/chat[/stream]: header/body validation, then
-        runtime selection — a Browser model lock (body ``require_model_lock`` or a confirmed
-        persisted lock) wins; else the session-persisted model routes via model_routes when an
-        alias or threads through as ``session_model`` when raw, then body values.
-        Returns ``(ctx, None)`` or ``(None, error)``; ``ctx["run_kwargs"]`` feeds ``_run_agent``."""
-        gateway_session_key, key_err = self._parse_session_key_header(request)
-        if key_err is not None:
-            return None, key_err
-        session_id = request.match_info["session_id"]
-        session, err = await self._get_existing_session_or_404(session_id)
-        if err:
-            return None, err
-        body, err = await self._read_json_body(request)
-        if err:
-            return None, err
-        user_message, err = _session_chat_user_message(body)
-        if err is not None:
-            return None, err
-        try:
-            turn_author = _request_turn_author(body)
-        except ValueError as exc:
-            return None, _error_response(str(exc), 400, code="invalid_author")
-        system_prompt = body.get("system_message") or body.get("instructions")
-        if system_prompt is not None and not isinstance(system_prompt, str):
-            return None, _error_response("system_message must be a string", 400, code="invalid_system_message")
-        runtime_request = self._effective_session_runtime_request(session=session, body=body)
-        lock_error = self._runtime_lock_error(runtime_request)
-        if lock_error is not None:
-            return None, lock_error
-        if not await asyncio.to_thread(self._persist_session_runtime_lock, session_id, runtime_request):
-            return None, _error_response(
-                "Could not persist the requested session model lock", 500, code="model_lock_persistence_failed")
-        lock_active = bool(runtime_request.get("require_model_lock"))
-        if lock_active:
-            route = runtime_request.get("route")
-            session_model = None
-            requested = runtime_request.get("requested") or {}
-            agent_overrides: dict[str, Any] = {}
-            for src_key, dst_key in (("model", "requested_model"), ("provider", "requested_provider")):
-                if requested.get(src_key):
-                    agent_overrides[dst_key] = requested[src_key]
-            if runtime_request.get("model_options"):
-                agent_overrides["model_options"] = runtime_request["model_options"]
-        else:
-            stored_model = self._stored_session_model(session)
-            stored_route = self._resolve_route(stored_model)
-            route = stored_route or self._resolve_route(body.get("model"))
-            session_model = stored_model if (stored_model and stored_route is None) else None
-            agent_overrides = _request_agent_overrides(body, virtual_model=self._model_name)
-            selection_error = self._request_route_conflict_error(
-                session_id=session_id, gateway_session_key=gateway_session_key,
-                requested_model=agent_overrides.get("requested_model"),
-                requested_provider=agent_overrides.get("requested_provider"), route=route)
-            if selection_error:
-                return None, _error_response(selection_error, 400)
-        run_kwargs = dict(
-            user_message=user_message, ephemeral_system_prompt=system_prompt, session_id=session_id,
-            gateway_session_key=gateway_session_key, route=route, session_model=session_model,
-            requested_runtime=runtime_request.get("requested") or {},
-            route_source=runtime_request.get("route_source") or "global",
-            confirmed_runtime_lock=lock_active, turn_author=turn_author,
-            # #98619: the client addresses this session by construction — the id is in the
-            # request path (/api/sessions/{session_id}/chat) — so a wake self-post lands where
-            # the client will read it. The audited native-session opt-in.
-            session_history_delivery="1", **agent_overrides)
-        return {
-            "gateway_session_key": gateway_session_key, "session_id": session_id, "body": body,
-            "user_message": user_message, "runtime_request": runtime_request,
-            "lock_active": lock_active, "run_kwargs": run_kwargs}, None
-
-    @staticmethod
-    def _session_headers(session_id: str, gateway_session_key: Optional[str]) -> dict[str, str]:
-        """``X-Hermes-Session-Id`` (+ ``X-Hermes-Session-Key`` when declared) response headers."""
-        headers = {"X-Hermes-Session-Id": session_id}
-        if gateway_session_key:
-            headers["X-Hermes-Session-Key"] = gateway_session_key
-        return headers
-
-    def _effective_turn_runtime(self, runtime_request: dict[str, Any], result: Any, usage: Any) -> dict[str, Any]:
-        """Sanitized runtime metadata for a finished session-chat turn."""
-        runtime = self._result_runtime(result, usage)
-        return self._sanitize_runtime_metadata(
-            # Same shared ladder /api/status uses. Before this was unified, the two endpoints disagreed on
-            # the same page load — the sidebar strip read "running" (it probed GATEWAY_HEALTH_URL and scoped
-            # to the requested profile) while the Channels page rendered "The gateway is not running" (it
-            # did neither). Cross-container, profile-scoped, and launch-service-managed deployments each hit
-            # that split. profile_home is passed when the request was scoped to a named profile:
-            # gateway/status readers resolve process-level paths and do NOT follow the HERMES_HOME
-            # contextvar override (#56986 / #69143), so the profile's directory has to be handed over
-            # explicitly or messaging silently reports another profile's gateway (#71211).
-            runtime=runtime,
-            requested_runtime=runtime_request.get("requested"),
-            route_source=runtime_request.get("route_source") or "global",
-            model_lock=self._model_lock_state(runtime_request, runtime))
-
-    @staticmethod
-    def _result_runtime(result: Any, usage: Any) -> dict[str, Any]:
-        """Runtime metadata from the result dict, falling back to the usage dict."""
-        runtime = (result.get("runtime") or {}) if isinstance(result, dict) else {}
-        return runtime or ((usage.get("runtime") or {}) if isinstance(usage, dict) else {})
-
-    @staticmethod
-    def _model_lock_state(runtime_request: dict[str, Any], runtime: Any) -> str:
-        """``confirmed`` once a runtime was observed under a lock, ``accepted`` before, else ``""``."""
-        if not runtime_request.get("require_model_lock"):
-            return ""
-        return "confirmed" if runtime else "accepted"
-
-    async def _admit_to_live_bot_chat(
-        self, session_id: str, message: Any, author: Optional[dict[str, Any]],
-    ) -> Optional[tuple[Path, dict[str, Any]]]:
-        """Admit a turn aimed at the canonical Bot Chat to the Desktop session that holds it live.
-
-        ``(profile home, mailbox record)`` when a live owner took it; None when this process should
-        run the turn itself — the session is not the canonical Bot Chat's own lineage, or nobody
-        holds that chat. Both peer transports (``/api/sessions/{id}/chat`` for ``peer dm``,
-        ``/v1/runs`` for ``peer run``) go through here, so the two lanes cannot drift.
-        """
-        if not isinstance(message, str):
-            return None
-        # Under session authority the Bot Chat is a LOCAL session whose only writer is the
-        # authority FIFO (a Desktop showing it is a viewer, not a lease holder): the turn enters
-        # through the same door as ``bot_relay.deliver`` and the receipt is its admission's.
-        if getattr(self.gateway_runner, "session_authority", None) is not None:
-            from gateway.platforms.api_server_bot_chat import admit_peer_turn
-            try:
-                return await admit_peer_turn(self.gateway_runner, session_id, message, author)
-            except (ValueError, Exception) as exc:
-                logger.debug("Failed to admit peer turn to session authority: %s", exc)
-                return None
-        db = await self._ensure_session_db_async()
-        if db is None:
-            return None
-        home = Path(db.db_path).parent
-        from tools.bot_live_delivery import deliver_to_live_owner, find_canonical_live_owner
-
-        def _admit() -> Optional[dict[str, Any]]:
-            try:
-                owner = find_canonical_live_owner(home)
-                # Only the canonical Bot Chat's own lineage: a peer turn into any other session runs here.
-                if owner is None or db.get_compression_tip(session_id) != owner["session_id"]:
-                    return None
-                return deliver_to_live_owner(home, owner, message, author=author)
-            except (ValueError, Exception) as exc:
-                # No reachable profile authority to hand the chat to: this process runs the turn.
-                logger.debug("Live bot chat admission skipped: %s", exc)
-                return None
-
-        try:
-            record = await asyncio.to_thread(_admit)
-        except (ValueError, Exception) as exc:
-            logger.debug("Live bot chat admission thread error: %s", exc)
-            return None
-        return None if record is None else (home, record)
-
-    async def _answer_through_live_bot_chat(self, ctx: dict[str, Any]) -> Optional[web.Response]:
-        """Hand a turn aimed at a canonical Bot Chat that a Desktop holds live to that owner.
-
-        This is the ``hermes peer dm`` transport. Running the turn here would make this process a
-        second writer beside the lease holder: the open chat never shows the message or the reply,
-        its live context never learns of them, and the two transcripts interleave in state.db.
-        Local and relayed DMs already hand such a message to the owner's mailbox
-        (``tools/bot_mode_dm.py``, ``tui_gateway/methods_bot_relay.py``). This waits for the owner's
-        receipt on the same budget as the local path, so the peer still gets the reply on this call.
-        """
-        try:
-            admitted = await self._admit_to_live_bot_chat(ctx["session_id"], ctx["user_message"], ctx["run_kwargs"].get("turn_author"))
-        except (ValueError, Exception) as exc:
-            logger.warning("Error admitting to live bot chat: %s, falling back to local run", exc)
-            return None
-        if admitted is None:
-            return None
-        session_id = admitted[1].get("session_id") or ctx["session_id"]  # a moved-aside API row: the local chat (MSG-21)
-        record = await self._await_live_bot_chat_receipt(*admitted)
-        delivery_id = record["delivery_id"]
-        headers = self._session_headers(session_id, ctx["gateway_session_key"])
-        if record["status"] == "settled":
-            return web.json_response(
-                {"object": "hermes.session.chat.completion", "session_id": session_id,
-                 "message": {"role": "assistant", "content": record.get("reply") or ""},
-                 "usage": {}, "runtime": {}, "delivery_id": delivery_id}, headers=headers)
-        if record["status"] in ("queued", "claimed"):
-            return web.json_response(
-                {"object": "hermes.session.chat.queued", "session_id": session_id,
-                 "status": record["status"], "delivery_id": delivery_id}, status=202, headers=headers)
-        return _error_response(record.get("error") or f"Bot Chat delivery {record['status']}", 502,
-                               code=record.get("reason") or record["status"], headers=headers)
-
-    async def _await_live_bot_chat_receipt(self, home: Path, record: dict[str, Any], *, keepalive=None) -> dict[str, Any]:
-        """Wait on the live Bot Chat's receipt (the authority admission's waiter, or the legacy owner
-        mailbox through ``await_delivery_async``) until it settles or the local DM budget runs out;
-        ``keepalive`` (async) is called every SSE keepalive interval so a streaming caller's proxy
-        keeps the socket."""
-        from gateway.platforms.api_server_bot_chat import await_live_delivery
-        from tools.bot_mode_dm import _LIVE_WAIT_SECONDS
-        deadline = time.monotonic() + _LIVE_WAIT_SECONDS
-        while record["status"] in ("queued", "claimed"):
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
-            budget = remaining if keepalive is None else min(remaining, CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS)
-            record = await await_live_delivery(self, home, record, budget)
-            if keepalive is not None and record["status"] in ("queued", "claimed"):
-                await keepalive()
-        return record
-
-    async def _stream_through_live_bot_chat(self, request: web.Request, ctx: dict[str, Any]) -> Optional[web.StreamResponse]:
-        """``_answer_through_live_bot_chat`` for the SSE sibling route: the owner's settled receipt is
-        the run's single ``assistant.completed`` event; a receipt still open at the budget is a
-        ``run.queued`` event (the 202 shape), a failed one an ``error`` event carrying the reason."""
-        try:
-            admitted = await self._admit_to_live_bot_chat(ctx["session_id"], ctx["user_message"], ctx["run_kwargs"].get("turn_author"))
-        except (ValueError, Exception) as exc:
-            logger.warning("Error admitting to live bot chat in stream: %s, falling back to local run", exc)
-            return None
-        if admitted is None:
-            return None
-        session_id = admitted[1].get("session_id") or ctx["session_id"]  # a moved-aside API row: the local chat (MSG-21)
-        events = _SessionEventQueue(session_id, f"run_{uuid.uuid4().hex}")
-        response = await self._prepare_sse_response(request, session_id, ctx["gateway_session_key"])
-
-        async def _write(name: str, payload: dict[str, Any]) -> None:
-            name, payload = events.payload(name, payload)
-            await response.write(_sse_frame(payload, event=name, ensure_ascii=False))
-
-        async def _keepalive() -> None:
-            await response.write(b": keepalive\n\n")
-
-        try:
-            await _write("run.started", {"user_message": {"role": "user", "content": ctx["user_message"]}, "runtime": {}})
-            record = await self._await_live_bot_chat_receipt(*admitted, keepalive=_keepalive)
-            delivery_id = record["delivery_id"]
-            if record["status"] == "settled":
-                message_id = f"msg_{uuid.uuid4().hex}"
-                await _write("message.started", {"message": {"id": message_id, "role": "assistant"}})
-                await _write("assistant.completed", {
-                    "message_id": message_id, "content": record.get("reply") or "", "delivery_id": delivery_id, "runtime": {}})
-                await _write("run.completed", {"message_id": message_id, "delivery_id": delivery_id, "usage": {}, "runtime": {}})
-            elif record["status"] in ("queued", "claimed"):
-                await _write("run.queued", {"status": record["status"], "delivery_id": delivery_id})
-            else:
-                await _write("error", {"message": record.get("error") or f"Bot Chat delivery {record['status']}",
-                                       "code": record.get("reason") or record["status"], "delivery_id": delivery_id})
-            await _write("done", {})
-        except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError):
-            logger.info("Session SSE client disconnected while a live Bot Chat held the turn")
-        return response
-
-    class _TelegramMirrorCoordinator:
-        """Per-turn coordinator for mirroring WebUI commentary and final replies to Telegram."""
-
-        def __init__(
-            self,
-            adapter: "APIServerAdapter",
-            *,
-            session_id: str,
-            loop: asyncio.AbstractEventLoop,
-            enabled: bool,
-        ) -> None:
-            self._adapter = adapter
-            self.session_id = session_id
-            self.loop = loop
-            self.enabled = bool(enabled)
-            self.mirror_lock = asyncio.Lock()
-            self.pending_mirror_tasks: list[asyncio.Task] = []
-            self.sent_mirror_texts: set[str] = set()
-
-        @staticmethod
-        def _norm(text: str) -> str:
-            return " ".join(text.split()).strip()
-
-        async def _send_telegram_mirror(self, text: str) -> None:
-            async with self.mirror_lock:
-                try:
-                    _runner, telegram = self._adapter._telegram_runner_and_adapter()
-                    if not telegram:
-                        return
-                    db = self._adapter._ensure_session_db()
-                    if not db:
-                        return
-                    if hasattr(db, "apply_telegram_topic_migration"):
-                        db.apply_telegram_topic_migration()
-                    binding = db.get_telegram_topic_binding_by_session(session_id=self.session_id)
-                    if not binding or not binding.get("delivery_enabled", True):
-                        return
-                    chat_id = binding.get("chat_id")
-                    if not chat_id:
-                        return
-                    thread_id = binding.get("thread_id") or binding.get("message_thread_id")
-                    metadata = {"thread_id": str(thread_id)} if thread_id else {}
-                    metadata["origin"] = "webui_mirror"
-                    try:
-                        await telegram.send(chat_id=str(chat_id), content=text, metadata=metadata)
-                    except TypeError:
-                        await telegram.send(chat_id=str(chat_id), text=text, metadata=metadata)
-                except Exception:
-                    logger.warning(
-                        "Failed to mirror WebUI message to Telegram for session %s (non-fatal)",
-                        self.session_id,
-                        exc_info=True,
-                    )
-
-        def _schedule_telegram_mirror(self, text: str) -> None:
-            if not self.enabled or not (isinstance(text, str) and text.strip()):
-                return
-            norm = self._norm(text)
-            if not norm or norm in self.sent_mirror_texts:
-                return
-            self.sent_mirror_texts.add(norm)
-            task = self.loop.create_task(self._send_telegram_mirror(text))
-            self.pending_mirror_tasks.append(task)
-
-        def enqueue_commentary(self, text: str) -> None:
-            if not self.enabled or not (isinstance(text, str) and text.strip()):
-                return
-            try:
-                running_loop = asyncio.get_running_loop()
-            except RuntimeError:
-                running_loop = None
-            if running_loop is self.loop:
-                self._schedule_telegram_mirror(text)
-            else:
-                try:
-                    self.loop.call_soon_threadsafe(self._schedule_telegram_mirror, text)
-                except RuntimeError:
-                    logger.debug(
-                        "Event loop closed while scheduling Telegram commentary mirror for session %s",
-                        self.session_id,
-                        exc_info=True,
-                    )
-
-        async def drain(self) -> None:
-            await asyncio.sleep(0)
-            while self.pending_mirror_tasks:
-                tasks = list(self.pending_mirror_tasks)
-                self.pending_mirror_tasks.clear()
-                await asyncio.gather(*tasks, return_exceptions=True)
-
-        async def send_final(self, final_response: str) -> None:
-            await self.drain()
-            if not self.enabled or not (isinstance(final_response, str) and final_response.strip()):
-                return
-            norm = self._norm(final_response)
-            if not norm or norm in self.sent_mirror_texts:
-                return
-            self.sent_mirror_texts.add(norm)
-            await self._send_telegram_mirror(final_response)
-
-    def _new_telegram_mirror(
-        self,
-        *,
-        session_id: str,
-        loop: asyncio.AbstractEventLoop,
-        enabled: bool,
-    ) -> "_TelegramMirrorCoordinator":
-        return self._TelegramMirrorCoordinator(
-            self,
-            session_id=session_id,
-            loop=loop,
-            enabled=enabled,
-        )
-
-    @_admit_api_agent_request
-    async def _handle_session_chat(self, request: web.Request) -> web.Response:
-        """POST /api/sessions/{session_id}/chat — one synchronous agent turn (plus the delivery lanes'
-        one bounded re-run of a transient failure; ``hermes peer dm`` is the client)."""
-        from tools.bot_failure_reasons import RETRY_NONE, result_retry_action
-        # This turn runs through _run_agent, so it already COUNTS toward the cap (#7483).
-        # Spending the budget without checking it refused every other caller while never
-        # refusing this route — and a fleet's cross-machine DMs all arrive here.
-        limited = self._concurrency_limited_response()
-        if limited is not None:
-            return limited
-        ctx, err = await self._prepare_session_chat(request)
-        if err is not None:
-            return err
-        from gateway.platforms.api_server_openai_routes import _response_status
-        handed_off = await self._answer_through_live_bot_chat(ctx)
-        if handed_off is not None:
-            return handed_off
-        gateway_session_key = ctx["gateway_session_key"]
-        session_id = ctx["session_id"]
-        from gateway.wake import reset_consecutive_auto_wakes
-        reset_consecutive_auto_wakes(session_id)
-        await asyncio.to_thread(self._mark_session_auto_resume, session_id)
-        db_turn = await self._ensure_session_db_async()
-        if db_turn is not None and hasattr(db_turn, "set_session_read"):
-            with suppress(Exception):
-                await asyncio.to_thread(db_turn.set_session_read, session_id, True)
-        ctx["run_kwargs"]["auto_resume_on_delegation"] = True
-        duplicate_to_telegram = bool(
-            ctx["body"].get("duplicate_to_telegram")
-            if "duplicate_to_telegram" in ctx["body"]
-            else self.is_telegram_bound(session_id)
-        )
-        loop = asyncio.get_running_loop()
-        self._pulse_loop = loop
-        self._pulse_prefs()[session_id] = duplicate_to_telegram
-        mirror = self._new_telegram_mirror(session_id=session_id, loop=loop, enabled=duplicate_to_telegram)
-
-        def _commentary(text: str, *, already_streamed: bool = False) -> None:
-            mirror.enqueue_commentary(text)
-
-        try:
-            history = await self._conversation_history_for_session(session_id)
-            result, usage = await self._run_agent(
-                conversation_history=history,
-                interim_assistant_callback=_commentary,
-                **ctx["run_kwargs"],
-            )
-            # One policy-gated re-run of a transiently failed turn — the peer-DM transport's half of the
-            # retry the local (``tools.bot_mode_dm``) and relayed (``tui_gateway.methods_bot_relay``)
-            # delivery lanes already apply (#93091 item 5, #115325). Same policy, same gate: transient
-            # classes (429 / 5xx) re-run the SAME session once, a context overflow lets the re-run's
-            # pre-API compaction shrink the transcript first, and auth/quota/config/model never re-run. The
-            # store is read again first: the failed attempt's turn-start persist left the DM as the
-            # transcript's unanswered tail row, and the re-run resumes that row instead of appending a
-            # second copy of it. A turn that fails again reaches the peer client exactly as before.
-            if result_retry_action(result) != RETRY_NONE:
-                history = await self._conversation_history_for_session(session_id)
-                result, usage = await self._run_agent(
-                    conversation_history=history,
-                    resume_unanswered_turn=True,
-                    interim_assistant_callback=_commentary,
-                    **ctx["run_kwargs"],
-                )
-        finally:
-            try:
-                await mirror.drain()
-            except Exception:
-                logger.debug("Telegram mirror drain failed in _handle_session_chat (non-fatal)", exc_info=True)
-        is_dict = isinstance(result, dict)
-        effective_session_id = result.get("session_id") if is_dict else session_id
-        raw_final_response = result.get("final_response", "") if is_dict else ""
-        final_response = self._resolve_message_media(raw_final_response)
-        await mirror.send_final(raw_final_response)
-        headers = self._session_headers(effective_session_id or session_id, gateway_session_key)
-        return web.json_response(
-            {"object": "hermes.session.chat.completion", "status": _response_status(result),
-             "session_id": effective_session_id or session_id,
-             "message": {"role": "assistant", "content": final_response}, "usage": usage,
-             "runtime": self._effective_turn_runtime(ctx["runtime_request"], result, usage)},
-            headers=headers)
-
-    @_admit_api_agent_request
-    async def _handle_session_chat_stream(self, request: web.Request) -> web.StreamResponse:
-        """POST /api/sessions/{session_id}/chat/stream — SSE wrapper over _run_agent."""
-        limited = self._concurrency_limited_response()
-        if limited is not None:
-            return limited
-        ctx, err = await self._prepare_session_chat(request)
-        if err is not None:
-            return err
-        handed_off = await self._stream_through_live_bot_chat(request, ctx)
-        if handed_off is not None:
-            return handed_off
-        gateway_session_key, session_id = ctx["gateway_session_key"], ctx["session_id"]
-        from gateway.wake import reset_consecutive_auto_wakes
-        reset_consecutive_auto_wakes(session_id)
-        await asyncio.to_thread(self._mark_session_auto_resume, session_id)
-        db_turn = await self._ensure_session_db_async()
-        if db_turn is not None and hasattr(db_turn, "set_session_read"):
-            with suppress(Exception):
-                await asyncio.to_thread(db_turn.set_session_read, session_id, True)
-        ctx["run_kwargs"]["auto_resume_on_delegation"] = True
-        user_message, runtime_request = ctx["user_message"], ctx["runtime_request"]
-        runtime_meta = self._sanitize_runtime_metadata(
-            requested_runtime=runtime_request.get("requested"),
-            route_source=runtime_request.get("route_source") or "global",
-            model_lock=("accepted" if ctx["lock_active"] else ""))
-        message_id = f"msg_{uuid.uuid4().hex}"
-        run_id = f"run_{uuid.uuid4().hex}"
-        events = _SessionEventQueue(session_id, run_id)
-        queue, _event_payload = events.queue, events.payload
-        duplicate_to_telegram = bool(
-            ctx["body"].get("duplicate_to_telegram") if "duplicate_to_telegram" in ctx["body"] else self.is_telegram_bound(session_id)
-        )
-        preserve_on_disconnect = bool(
-            duplicate_to_telegram or self.is_telegram_bound(session_id) or ctx["body"].get("preserve_on_disconnect")
-        )
-        loop = asyncio.get_running_loop()
-        self._pulse_loop = loop
-        self._pulse_prefs()[session_id] = duplicate_to_telegram
-        mirror = self._new_telegram_mirror(session_id=session_id, loop=loop, enabled=duplicate_to_telegram)
-
-        async def _finalize_pulse_ticker(fallback_status: str) -> None:
-            entry = self._pulse_registry().get(session_id)
-            if entry is None:
-                return
-            stop_task = entry.get("stop_task")
-            if stop_task is not None:
-                try:
-                    await stop_task
-                except Exception:
-                    logger.debug("Pulse ticker stop_task failed (non-fatal)", exc_info=True)
-                return
-            if entry.get("stopped"):
-                return
-            ticker = entry["ticker"]
-            start_task = entry.get("start_task")
-            if not ticker.active and not entry.get("starting") and (start_task is None or start_task.done()):
-                return
-            has_running = any(t.get("status") == "running" for t in ticker.tasks.values())
-            is_draining = bool(getattr(self, "_draining", False))
-            if fallback_status == "cancelled" or is_draining:
-                final_status = "interrupted" if is_draining and fallback_status != "cancelled" else "cancelled"
-                final_summary = entry.get("terminal_summary") or ""
-                entry["stopped"] = True
-                stop_task = asyncio.create_task(
-                    self._stop_pulse_entry(session_id, entry, final_status, final_summary)
-                )
-                entry["stop_task"] = stop_task
-                try:
-                    await stop_task
-                except Exception:
-                    logger.debug("Pulse ticker stop failed (non-fatal)", exc_info=True)
-                return
-            if has_running and fallback_status in ("completed", "failed"):
-                return
-            entry["stopped"] = True
-            final_status = entry.get("terminal_status") or fallback_status
-            final_summary = entry.get("terminal_summary") or ""
-            stop_task = asyncio.create_task(
-                self._stop_pulse_entry(session_id, entry, final_status, final_summary)
-            )
-            entry["stop_task"] = stop_task
-            try:
-                await stop_task
-            except Exception:
-                logger.debug("Pulse ticker stop failed (non-fatal)", exc_info=True)
-
-        # Claim ownership inside the request's profile scope before any run-keyed state
-        # exists, so /v1/runs/{id}* control is confined to the starting profile.
-        # See #93689.
-        self._run_owners[run_id] = self._run_idempotency_scope(request)
-        self._set_run_status(
-            run_id, "queued", session_id=session_id, model=ctx["body"].get("model", self._model_name))
-
-        def _delta(delta: str) -> None:
-            if delta:
-                events.enqueue("assistant.delta", {"message_id": message_id, "delta": delta})
-
-        def _tool_progress(event_type: str, tool_name: str | None = None, preview: str | None = None, args=None, **kwargs) -> None:
-            if event_type == "reasoning.available":
-                events.enqueue("tool.progress", {"message_id": message_id, "tool_name": tool_name or "_thinking", "delta": preview or ""})
-            elif event_type in {"tool.started", "tool.completed", "tool.failed"}:
-                event_name = (
-                    "tool.failed"
-                    if event_type == "tool.completed" and kwargs.get("is_error")
-                    else event_type
-                )
-                events.enqueue(event_name, {"message_id": message_id, "tool_name": tool_name, "preview": preview, "args": args})
-            elif event_type in _SUBAGENT_PULSE_EVENTS or event_type in ("subagent.tool", "subagent_tool"):
-                def _json_safe(val: Any) -> Any:
-                    if val is None or isinstance(val, (str, int, float, bool)):
-                        return val
-                    if isinstance(val, dict):
-                        return {str(k): _json_safe(v) for k, v in val.items()}
-                    if isinstance(val, (list, tuple)):
-                        return [_json_safe(v) for v in val]
-                    return str(val)
-
-                _subagent_event_map = {
-                    "subagent_start": "subagent.start",
-                    "subagent.start": "subagent.start",
-                    "subagent_progress": "subagent.progress",
-                    "subagent.progress": "subagent.progress",
-                    "subagent_tool": "subagent.tool",
-                    "subagent.tool": "subagent.tool",
-                    "subagent_complete": "subagent.complete",
-                    "subagent.complete": "subagent.complete",
-                }
-                normalized_event_name = _subagent_event_map.get(event_type, event_type)
-                args_dict = args if isinstance(args, dict) else {}
-                subagent_id = (
-                    kwargs.get("subagent_id")
-                    or args_dict.get("subagent_id")
-                    or (f"task_{kwargs['task_index']}" if kwargs.get("task_index") is not None else None)
-                )
-                started_at = kwargs.get("started_at")
-                if not isinstance(started_at, (int, float)) or isinstance(started_at, bool):
-                    started_at = args_dict.get("started_at")
-                if not isinstance(started_at, (int, float)) or isinstance(started_at, bool):
-                    started_at = None
-                    try:
-                        from tools.delegate_tool_registry import _active_subagents, _active_subagents_lock
-                        task_idx = kwargs.get("task_index")
-                        with _active_subagents_lock:
-                            rec = _active_subagents.get(subagent_id) if subagent_id else None
-                            if rec is None:
-                                for cand in _active_subagents.values():
-                                    owner_sid = str(cand.get("owner_agent_session_id") or cand.get("owner_session_id") or "")
-                                    parent_sid = str(cand.get("parent_session_id") or "")
-                                    gw_key = str(cand.get("gateway_session_key") or "")
-                                    sid_match = bool(session_id) and (
-                                        owner_sid == session_id
-                                        or parent_sid == session_id
-                                        or gw_key == session_id
-                                    )
-                                    if not sid_match:
-                                        continue
-                                    if subagent_id and cand.get("subagent_id") == subagent_id:
-                                        rec = cand
-                                        break
-                                    if task_idx is not None and cand.get("task_index") == task_idx:
-                                        rec = cand
-                                        break
-                            if rec is not None:
-                                cand_started = rec.get("started_at")
-                                if isinstance(cand_started, (int, float)) and not isinstance(cand_started, bool):
-                                    started_at = cand_started
-                    except Exception:
-                        pass
-                now_ts = time.time()
-                default_status = "completed" if normalized_event_name == "subagent.complete" else "running"
-                subagent_payload: dict[str, Any] = {
-                    "message_id": message_id,
-                    "event_type": normalized_event_name,
-                    "subagent_id": _json_safe(subagent_id),
-                    "goal": _json_safe(
-                        kwargs.get("goal")
-                        or args_dict.get("goal")
-                        or (preview if normalized_event_name == "subagent.start" else None)
-                    ),
-                    "tool_name": _json_safe(tool_name or kwargs.get("tool_name") or kwargs.get("action")),
-                    "preview": _json_safe(preview or kwargs.get("summary") or kwargs.get("action")),
-                    "args": _json_safe(args),
-                    "status": _json_safe(kwargs.get("status") or default_status),
-                    "timestamp": now_ts,
-                }
-                if isinstance(started_at, (int, float)) and not isinstance(started_at, bool):
-                    subagent_payload["started_at"] = float(started_at)
-                    subagent_payload["running_seconds"] = round(max(0.0, now_ts - float(started_at)), 1)
-                elif isinstance(kwargs.get("running_seconds"), (int, float)) and not isinstance(kwargs.get("running_seconds"), bool):
-                    subagent_payload["running_seconds"] = round(max(0.0, float(kwargs["running_seconds"])), 1)
-                if "task_index" in kwargs:
-                    subagent_payload["task_index"] = _json_safe(kwargs.get("task_index"))
-                events.enqueue(normalized_event_name, subagent_payload)
-                if event_type in _SUBAGENT_PULSE_EVENTS and getattr(self.gateway_runner, "session_authority", None) is None:
-                    self.handle_session_subagent_pulse(
-                        session_id,
-                        event_type,
-                        tool_name,
-                        preview,
-                        args,
-                        **kwargs,
-                    )
-
-        def _commentary(text: str, *, already_streamed: bool = False) -> None:
-            # Mid-turn assistant commentary (Codex ``phase="commentary"``, text beside tool calls)
-            # as its own typed event — never folded into ``assistant.completed`` (#67580).
-            if isinstance(text, str) and text.strip():
-                events.enqueue("assistant.commentary", {
-                    "message_id": message_id,
-                    "text": self._resolve_message_media(text),
-                    "already_streamed": bool(already_streamed),
-                })
-                mirror.enqueue_commentary(text)
-
-        approval_notify = self._register_session_stream_approval(run_id, events, message_id)
-
-        async def _run_and_signal() -> None:
-            turn_cancelled = False
-            turn_failed = False
-            try:
-                await queue.put(_event_payload("run.started", {
-                    "user_message": {"role": "user", "content": user_message},
-                    "runtime": runtime_meta,
-                    "timestamp": time.time()}))
-                self._set_run_status(run_id, "running", last_event="run.started")
-                await queue.put(_event_payload("message.started", {
-                    "message": {"id": message_id, "role": "assistant", "timestamp": time.time()},
-                    "timestamp": time.time()}))
-                history = await self._conversation_history_for_session(session_id)
-                result, usage = await self._run_agent(
-                    conversation_history=history, stream_delta_callback=_delta,
-                    tool_progress_callback=_tool_progress, interim_assistant_callback=_commentary,
-                    active_run_id=run_id, approval_notify_callback=approval_notify,
-                    approval_session_key=run_id, **ctx["run_kwargs"])
-                await events.flush()
-                is_dict = isinstance(result, dict)
-                raw_final_response = result.get("final_response", "") if is_dict else ""
-                final_response = self._resolve_message_media(raw_final_response)
-                effective_session_id = result.get("session_id", session_id) if is_dict else session_id
-                turn_messages = self._turn_transcript_messages(history, user_message, result) if is_dict else []
-                effective_runtime = self._effective_turn_runtime(runtime_request, result, usage)
-                # Terminal status and flags come from the result (interrupted -> cancelled,
-                # unfinished -> failed); a late steer rides along as ``pending_steer`` for replay.
-                status, fields = _api_runs.terminal_run_status(result if is_dict else {})
-                await mirror.drain()
-                await _finalize_pulse_ticker(status or "completed")
-                await mirror.send_final(raw_final_response)
-                await queue.put(_event_payload("assistant.completed", {
-                    "session_id": effective_session_id, "message_id": message_id,
-                    "content": final_response, **fields, "runtime": effective_runtime,
-                    "timestamp": time.time()}))
-                await queue.put(_event_payload(f"run.{status}", {
-                    "session_id": effective_session_id, "message_id": message_id, **fields,
-                    "messages": turn_messages, "usage": usage, "runtime": effective_runtime}))
-                self._set_run_status(
-                    run_id, status, session_id=effective_session_id,
-                    # The reply text, so a caller whose stream died can still read it from
-                    # GET /v1/runs/{run_id}; POST /v1/runs already records output in `_finish`.
-                    output=final_response, usage=usage,
-                    last_event=f"run.{status}", **fields)
-            except asyncio.CancelledError:
-                turn_cancelled = True
-                self._set_run_status(run_id, "cancelled", last_event="run.cancelled")
-                raise
-            except Exception as exc:
-                turn_failed = True
-                logger.exception("[api_server] session chat stream failed")
-                self._set_run_status(
-                    run_id, "failed", error=_redact_api_error_text(exc), last_event="run.failed")
-                await queue.put(_event_payload("error", {"message": _redact_api_error_text(exc)}))
-            finally:
-                try:
-                    await mirror.drain()
-                except Exception:
-                    logger.debug("Telegram mirror drain failed in finally (non-fatal)", exc_info=True)
-                await _finalize_pulse_ticker("cancelled" if turn_cancelled else "failed" if turn_failed else "completed")
-                self._active_run_agents.pop(run_id, None)
-                self._run_approval_sessions.pop(run_id, None)
-                self._release_run_owner_if_forgotten(run_id)
-                await events.flush()
-                await queue.put(_event_payload("done", {}))
-                await queue.put(None)
-
-        # NOT in _active_run_tasks: _run_agent already counts this turn for the shutdown drain.
-        task = asyncio.create_task(_run_and_signal())
-        self._track_background_task(task)
-        response = await self._prepare_sse_response(request, session_id, gateway_session_key)
-        try:
-            while True:
-                try:
-                    item = await asyncio.wait_for(queue.get(), timeout=CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS)
-                except TimeoutError:
-                    await response.write(b": keepalive\n\n")
-                    continue
-                if item is None:
-                    break
-                name, payload = item
-                await response.write(_sse_frame(payload, event=name, ensure_ascii=False))
-        except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError):
-            if not self._is_preserved(session_id, preserve_on_disconnect):
-                await self._drain_session_stream_task_on_disconnect(
-                    run_id, task, interrupt_message="SSE client disconnected", shield_wait=False)
-                logger.info("Session SSE client disconnected; interrupted live run %s", run_id)
-            else:
-                logger.info("Session SSE client disconnected; preserved live run %s", run_id)
-        except asyncio.CancelledError:
-            if not self._is_preserved(session_id, preserve_on_disconnect):
-                await self._drain_session_stream_task_on_disconnect(
-                    run_id, task, interrupt_message="SSE task cancelled", shield_wait=True)
-                logger.info("Session SSE task cancelled; drained live run %s", run_id)
-            else:
-                logger.info("Session SSE task cancelled; preserved live run %s", run_id)
-            raise
-        except Exception as exc:
-            logger.debug("[api_server] session SSE stream error: %s", exc)
-        return response
-
-    def _register_session_stream_approval(self, run_id: str, events: _SessionEventQueue, message_id: str):
-        """Route a session-stream turn's dangerous-command approvals to its SSE queue and to
-        ``POST /v1/runs/{run_id}/approval`` (#58856). Keyed by the run id (never the shared
-        session key) so concurrent turns on one session can't cross-resolve."""
-        self._run_approval_sessions[run_id] = run_id
-
-        def _approval_notify(approval_data: dict[str, Any]) -> None:
-            event = _approval_request_event(run_id, approval_data, message_id=message_id)
-            self._set_run_status(run_id, "waiting_for_approval", last_event="approval.request", approval=event)
-            events.enqueue("approval.request", event)  # executor thread -> loop hop inside
-        return _approval_notify
-
-    async def _drain_session_stream_task_on_disconnect(
-        self, run_id: str, task: asyncio.Task, *, interrupt_message: str, shield_wait: bool
-    ) -> None:
-        """Preserve live run control refs until the executor-backed turn actually exits."""
-        agent = self._active_run_agents.get(run_id)
-        if agent is None:
-            if not task.done():
-                task.cancel()
-                with suppress(Exception):
-                    await task
-            return
-        with suppress(Exception):
-            agent.interrupt(interrupt_message)
-        if not task.done():
-            with suppress(Exception):
-                await (asyncio.shield(task) if shield_wait else task)
-
-    @_require_auth
-    async def _handle_session_model_lock(self, request: web.Request) -> web.Response:
-        """POST /api/sessions/{session_id}/model — backend-ack a Browser model lock."""
-        session_id = request.match_info["session_id"]
-        _, err = await self._get_existing_session_or_404(session_id)
-        if err:
-            return err
-        body, err = await self._read_json_body(request)
-        if err:
-            return err
-        runtime_request = self._session_runtime_request_from_body(body)
-        runtime_request["require_model_lock"] = True
-        lock_error = self._runtime_lock_error(runtime_request)
-        if lock_error is not None:
-            return lock_error
-        if not await asyncio.to_thread(self._persist_session_runtime_lock, session_id, runtime_request):
-            return _error_response(
-                "Could not persist the requested session model lock", 500, code="model_lock_persistence_failed")
-        requested = runtime_request.get("requested") or {}
-        route = runtime_request.get("route") or {}
-        runtime = self._sanitize_runtime_metadata(
-            runtime={
-                "provider": route.get("provider") or requested.get("provider") or "",
-                "model": route.get("model") or requested.get("model") or "",
-                "route_source": runtime_request.get("route_source") or "raw_request"},
-            requested_runtime=requested,
-            route_source=runtime_request.get("route_source") or "raw_request",
-            model_lock="accepted")
-        return web.json_response(
-            {"object": "hermes.session.model_lock", "session_id": session_id, "runtime": runtime})
 
     # -- Cron jobs API ----------------------------------------------------------------
 
@@ -5366,10 +3262,12 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
 
             def _detach_fire(fire_fn, *fire_args) -> web.Response:
                 # The done callback owns the reservation once the task is detached.
-                task = asyncio.create_task(_api_runs.on_turn_executor(fire_fn, *fire_args, adapters=adapters, loop=loop))
+                task = self._spawn_tracked_task(
+                    _api_runs.on_turn_executor(fire_fn, *fire_args, adapters=adapters, loop=loop),
+                    tolerate_missing=True,
+                )
                 reservation["detached"] = True
                 task.add_done_callback(lambda _task: _release_pending_api_work(self, reservation))
-                self._track_background_task(task, tolerate_missing=True)
                 return web.json_response({"status": "accepted", "job_id": job_id}, status=202)
 
             if not provider_supports_split_fire(provider):
@@ -5390,18 +3288,39 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
     # -- Agent execution --------------------------------------------------------------
 
     def _track_background_task(self, task, *, tolerate_missing: bool = False) -> None:
-        """Register a task in ``_background_tasks`` (tolerates test doubles) with auto-discard.
-        ``tolerate_missing`` (cron fire paths) also swallows AttributeError from the whole
-        registration; the run/sweep paths only tolerate an unhashable task."""
+        """Register a task in ``_background_tasks`` (tolerates test doubles) with auto-discard
+        and exception logging. ``tolerate_missing`` (cron fire paths) also swallows AttributeError
+        from the whole registration; the run/sweep paths only tolerate an unhashable task."""
+        def _on_done(done_task) -> None:
+            with suppress(AttributeError, TypeError):
+                self._background_tasks.discard(done_task)
+            try:
+                if hasattr(done_task, "cancelled") and done_task.cancelled():
+                    return
+                if hasattr(done_task, "exception"):
+                    exc = done_task.exception()
+                    if exc is not None:
+                        logger.error("Background task failed: %s", exc, exc_info=exc)
+            except asyncio.CancelledError:
+                return
+            except Exception:
+                logger.debug("Failed inspecting completed background task", exc_info=True)
+
         if tolerate_missing:
             with suppress(TypeError, AttributeError):
                 self._background_tasks.add(task)
-                task.add_done_callback(self._background_tasks.discard)
+                task.add_done_callback(_on_done)
             return
         with suppress(TypeError):
             self._background_tasks.add(task)
         if hasattr(task, "add_done_callback"):
-            task.add_done_callback(self._background_tasks.discard)
+            task.add_done_callback(_on_done)
+
+    def _spawn_tracked_task(self, coro, *, tolerate_missing: bool = False) -> asyncio.Task[Any]:
+        """Create an asyncio task and immediately register it via ``_track_background_task``."""
+        task = asyncio.create_task(coro)
+        self._track_background_task(task, tolerate_missing=tolerate_missing)
+        return task
 
     def _concurrency_limited_response(self) -> Optional[web.Response]:
         """429 when the concurrent-run cap is reached (0 disables), else None. Uses the same
@@ -5612,8 +3531,6 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                         from agent.session_persistence import adopt_unanswered_turn
 
                         adopt_unanswered_turn(conversation_history, user_message, agent)
-                    if active_run_id:
-                        self._active_run_agents[active_run_id] = agent
                     effective_task_id = session_id or str(uuid.uuid4())
                     # Process baseline for disconnect reaping (this surface bypasses TurnRunner)
                     # + shutdown-interrupt registration, once for every caller.
@@ -5628,7 +3545,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                     # _ProviderAuthResolutionError handler below lives here rather than in each route. Only
                     # two callers pass ``agent_ref``, and only /v1/runs has a run_id, so neither is a usable
                     # hook for the rest. See #63529.
-                    self._shutdown_interruptible_agents[id(agent)] = agent
+                    self._register_active_agent(agent, run_id=active_run_id, session_id=session_id)
                     # Passed only when set: a human turn keeps today's call shape.
                     author_kwargs = {"turn_author": turn_author} if turn_author is not None else {}
                     conversation_kwargs = dict(
@@ -5683,11 +3600,9 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 finally:
                     # Turn over (any outcome): clear ownership so a late disconnect can't reap
                     # background work this turn deliberately left running.
-                    if active_run_id:
-                        self._active_run_agents.pop(active_run_id, None)
+                    self._unregister_active_agent(agent, run_id=active_run_id, session_id=session_id)
                     if agent is not None:
                         _clear_turn_process_ownership(agent)
-                        self._shutdown_interruptible_agents.pop(id(agent), None)
                         self._memory_sessions.checkin(agent)
                         # Bind the declared key to the row the turn actually ended on
                         # (agent.session_id carries a mid-turn rotation). Opt-in per route.
@@ -5860,7 +3775,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             self._app["api_server_adapter"] = self
             if self.gateway_runner is not None:
                 self._app["gateway_runner"] = self.gateway_runner
-            self._track_background_task(asyncio.create_task(self._sweep_orphaned_runs()))
+            self._spawn_tracked_task(self._sweep_orphaned_runs())
             # Network-accessible + unsandboxed local terminal backend = host-user RCE surface;
             # warn, don't refuse (the operator may have a firewall / strong key).
             if is_network_accessible(self._host):
@@ -5930,7 +3845,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             # Publish a metrics-bearing snapshot at bind and keep it fresh: the
             # heartbeat loop updates last_heartbeat/metrics_today (#52323).
             self._publish_runtime_status()
-            self._track_background_task(asyncio.create_task(self._heartbeat_loop()))
+            self._spawn_tracked_task(self._heartbeat_loop())
             logger.info(
                 "[%s] API server listening on http://%s:%d (model: %s)",
                 self.name, self._host, self._port, self._model_name)

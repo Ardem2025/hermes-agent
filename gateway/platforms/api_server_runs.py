@@ -27,11 +27,13 @@ except ImportError:
     RequestKey = None  # type: ignore[assignment,misc]
 
 from gateway.platforms.api_server_room_grants import _json_error, _room_grant_error_response, room_run_claims
-from gateway.turn_executor import _UnboundedThreadExecutor
+from gateway.turn_executor import BoundedThreadExecutor
 from gateway.platforms.api_server_run_idempotency import TERMINAL_STATUSES
 
 
 logger = logging.getLogger("gateway.platforms.api_server")
+
+MAX_RUN_STATUSES = 2000
 
 # Executor-thread lifetime for API-server agent turns (#116535). The handler-side
 # ``_inflight_agent_runs`` count in api_server.py drops in the handler's ``finally`` when the
@@ -49,20 +51,45 @@ _API_WORKER_LIVE = 0
 # Created on first use and retired at adapter disconnect (``_close_run_state``), so its parked
 # threads do not outlive the adapter that used them; the loop's default executor this replaced
 # went away with its loop the same way.
-_API_TURN_EXECUTOR: _UnboundedThreadExecutor | None = None
+_API_TURN_EXECUTOR: BoundedThreadExecutor | None = None
 _API_TURN_EXECUTOR_LOCK = threading.Lock()
 
 
-def api_turn_executor() -> _UnboundedThreadExecutor:
-    """The executor that runs API-server agent turns and cron fires (never the loop's default)."""
+def _resolve_api_turn_max_workers(max_workers: Optional[int] = None) -> int:
+    """Compute bounded worker cap: ``max(8, max_concurrent_runs * 2)`` with optional override."""
+    if max_workers is not None:
+        return max(1, int(max_workers))
+    env_override = os.getenv("HERMES_API_TURN_MAX_WORKERS", "").strip()
+    if env_override:
+        try:
+            return max(1, int(env_override))
+        except ValueError:
+            pass
+    max_concurrent_runs = 10
+    with suppress(Exception):
+        from hermes_cli.config import cfg_get, load_config
+        cfg = load_config()
+        explicit_workers = cfg_get(cfg, "gateway", "api_server", "max_turn_workers", default=None)
+        if explicit_workers is not None:
+            return max(1, int(explicit_workers))
+        max_concurrent_runs = max(0, int(cfg_get(cfg, "gateway", "api_server", "max_concurrent_runs", default=10)))
+    default_pool_floor = min(32, (os.cpu_count() or 1) + 4) + 2
+    return max(8, max_concurrent_runs * 2, default_pool_floor)
+
+
+def api_turn_executor(max_workers: Optional[int] = None) -> BoundedThreadExecutor:
+    """The bounded executor that runs API-server agent turns and cron fires (never the loop's default)."""
     global _API_TURN_EXECUTOR
     with _API_TURN_EXECUTOR_LOCK:
         if _API_TURN_EXECUTOR is None:
-            _API_TURN_EXECUTOR = _UnboundedThreadExecutor(thread_name_prefix="hermes-api-turn")
+            _API_TURN_EXECUTOR = BoundedThreadExecutor(
+                max_workers=_resolve_api_turn_max_workers(max_workers),
+                thread_name_prefix="hermes-api-turn",
+            )
         return _API_TURN_EXECUTOR
 
 
-def retire_api_turn_executor() -> _UnboundedThreadExecutor | None:
+def retire_api_turn_executor() -> BoundedThreadExecutor | None:
     """Shut the API turn executor down without waiting and return it (None if never used).
 
     Parked workers exit now; a worker still inside a turn finishes it, releases its
@@ -323,6 +350,8 @@ def _set_run_status(self, run_id: str, status: str, **fields: Any) -> dict[str, 
     if status != "waiting_for_approval":
         current.pop("approval", None)
     self._run_statuses[run_id] = current
+    if len(self._run_statuses) > MAX_RUN_STATUSES:
+        _evict_excess_terminal_run_statuses(self)
     should_persist = (
         status != previous_status
         or status in TERMINAL_STATUSES
@@ -334,6 +363,21 @@ def _set_run_status(self, run_id: str, status: str, **fields: Any) -> dict[str, 
         except Exception:
             logger.exception("[api_server] failed to persist idempotent run status %s", run_id)
     return current
+
+
+def _evict_excess_terminal_run_statuses(self) -> None:
+    """Evict oldest terminal run statuses when ``_run_statuses`` exceeds ``MAX_RUN_STATUSES``."""
+    if len(self._run_statuses) <= MAX_RUN_STATUSES:
+        return
+    terminal_entries = [
+        (float(info.get("updated_at", 0) or 0), rid)
+        for rid, info in self._run_statuses.items()
+        if isinstance(info, dict) and info.get("status") in TERMINAL_STATUSES
+    ]
+    terminal_entries.sort()
+    excess = len(self._run_statuses) - MAX_RUN_STATUSES
+    for _, rid in terminal_entries[:excess]:
+        _forget_run(self, rid, self._run_statuses, self._run_idempotency_ids)
 
 
 def _mark_shutdown_interrupted_runs(self, run_ids) -> None:
@@ -610,6 +654,8 @@ def _forget_run(self, run_id: str, *tables) -> None:
 
 def _retire_live_run(self, run_id: str) -> None:
     """Retire agent/task/approval control state once the executor-backed task is done."""
+    if hasattr(self, "_unregister_active_agent"):
+        self._unregister_active_agent(run_id=run_id)
     _forget_run(self, run_id, self._active_run_agents, self._active_run_tasks, self._run_approval_sessions,
                 self._stopping_run_ids, self._shutdown_interrupted_run_ids)
 
@@ -942,10 +988,13 @@ async def _handle_runs(self, request: web.Request, *, _api_server) -> web.Respon
             _execute_run_via_live_owner(self, launch, *admitted, _api_server=_api_server))
     else:
         task = self._active_run_tasks[run_id] = asyncio.create_task(_execute_run(self, launch, _api_server=_api_server))
-    with suppress(TypeError):
-        self._background_tasks.add(task)  # tracked for shutdown drain
-    if hasattr(task, "add_done_callback"):
-        task.add_done_callback(self._background_tasks.discard)
+    if hasattr(self, "_track_background_task"):
+        self._track_background_task(task)
+    else:
+        with suppress(TypeError):
+            self._background_tasks.add(task)  # tracked for shutdown drain
+        if hasattr(task, "add_done_callback"):
+            task.add_done_callback(self._background_tasks.discard)
     return _accepted_response(run_id, "started", gateway_session_key, replayed=False)
 
 
@@ -1189,7 +1238,10 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
                 agent = self._create_agent(
                     stream_delta_callback=_text_cb, tool_progress_callback=self._make_run_event_callback(run_id, loop),
                     interim_assistant_callback=_interim_cb, **run.agent_kwargs)
-            self._active_run_agents[run_id] = agent
+            if hasattr(self, "_register_active_agent"):
+                self._register_active_agent(agent, run_id=run_id)
+            else:
+                self._active_run_agents[run_id] = agent
             approval_notify = _make_approval_notify(self, run, _api_server=_api_server)
             result, usage, served_runtime = await _submit_api_worker(
                 loop, lambda: _run_agent_sync(self, run, agent, approval_notify, _api_server=_api_server))
@@ -1620,6 +1672,7 @@ def _sweep_orphaned_runs_once(self, now: Optional[float] = None) -> None:
             _unregister_approval_notify(self._run_approval_sessions.get(run_id))
             _retire_live_run(self, run_id)
     for run_id, status in list(self._run_statuses.items()):
-        if (status.get("status") in {"completed", "failed", "cancelled"}
+        if (status.get("status") in TERMINAL_STATUSES
                 and now - float(status.get("updated_at", 0) or 0) > self._RUN_STATUS_TTL):
             _forget_run(self, run_id, self._run_statuses, self._run_idempotency_ids)
+    _evict_excess_terminal_run_statuses(self)

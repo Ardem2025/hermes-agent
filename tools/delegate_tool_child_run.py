@@ -18,7 +18,8 @@ from dataclasses import dataclass, field
 from tools import file_state
 from tools.delegate_tool_progress import _quiet, _safe_progress
 from tools.delegate_tool_registry import (
-    _capture_gateway_steer_authority, _close_subagent_steering, _register_subagent, _unregister_subagent,
+    _capture_gateway_steer_authority, _close_subagent_steering, _mark_subagent_terminal, _register_subagent,
+    _unregister_subagent,
 )
 from tools.delegate_tool_results import (
     _extract_output_tail, _looks_like_error_output, _stringify_tool_content, _summarize_tool_arguments,
@@ -853,8 +854,18 @@ class _ChildRun:
     ) -> dict[str, Any]:
         """Shared tail of every failure path: emit ``subagent.complete`` (``status`` defaults to the entry's), note
         the steer text that won the race with the failure, report the worktree."""
+        terminal_status = status or entry["status"]
+        if self.subagent_id:
+            _mark_subagent_terminal(
+                self.subagent_id,
+                status=terminal_status,
+                duration_seconds=entry.get("duration_seconds"),
+                failure_reason=entry.get("failure_reason"),
+                error=entry.get("error"),
+                agent=self.child,
+            )
         _safe_progress(
-            self.child_progress_cb, "subagent.complete", preview=redact_child_text(preview, force=False), status=status or entry["status"],
+            self.child_progress_cb, "subagent.complete", preview=redact_child_text(preview, force=False), status=terminal_status,
             duration_seconds=entry["duration_seconds"],
             summary=redact_child_text(summary, force=False) if summary is not None else None,
         )
@@ -1091,6 +1102,15 @@ class _ChildRun:
     def emit_complete(self, result: dict[str, Any], entry: dict[str, Any], duration: float) -> None:
         """Fire ``subagent.complete`` with the per-branch observability payload (tokens, cost, files touched,
         tool-output tail); every field is optional and degrades gracefully on the client."""
+        if self.subagent_id:
+            _mark_subagent_terminal(
+                self.subagent_id,
+                status=str(entry.get("status") or "completed"),
+                duration_seconds=duration,
+                failure_reason=entry.get("failure_reason"),
+                error=entry.get("error"),
+                agent=self.child,
+            )
         if not self.child_progress_cb:
             return
         child = self.child

@@ -863,20 +863,12 @@ def has_live_for_session(session_key: str = "", origin_ui_session_id: str = "", 
     return bool(_session_records(_LIVE_STATES, session_key, origin_ui_session_id, parent_session_id))
 
 
-def has_active_or_pending_for_session(
+def has_pending_delivery_for_session(
     session_key: str = "",
     origin_ui_session_id: str = "",
-    parent_session_id: str = ""
+    parent_session_id: str = "",
 ) -> bool:
-    """Whether a session still owns any live (running/stalling/finalizing) delegation
-    or any completed delegation whose result is still pending delivery."""
-    if has_live_for_session(
-        session_key=session_key,
-        origin_ui_session_id=origin_ui_session_id,
-        parent_session_id=parent_session_id,
-    ):
-        return True
-
+    """Whether a session has any completed delegation whose result is still pending delivery in SQLite."""
     if not _db_path().exists():
         return False
 
@@ -906,6 +898,26 @@ def has_active_or_pending_for_session(
     except Exception as exc:
         logger.debug("Failed to check pending async delegations for session: %s", exc)
         return False
+
+
+def has_active_or_pending_for_session(
+    session_key: str = "",
+    origin_ui_session_id: str = "",
+    parent_session_id: str = ""
+) -> bool:
+    """Whether a session still owns any live (running/stalling/finalizing) delegation
+    or any completed delegation whose result is still pending delivery."""
+    if has_live_for_session(
+        session_key=session_key,
+        origin_ui_session_id=origin_ui_session_id,
+        parent_session_id=parent_session_id,
+    ):
+        return True
+    return has_pending_delivery_for_session(
+        session_key=session_key,
+        origin_ui_session_id=origin_ui_session_id,
+        parent_session_id=parent_session_id,
+    )
 
 
 def _new_delegation_id() -> str:
