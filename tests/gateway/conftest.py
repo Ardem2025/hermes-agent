@@ -740,3 +740,15 @@ def hosted_owner(tmp_path, monkeypatch):
     thread.join()
     loop.close()
     store._db.close()
+
+
+@pytest.fixture(autouse=True)
+def _clear_telegram_shared_flood_cooldowns():
+    try:
+        from plugins.platforms.telegram.telegram_flood_cooldown import clear_send_flood_cooldowns
+    except ImportError:
+        yield
+        return
+    clear_send_flood_cooldowns()
+    yield
+    clear_send_flood_cooldowns()

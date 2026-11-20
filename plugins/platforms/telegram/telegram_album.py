@@ -185,6 +185,27 @@ async def send_photo_album(
                         adapter.name, chunk_idx + 1, len(chunks), redact(err), exc_info=True)
                     ambiguous = delivered = True
                     continue
+                from plugins.platforms.telegram import telegram_send_errors as kinds
+                from gateway.delivery_ledger import flood_wait_seconds, is_flood_error
+                if not per_photo_fallback and (kinds.send_error_kind(err) == kinds.FLOOD or is_flood_error(err)):
+                    from agent.retry_utils import coerce_retry_after_seconds
+                    wait = coerce_retry_after_seconds(getattr(err, "retry_after", None))
+                    if wait is None:
+                        wait = coerce_retry_after_seconds(str(err))
+                    if wait is None and is_flood_error(err):
+                        wait = flood_wait_seconds(err, default=30.0)
+                    if wait is None:
+                        wait = 30.0
+                    clamped = max(1.0, min(float(wait), 86400.0))
+                    if hasattr(adapter, "_record_send_flood_cooldown"):
+                        adapter._record_send_flood_cooldown(chat_id, clamped)
+                    detail = {"failed": failed, "refused": refused, "ambiguous": ambiguous} if failed or refused or ambiguous else None
+                    return SendResult(
+                        success=False,
+                        error=f"flood_control:{clamped:.1f}",
+                        retry_after=clamped,
+                        raw_response=detail,
+                    )
                 logger.warning("[%s] send_media_group refused (chunk %d/%d), falling back to per-image: %s",
                                adapter.name, chunk_idx + 1, len(chunks), redact(err), exc_info=True)
         if per_photo_fallback:

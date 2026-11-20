@@ -18,6 +18,8 @@ import threading
 from dataclasses import dataclass
 from typing import Any, List, Optional
 
+from gateway.delivery_ledger import is_flood_error
+
 
 # Log-record parity with the origin module.
 logger = logging.getLogger("cron.scheduler")
@@ -1148,9 +1150,11 @@ def _note_target_error(job: dict, msg: str, errors: list) -> None:
     errors.append(msg)
 
 
-def _warn_live_lane_failure(job: dict, msg: str, is_relay: bool) -> None:
-    """Relay targets have no standalone fallback, so the log line must not promise one."""
-    if is_relay:
+def _warn_live_lane_failure(
+    job: dict, msg: str, is_relay: bool, *, suppress_fallback_note: bool = False
+) -> None:
+    """Relay targets and flood-refused sends have no standalone fallback, so the log line must not promise one."""
+    if is_relay or suppress_fallback_note:
         logger.warning("Job '%s': %s", job["id"], msg)
     else:
         logger.warning("Job '%s': %s, falling back to standalone", job["id"], msg)
@@ -1377,7 +1381,7 @@ def _live_send_text(
             err, shape = getattr(send_result, "error", None), type(send_result).__name__
         msg = f"live adapter send to {t.where} returned unconfirmed result ({shape}, error={err})"
         t.live_error = str(err) if err else None
-        _warn_live_lane_failure(job, msg, t.is_relay)
+        _warn_live_lane_failure(job, msg, t.is_relay, suppress_fallback_note=is_flood_error(t.live_error))
         target_errors.append(msg)
         return False, False, None
     if send_raw_response and t.thread_id and send_raw_response.get("thread_fallback"):
@@ -1556,7 +1560,12 @@ def _deliver_via_live_adapter(
         err_msg = f"live adapter delivery to {t.where} failed: {e}"
         if not any(err_msg in err for err in target_errors):
             target_errors.append(err_msg)
-        _warn_live_lane_failure(job, err_msg, t.is_relay)
+        _warn_live_lane_failure(
+            job,
+            err_msg,
+            t.is_relay,
+            suppress_fallback_note=is_flood_error(t.live_error) or is_flood_error(e),
+        )
     return delivered
 
 
@@ -1666,6 +1675,13 @@ def _deliver_standalone(
         # Relay owns the destination and credential; a native retry could duplicate — fail closed.
         if not target_errors:
             target_errors.append(f"relay delivery to {t.where} failed")
+        delivery_errors.extend(target_errors)
+        return
+    if is_flood_error(t.live_error):
+        # Live adapter already refused with flood control; falling back to standalone would hit
+        # the same Bot API rate limit and extend the ban — fail closed without standalone or reconnect queue.
+        if not target_errors:
+            target_errors.append(f"live adapter delivery to {t.where} failed: {t.live_error}")
         delivery_errors.extend(target_errors)
         return
     result, err = _standalone_send(t, content, media_files)

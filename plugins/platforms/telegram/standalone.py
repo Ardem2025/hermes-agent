@@ -15,8 +15,18 @@ from types import SimpleNamespace
 
 from agent.redact import redact_sensitive_text
 from agent.retry_utils import coerce_retry_after_seconds
+from gateway.delivery_ledger import flood_wait_seconds, is_flood_error
+from plugins.platforms.telegram.telegram_flood_cooldown import (
+    record_send_flood_cooldown,
+    send_flood_cooldown_remaining,
+)
 from plugins.platforms.telegram.telegram_markdown import _MD_CODE_RE
-from plugins.platforms.telegram.telegram_send_errors import SAME_REQUEST_ATTEMPTS, is_entity_parse_error
+from plugins.platforms.telegram.telegram_send_errors import (
+    FLOOD as _FLOOD_ERROR_KIND,
+    SAME_REQUEST_ATTEMPTS,
+    is_entity_parse_error,
+    send_error_kind,
+)
 from pm import install_hint
 
 logger = logging.getLogger(__name__)
@@ -44,6 +54,23 @@ def _sanitize_error_text(text) -> str:
 
 def _error(message: str) -> dict:
     return {"error": _sanitize_error_text(message)}
+
+
+def _flood_wait_from_exception(exc: Exception) -> float | None:
+    """Return wait seconds when ``exc`` is a Telegram flood-control error, else ``None``."""
+    if send_error_kind(exc) != _FLOOD_ERROR_KIND and not is_flood_error(exc):
+        return None
+    wait = coerce_retry_after_seconds(getattr(exc, "retry_after", None))
+    if wait is None:
+        wait = coerce_retry_after_seconds(str(exc))
+    if wait is None and is_flood_error(exc):
+        wait = flood_wait_seconds(exc, default=30.0)
+    return 30.0 if wait is None else wait
+
+
+def _record_and_format_flood_error(token: str | None, chat_id, wait: float | int) -> dict:
+    clamped = record_send_flood_cooldown(token, chat_id, wait)
+    return _error(f"flood_control:{clamped:.1f}")
 
 
 def _success(chat_id, warnings=None, **fields) -> dict:
@@ -344,6 +371,13 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
         return _error(f"Telegram topic '{thread_id}' is a name, not a thread id: a direct send cannot "
                       "resolve named topics. Use telegram:<chat_id>:<numeric thread id>, or deliver "
                       "through a cron job while the gateway is running.")
+    remaining = send_flood_cooldown_remaining(token, chat_id)
+    if remaining is not None and remaining > 0:
+        logger.warning(
+            "Telegram flood control still active for chat %s (%.0fs left); refusing standalone send locally without an API call",
+            chat_id, remaining,
+        )
+        return _error(f"flood_control:{remaining:.1f}")
     try:
         from plugins.platforms.telegram.telegram_outbound import (
             is_visually_empty, notification_kwargs, resolve_notifications_mode, send_album_standalone,
@@ -367,8 +401,18 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
             rich = await send_rich_standalone(bot, {**(extra or {}), "disable_link_previews": disable_link_previews},
                                               chat_id, message, thread_id=thread_id, notify=notify)
             if rich is not None:
-                return (_success(chat_id, message_id=rich.message_id) if rich.success
-                        else _error(f"Telegram send failed: {rich.error}"))
+                if rich.success:
+                    return _success(chat_id, message_id=rich.message_id)
+                if is_flood_error(rich.error) or getattr(rich, "retry_after", None) is not None:
+                    wait = getattr(rich, "retry_after", None)
+                    if wait is None:
+                        wait = flood_wait_seconds(rich.error, default=30.0)
+                    clamped = record_send_flood_cooldown(token, chat_id, wait)
+                    err_text = str(rich.error or "")
+                    if err_text.strip().lower().startswith("flood_control:"):
+                        return _error(err_text)
+                    return _error(f"flood_control:{clamped:.1f}")
+                return _error(f"Telegram send failed: {rich.error}")
         # MEDIA caption rides on the bubble as its *formatted* caption; formatting can inflate a
         # raw <1024 string past Telegram's cap, so re-check in UTF-16 units.
         _cap, _ = _media_caption_split(message, media_files)
@@ -388,6 +432,15 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
             last_msg = await _telegram_send_text_chunk(bot, int_chat_id, chunk, send_parse_mode, _has_html, text_kwargs)
         if album := _telegram_album_paths(media_files, force_document, _tg_caption):
             result = await send_album_standalone(bot, extra or {}, chat_id, album, thread_id=thread_id, notify=notify)
+            if not result.success and (is_flood_error(result.error) or getattr(result, "retry_after", None) is not None):
+                wait = getattr(result, "retry_after", None)
+                if wait is None:
+                    wait = flood_wait_seconds(result.error, default=30.0)
+                clamped = record_send_flood_cooldown(token, chat_id, wait)
+                err_text = str(result.error or "")
+                if err_text.strip().lower().startswith("flood_control:"):
+                    return _error(err_text)
+                return _error(f"flood_control:{clamped:.1f}")
             detail = result.raw_response or {}
             warnings += [_sanitize_error_text(f"Failed to send Telegram photo {path}: {err}")
                          for path, err in detail.get("failed", ())]
@@ -409,6 +462,8 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
                             bot, chat_id=int_chat_id, text=_tg_caption, parse_mode=send_parse_mode, **text_kwargs)
                         _tg_caption = None  # delivered — don't re-caption a later file
                     except Exception as _cap_err:
+                        if (flood_wait := _flood_wait_from_exception(_cap_err)) is not None:
+                            return _record_and_format_flood_error(token, chat_id, flood_wait)
                         logger.warning("Telegram caption-fallback send failed for missing media: %s",
                                        _sanitize_error_text(_cap_err))
                 continue
@@ -417,6 +472,8 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
                     bot, int_chat_id, media_path, is_voice, caption=_tg_caption, parse_mode=send_parse_mode,
                     has_html=_has_html, thread_kwargs=thread_kwargs, force_document=force_document)
             except Exception as e:
+                if (flood_wait := _flood_wait_from_exception(e)) is not None:
+                    return _record_and_format_flood_error(token, chat_id, flood_wait)
                 warnings.append(_sanitize_error_text(f"Failed to send media {media_path}: {e}"))
                 logger.error(warnings[-1])
         if last_msg is None:
@@ -427,6 +484,8 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
         return {"error": "python-telegram-bot not installed. Run: "
                 f"{install_hint('telegram')}"}
     except Exception as e:
+        if (flood_wait := _flood_wait_from_exception(e)) is not None:
+            return _record_and_format_flood_error(token, chat_id, flood_wait)
         return _error(f"Telegram send failed: {e}")
 
 

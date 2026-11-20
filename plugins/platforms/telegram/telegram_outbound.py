@@ -51,7 +51,9 @@ def _standalone_adapter(bot, extra: dict):
     out-of-process send reuses the gateway's gates, routing and fallbacks verbatim."""
     from gateway.config import PlatformConfig
     from plugins.platforms.telegram.adapter import TelegramAdapter
-    adapter = TelegramAdapter(PlatformConfig(enabled=True, extra=dict(extra or {})))
+    adapter = TelegramAdapter(
+        PlatformConfig(enabled=True, token=getattr(bot, "token", None), extra=dict(extra or {}))
+    )
     adapter._bot = bot
     adapter._notifications_mode = resolve_notifications_mode()
     return adapter
@@ -70,7 +72,23 @@ async def send_rich_standalone(bot, extra: dict, chat_id, content: str, *, threa
     adapter = _standalone_adapter(bot, extra)
     if not adapter._should_attempt_rich(content):
         return None
-    return await adapter._try_send_rich(str(chat_id), content, None, _metadata(thread_id, notify))
+    result = await adapter._try_send_rich(str(chat_id), content, None, _metadata(thread_id, notify))
+    if result is not None and not result.success:
+        from gateway.delivery_ledger import flood_wait_seconds, is_flood_error
+        retry_after = getattr(result, "retry_after", None)
+        if is_flood_error(result.error) or retry_after is not None:
+            wait = retry_after if retry_after is not None else flood_wait_seconds(result.error, default=30.0)
+            clamped = max(1.0, min(float(wait), 86400.0))
+            adapter._record_send_flood_cooldown(chat_id, clamped)
+            from gateway.platforms.base import SendResult
+            return SendResult(
+                success=False,
+                error=f"flood_control:{clamped:.1f}",
+                retry_after=clamped,
+                retryable=result.retryable,
+                raw_response=result.raw_response,
+            )
+    return result
 
 
 async def send_album_standalone(bot, extra: dict, chat_id, paths: list[str], *, thread_id=None, notify=None):

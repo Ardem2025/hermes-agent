@@ -1,3 +1,7 @@
+from plugins.platforms.telegram.telegram_flood_cooldown import (
+    record_send_flood_cooldown as _record_shared_send_flood_cooldown,
+    send_flood_cooldown_remaining as _shared_send_flood_cooldown_remaining,
+)
 from plugins.platforms.telegram.telegram_markdown import _escape_mdv2, to_markdown_v2, _wrap_markdown_tables
 # health: allow FILE_LINES -- platform-tables refactor: core's PLATFORM_HINTS/_PLATFORM_DEFAULTS rows for this platform moved onto its register() call (hint text lives in adapter_hint.py); the growth is only those kwargs
 """Telegram platform adapter (python-telegram-bot): inbound messages/media/commands, outbound replies."""
@@ -5332,31 +5336,52 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
                 if not getattr(lock, "_waiters", None):  # nobody queued: drop the entry (bounded dict)
                     locks.pop(key, None)
 
+    def _flood_cooldown_token(self) -> str:
+        return (
+            getattr(getattr(self, "config", None), "token", None)
+            or getattr(getattr(self, "_bot", None), "token", None)
+            or ""
+        )
+
     def _record_send_flood_cooldown(self, chat_id: Any, wait: float | int) -> SendResult:
         """A send refused with ``retry_after=wait`` arms a per-chat window during which ``send()`` fails
         closed locally (same ``flood_control:<s>`` result, so ledger recognition and redelivery timing are
         unchanged) instead of firing more requests into a penalty Telegram lengthens while it is hammered."""
         until: dict[str, float] = self.__dict__.setdefault("_telegram_send_cooldown_until", {})
-        now = asyncio.get_running_loop().time()
-        for stale in [k for k, t in until.items() if t <= now]:
-            del until[stale]
         key = str(normalize_telegram_chat_id(chat_id))
         clamped = max(1.0, min(float(wait), _MAX_FLOOD_COOLDOWN_SECS))
-        until[key] = max(until.get(key, 0.0), now + clamped)
+        try:
+            now = asyncio.get_running_loop().time()
+        except RuntimeError:
+            now = None
+        if now is not None:
+            for stale in [k for k, t in until.items() if t <= now]:
+                del until[stale]
+            until[key] = max(until.get(key, 0.0), now + clamped)
+        _record_shared_send_flood_cooldown(self._flood_cooldown_token(), chat_id, clamped)
         return _flood_cap_result(wait)
 
     def _send_flood_cooldown_remaining(self, chat_id: Any) -> Optional[float]:
         """Seconds left in this chat's flood window, or ``None`` when sends may go out."""
         until: dict[str, float] = self.__dict__.setdefault("_telegram_send_cooldown_until", {})
         key = str(normalize_telegram_chat_id(chat_id))
+        local_remaining: Optional[float] = None
         deadline = until.get(key)
-        if deadline is None:
-            return None
-        remaining = deadline - asyncio.get_running_loop().time()
-        if remaining > 0:
-            return remaining
-        until.pop(key, None)
-        return None
+        if deadline is not None:
+            try:
+                now = asyncio.get_running_loop().time()
+            except RuntimeError:
+                now = None
+            if now is not None:
+                remaining = deadline - now
+                if remaining > 0:
+                    local_remaining = remaining
+                else:
+                    until.pop(key, None)
+        shared_remaining = _shared_send_flood_cooldown_remaining(self._flood_cooldown_token(), chat_id)
+        if local_remaining is not None and shared_remaining is not None:
+            return max(local_remaining, shared_remaining)
+        return local_remaining if local_remaining is not None else shared_remaining
 
     # --- shared per-chat send+edit pacing budget (#116312) -----------------------------------------
     # One slot per chat that sendMessage AND editMessageText both draw from (Telegram counts them
