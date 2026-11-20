@@ -12,6 +12,7 @@ import pytest
 
 from gateway.config import PlatformConfig
 from plugins.platforms.telegram.adapter import TelegramAdapter
+from plugins.platforms.telegram.telegram_flood_cooldown import clear_send_flood_cooldowns
 import itertools
 
 
@@ -52,6 +53,7 @@ async def test_split_send_resumes_from_undelivered_tail_without_resending_head(m
 
     async def _penalty_elapses(_delay):  # the base retry sleep is mocked; model the window having passed
         adapter._telegram_send_cooldown_until.clear()
+        clear_send_flood_cooldowns()
 
     monkeypatch.setattr("gateway.platforms.base.asyncio.sleep", _penalty_elapses)
     content = _three_chunk_text()
