@@ -169,6 +169,18 @@ def _validate_native(runner, event, provenance=None, fresh_roles=False):
             _refuse(event, 'invalid_params', name)
     if event.reply_expected is not None and type(event.reply_expected) is not bool:
         _refuse(event, 'invalid_params', 'reply_expected')
+    if not isinstance(event.plugin_system_context, str):
+        _refuse(event, 'invalid_params', 'plugin_system_context')
+    if type(event.plugin_onboarding_active) is not bool:
+        _refuse(event, 'invalid_params', 'plugin_onboarding_active')
+    intents = event.plugin_deferred_intents
+    if not isinstance(intents, list) or not all(isinstance(item, dict) for item in intents):
+        _refuse(event, 'invalid_params', 'plugin_deferred_intents')
+    if intents:
+        try:
+            json.dumps(intents, ensure_ascii=False, allow_nan=False)
+        except (TypeError, ValueError):
+            _refuse(event, 'invalid_params', 'plugin_deferred_intents')
     skill = event.auto_skill
     if not (skill is None or isinstance(skill, str)
             or isinstance(skill, list) and all(isinstance(item, str) for item in skill)):
@@ -256,6 +268,12 @@ def _snapshot_native(runner, event, provenance, fresh_roles=False, encoded_sourc
                               if getattr(event, name) is not None})
     if event.inherit_channel_pin is True:  # synthetic goal/resume turn reuses the session's pins (#126109)
         envelope['event']['inherit_channel_pin'] = True
+    if event.plugin_deferred_intents:
+        envelope['event']['plugin_deferred_intents'] = deepcopy(event.plugin_deferred_intents)
+    if event.plugin_system_context:
+        envelope['event']['plugin_system_context'] = event.plugin_system_context
+    if event.plugin_onboarding_active is True:
+        envelope['event']['plugin_onboarding_active'] = True
     if metadata := _native_metadata(event):
         envelope['event']['metadata'] = metadata
     # COMMAND that passed admission is path text (``/Users/x is broken``): replay it as text.

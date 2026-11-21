@@ -101,3 +101,70 @@ def test_unbind_telegram_topic_preserves_session(tmp_path):
     assert db.get_telegram_topic_binding_by_session(session_id="sess_unbind_1") is None
     assert db.get_session("sess_unbind_1") is not None
     assert db.unbind_telegram_topic(chat_id="1003", thread_id="88", profile_name="bot_a") is False
+
+
+def test_pre_v3_topic_tables_migrate_without_delivery_enabled_column(tmp_path):
+    import sqlite3
+
+    db_path = tmp_path / "legacy_pre_v3.db"
+    db = SessionDB(db_path)
+    db.create_session(session_id="sess_legacy_1", source="telegram")
+    db.close()
+
+    # Simulate a pre-v3 database where telegram_dm_topic_mode and telegram_dm_topic_bindings
+    # lack profile_name and the 5 newer binding columns (delivery_enabled, etc.).
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("DROP TABLE IF EXISTS telegram_dm_topic_bindings")
+        conn.execute("DROP TABLE IF EXISTS telegram_dm_topic_mode")
+        conn.execute(
+            """
+            CREATE TABLE telegram_dm_topic_mode (
+                chat_id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                activated_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE telegram_dm_topic_bindings (
+                chat_id TEXT NOT NULL,
+                thread_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                session_key TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                managed_mode TEXT NOT NULL DEFAULT 'auto',
+                linked_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                PRIMARY KEY (chat_id, thread_id)
+            )
+            """
+        )
+        conn.execute(
+            "INSERT INTO telegram_dm_topic_mode (chat_id, user_id, enabled, activated_at, updated_at) "
+            "VALUES ('2001', '3001', 1, 100.0, 100.0)"
+        )
+        conn.execute(
+            "INSERT INTO telegram_dm_topic_bindings "
+            "(chat_id, thread_id, user_id, session_key, session_id, managed_mode, linked_at, updated_at) "
+            "VALUES ('2001', '77', '3001', 'tg:2001:77', 'sess_legacy_1', 'auto', 100.0, 100.0)"
+        )
+        conn.commit()
+
+    reopened = SessionDB(db_path)
+    try:
+        reopened.apply_telegram_topic_migration()
+        assert reopened.is_telegram_topic_mode_enabled(chat_id="2001", user_id="3001", profile_name="default") is True
+
+        binding = reopened.get_telegram_topic_binding(chat_id="2001", thread_id="77", profile_name="default")
+        assert binding is not None
+        assert binding["session_id"] == "sess_legacy_1"
+        assert binding["delivery_enabled"] == 1
+        assert binding["last_synced_message_id"] is None
+        assert binding["role_id"] is None
+        assert binding["prompt_revision"] is None
+        assert binding["reply_anchor_message_id"] is None
+    finally:
+        reopened.close()

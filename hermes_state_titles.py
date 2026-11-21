@@ -156,8 +156,14 @@ class SessionTitlesMixin:
                                  "identity, and renaming it would orphan the conversation. "
                                  "To start fresh, create a new bot instead.")
             return []
-        if not is_user and current["title"] is not None and self._title_rank(current["title_source"]) >= new_rank:
-            return []
+        existing_title = current["title"]
+        existing_has_text = isinstance(existing_title, str) and bool(existing_title.strip())
+        if not is_user and existing_has_text:
+            if not str(current["title_source"] or "").strip():
+                if not is_default_topic_title(existing_title):
+                    return []
+            elif self._title_rank(current["title_source"]) >= new_rank:
+                return []
         if title:
             cleared = self._resolve_title_conflict(conn, session_id, title)
             if cleared:

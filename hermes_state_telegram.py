@@ -142,12 +142,17 @@ class SessionTelegramTopicsMixin:
                     # build's executescript crash is dropped first; its legacy table is still intact.
                     # v1 bindings had no ON DELETE CASCADE, so pruned sessions left orphan rows that
                     # the v3 FK (foreign_keys=ON on the writer) would reject — copy only live ones.
-                    legacy_columns = columns.replace("profile_name, ", "", 1)
-                    live = " WHERE EXISTS (SELECT 1 FROM sessions s WHERE s.id = session_id)" if "session_id" in columns else ""
+                    # Only copy columns that actually exist in the legacy table; columns added in
+                    # later schema revisions (e.g. delivery_enabled, last_synced_message_id, role_id,
+                    # prompt_revision, reply_anchor_message_id) take their DDL defaults/NULLs.
+                    col_list = [c.strip() for c in columns.split(",")]
+                    insert_cols = [c for c in col_list if c == "profile_name" or c in have]
+                    select_exprs = ["'default'" if c == "profile_name" else c for c in insert_cols]
+                    live = " WHERE EXISTS (SELECT 1 FROM sessions s WHERE s.id = session_id)" if "session_id" in have else ""
                     conn.execute(f"DROP TABLE IF EXISTS {table}_new")
                     self._rebuild_table(
                         conn.cursor(), table, f"{table}_legacy", f"CREATE TABLE {table} ({ddl})",
-                        f"INSERT INTO {table} ({columns}) SELECT 'default', {legacy_columns} FROM {table}_legacy{live}",
+                        f"INSERT INTO {table} ({', '.join(insert_cols)}) SELECT {', '.join(select_exprs)} FROM {table}_legacy{live}",
                     )
                 if table == "telegram_dm_topic_bindings":
                     have = {row[1] for row in conn.execute(f"PRAGMA table_info('{table}')")}

@@ -898,3 +898,64 @@ class TestModelSwitchMarkerNotTitleable:
         assert apply_instant_title(db, "sess-1", "南京市秦淮区 小时级天气预报") == (
             "南京市秦淮区 小时级天气预报"
         )
+
+
+class TestLegacyNullSourceTitleProtection:
+    """Non-empty, non-default titles written externally with title_source=NULL must not be overwritten."""
+
+    def test_protects_non_default_title_with_null_source_from_auto_titler(self, tmp_path):
+        db = SessionDB(tmp_path / "state.db")
+        db.create_session(session_id="sess-onboard", source="telegram")
+        db._write_sql(
+            "UPDATE sessions SET title = ?, title_source = NULL WHERE id = ?",
+            ("Знакомство 🌿", "sess-onboard"),
+        )
+
+        assert db.get_session_title("sess-onboard") == "Знакомство 🌿"
+        assert db.get_session_title_source("sess-onboard") is None
+
+        # Direct SessionDB auto-title writes (derived and llm) must refuse to overwrite.
+        assert db.set_auto_title("sess-onboard", "Привет", source="derived") is False
+        assert db.set_auto_title("sess-onboard", "Greeting", source="llm") is False
+        assert db.get_session_title("sess-onboard") == "Знакомство 🌿"
+
+        # Instant title, background auto_title_session, and maybe_auto_title (turn 1 & turn 2)
+        # must all leave the title intact without calling the LLM.
+        from agent.title_generator import apply_instant_title
+
+        with (
+            patch("agent.title_generator.call_llm") as mock_llm,
+            patch("agent.title_generator.generate_title") as mock_gen,
+        ):
+            assert apply_instant_title(db, "sess-onboard", "Привет, расскажи о себе") is None
+            auto_title_session(db, "sess-onboard", "Привет, расскажи о себе")
+            assert maybe_auto_title(db, "sess-onboard", "Привет, расскажи о себе", []) is None
+            assert maybe_auto_title(
+                db,
+                "sess-onboard",
+                "Помоги настроить расписание",
+                [
+                    {"role": "user", "content": "Привет, расскажи о себе"},
+                    {"role": "assistant", "content": "Привет!"},
+                    {"role": "user", "content": "Помоги настроить расписание"},
+                ],
+            ) is None
+            mock_llm.assert_not_called()
+            mock_gen.assert_not_called()
+
+        assert db.get_session_title("sess-onboard") == "Знакомство 🌿"
+        assert db.get_session_title_source("sess-onboard") is None
+
+    def test_default_topic_title_with_null_source_can_still_be_auto_titled(self, tmp_path):
+        db = SessionDB(tmp_path / "state.db")
+        db.create_session(session_id="sess-default", source="telegram")
+        db._write_sql(
+            "UPDATE sessions SET title = ?, title_source = NULL WHERE id = ?",
+            ("New chat", "sess-default"),
+        )
+
+        with patch("agent.title_generator.generate_title", return_value="Debug scheduler failures"):
+            auto_title_session(db, "sess-default", "help me debug the scheduler")
+
+        assert db.get_session_title("sess-default") == "Debug scheduler failures"
+        assert db.get_session_title_source("sess-default") == "llm"

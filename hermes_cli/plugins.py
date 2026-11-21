@@ -141,6 +141,10 @@ VALID_HOOKS: set[str] = {
     # auth/pairing and dispatch. Kwargs: event, gateway, session_store. Return {"action": "skip",
     # "reason"} -> drop; {"action": "rewrite", "text"} -> replace event.text; "allow"/None -> normal.
     "pre_gateway_dispatch", "post_gateway_admission",  # post_*: fail-open consume, gateway/run_inbound_consumer.py
+    # post_gateway_session_bound: after GatewayRunner binds a concrete session and refreshes any
+    # Telegram topic binding. Kwargs: event, gateway, session_store, session_entry, session_id,
+    # source, deferred_intents. Optional dict return may supply system_context / onboarding_active.
+    "post_gateway_session_bound",
     # agent_loop_stopped: an agent turn was interrupted mid-run (/stop, or the running-agent
     # fast-path of /new; see gateway/run.py::_interrupt_and_clear_session). Kwargs: session_key,
     # platform, reason, invalidation_reason. Return values are ignored.

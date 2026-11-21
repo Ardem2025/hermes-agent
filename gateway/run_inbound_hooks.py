@@ -88,6 +88,14 @@ class GatewayInboundHooksMixin:
             logger.warning("pre_gateway_dispatch invocation failed: %s", _hook_exc)
             _hook_results = []
 
+        _plugin_context_parts: list[str] = []
+        _existing_ctx = getattr(event, "plugin_system_context", "")
+        if isinstance(_existing_ctx, str) and _existing_ctx.strip():
+            _plugin_context_parts.append(_existing_ctx.strip()[:2048])
+        _plugin_deferred_intents: list[dict] = list(getattr(event, "plugin_deferred_intents", None) or [])
+        _plugin_onboarding_active = bool(getattr(event, "plugin_onboarding_active", False))
+        _plugin_rewrite_text: Optional[str] = None
+
         for _result in _hook_results:
             if not isinstance(_result, dict):
                 continue
@@ -101,16 +109,40 @@ class GatewayInboundHooksMixin:
                     source.chat_id or "unknown",
                 )
                 return None
-            if _action == "rewrite":
+            _context = _result.get("system_context")
+            if isinstance(_context, str):
+                _context = _context.strip()
+                if _context:
+                    _plugin_context_parts.append(_context[:2048])
+            _intent = _result.get("deferred_activation")
+            if isinstance(_intent, dict):
+                _plugin_deferred_intents.append(dict(list(_intent.items())[:16]))
+                _plugin_onboarding_active = True
+            if (
+                _result.get("workflow") in {"active", "resume"}
+                or _result.get("storage_namespace") == "workflow:onboarding"
+                or bool(_result.get("onboarding_active"))
+            ):
+                _plugin_onboarding_active = True
+            if _action == "rewrite" and _plugin_rewrite_text is None:
                 _new_text = _result.get("text")
                 if isinstance(_new_text, str):
-                    from gateway.session_ingress_context import carry_callback
-                    rewritten = dataclasses.replace(event, text=_new_text)
-                    carry_callback(event, rewritten)
-                    event = rewritten
-                break
-            if _action == "allow":
-                break
+                    _plugin_rewrite_text = _new_text
+
+        _replace_kwargs: dict = {}
+        if _plugin_rewrite_text is not None:
+            _replace_kwargs["text"] = _plugin_rewrite_text
+        if _plugin_context_parts:
+            _replace_kwargs["plugin_system_context"] = "\n\n".join(_plugin_context_parts)[:4096]
+        if _plugin_deferred_intents:
+            _replace_kwargs["plugin_deferred_intents"] = _plugin_deferred_intents
+        if _plugin_onboarding_active and not getattr(event, "plugin_onboarding_active", False):
+            _replace_kwargs["plugin_onboarding_active"] = True
+        if _replace_kwargs:
+            from gateway.session_ingress_context import carry_callback
+            rewritten = dataclasses.replace(event, **_replace_kwargs)
+            carry_callback(event, rewritten)
+            event = rewritten
         return event
 
     def _hm_quick_commands(self) -> dict:

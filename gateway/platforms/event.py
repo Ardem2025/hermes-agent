@@ -137,6 +137,11 @@ class MessageEvent:
     # unknown). For adapters whose ``media_urls`` are random cache names (relay); the name is
     # display data only, never a path. Appended for positional compat.
     media_filenames: list[str] = field(default_factory=list)
+    # Trusted per-turn plugin metadata attached by pre_gateway_dispatch / post_gateway_session_bound.
+    # Appended for positional compat.
+    plugin_deferred_intents: list[dict] = field(default_factory=list)
+    plugin_system_context: str = ""
+    plugin_onboarding_active: bool = False
 
     # Process-local admission receipt, never routing metadata or execution acknowledgement.
     _gateway_accepted: bool = field(default=False, init=False, repr=False, compare=False)

@@ -450,6 +450,44 @@ class GatewayTurnPrepareMixin:
         from gateway.run_heartbeat_acceptance import resolve_heartbeat_owner
         if not await resolve_heartbeat_owner(self, event, session_entry):
             return
+        if not getattr(event, "internal", False):
+            try:
+                from hermes_cli.lifecycle import ainvoke_hook as _ainvoke_hook
+                _bound_results = await _ainvoke_hook(
+                    "post_gateway_session_bound",
+                    event=event,
+                    gateway=self,
+                    session_store=getattr(self, "session_store", None),
+                    session_entry=session_entry,
+                    session_id=getattr(session_entry, "session_id", None),
+                    source=source,
+                    deferred_intents=list(getattr(event, "plugin_deferred_intents", None) or []),
+                )
+            except Exception:
+                logger.warning("post_gateway_session_bound invocation failed", exc_info=True)
+                _bound_results = []
+            _bound_context_parts: list[str] = []
+            _bound_onboarding_active = False
+            for _result in _bound_results or ():
+                if not isinstance(_result, dict):
+                    continue
+                _ctx = _result.get("system_context")
+                if isinstance(_ctx, str) and _ctx.strip():
+                    _bound_context_parts.append(_ctx.strip()[:2048])
+                if (
+                    _result.get("onboarding_active")
+                    or _result.get("workflow") in {"active", "resume"}
+                    or _result.get("storage_namespace") == "workflow:onboarding"
+                ):
+                    _bound_onboarding_active = True
+            if _bound_context_parts:
+                _existing_ctx = getattr(event, "plugin_system_context", "") or ""
+                _merged_parts = (
+                    [_existing_ctx.strip()] if isinstance(_existing_ctx, str) and _existing_ctx.strip() else []
+                ) + _bound_context_parts
+                event.plugin_system_context = "\n\n".join(_merged_parts)[:4096]
+            if _bound_onboarding_active:
+                event.plugin_onboarding_active = True
         return source, session_entry, session_key
 
     async def _hmwa_heal_telegram_topic_binding(self, source, session_entry, session_key):
@@ -636,7 +674,7 @@ class GatewayTurnPrepareMixin:
         if _lease_token is not None:
             self._session_state(_quick_key).turn.lease_tokens[run_generation] = _lease_token
 
-    async def _hmwa_first_contact_notes(self, source, history, turn_sidecar_notes, internal=False):
+    async def _hmwa_first_contact_notes(self, source, history, turn_sidecar_notes, internal=False, event=None):
         """First-ever-message onboarding note + one-time 'no home channel' prompt (both only when
         the session has no history). Delivered on the user message (sidecar), NOT the ephemeral
         system prompt: present-on-turn-1/absent-on-turn-2 was a guaranteed prompt diff + rebuild."""
@@ -651,9 +689,14 @@ class GatewayTurnPrepareMixin:
             # Same branch logic as the TUI (profile-build offer once when "ask", else plain intro);
             # first_contact_turn_note already falls back to the plain intro on error.
             from agent.onboarding import first_contact_turn_note
+            onboarding_run_active = bool(
+                getattr(event, "plugin_onboarding_active", False)
+                or getattr(event, "plugin_deferred_intents", None)
+            )
             note = first_contact_turn_note(
                 _load_gateway_config(), _gateway_config_home() / "config.yaml",
                 session_history_empty=True, install_has_prior_sessions=False,
+                onboarding_run_active=onboarding_run_active,
             )
             if note:
                 turn_sidecar_notes.append(note)
@@ -779,6 +822,9 @@ class GatewayTurnPrepareMixin:
         turn_sidecar_notes: list[str] = []
         if _was_auto_reset:
             await self._hmwa_deliver_auto_reset_notice(session_entry, source, turn_sidecar_notes)
+        _plugin_system_context = getattr(event, "plugin_system_context", None)
+        if isinstance(_plugin_system_context, str) and _plugin_system_context.strip():
+            turn_sidecar_notes.append(_plugin_system_context.strip()[:4096])
 
         # Keep human text separate from skills, sender metadata, and other model context.
         # With no text (e.g. voice-only), retain the existing enriched-message title fallback.
@@ -807,7 +853,7 @@ class GatewayTurnPrepareMixin:
             from gateway.session_results import record_unexecuted_failure
             return record_unexecuted_failure(t("gateway.errors.history_unavailable")), _session_env_tokens
 
-        await self._hmwa_first_contact_notes(source, history, turn_sidecar_notes, internal=event.internal)
+        await self._hmwa_first_contact_notes(source, history, turn_sidecar_notes, internal=event.internal, event=event)
 
         # Voice channel state rides the user message ONLY when changed (in the system prompt it
         # forced a rebuild + prompt-cache re-key per message).

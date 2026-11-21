@@ -560,12 +560,37 @@ def generate_title(
         return None
 
 
+def _has_protected_title(session_db, session_id: str) -> bool:
+    """True when the session holds a non-empty, non-default title whose provenance is not ``derived``."""
+    try:
+        source_fn = getattr(session_db, "get_session_title_source", None)
+        if callable(source_fn):
+            source = source_fn(session_id)
+            if source == "derived":
+                return False
+            if isinstance(source, str) and source:
+                return True
+        title_fn = getattr(session_db, "get_session_title", None)
+        existing = title_fn(session_id) if callable(title_fn) else None
+        if not isinstance(existing, str) or not existing.strip():
+            return False
+        from hermes_state_titles import is_default_topic_title
+        return not is_default_topic_title(existing)
+    except Exception:
+        return True
+
+
 def _has_upgraded_title(session_db, session_id: str) -> bool:
-    """True when the session already carries an ``llm``/``user`` title (or the check fails)."""
+    """True when the session already carries an ``llm``/``user`` title (or a non-default legacy title)."""
     try:
         source_fn = getattr(session_db, "get_session_title_source", None)
         if source_fn is not None:
-            return source_fn(session_id) not in (None, "derived")
+            source = source_fn(session_id)
+            if source not in (None, "derived"):
+                return True
+            if source is None:
+                return _has_protected_title(session_db, session_id)
+            return False
         return bool(session_db.get_session_title(session_id))
     except Exception:
         return True
@@ -626,7 +651,7 @@ def apply_instant_title(
 
     ``title_preview`` must reach this stage too: the model upgrade's own ``derive_title`` fallback writes
     ``derived`` provenance, which never replaces the ``derived`` title written here."""
-    if not session_db or not session_id:
+    if not session_db or not session_id or _has_protected_title(session_db, session_id):
         return None
     try:
         title = derive_title(user_message, title_preview) if is_titleable_user_message(user_message) else None
@@ -749,6 +774,8 @@ def maybe_auto_title(
     Returns the upgrade thread: already started, or — when ``title_upgrade_must_wait_for_turn`` — left
     UNSTARTED for the caller to hand to ``start_title_upgrade`` once the turn's model request settled."""
     if not session_db or not session_id or not user_message:
+        return None
+    if _has_protected_title(session_db, session_id):
         return None
     # History may be pre- or post-message. Past the opening turn, skip once the session holds an
     # ``llm``/``user`` name: count alone left a machinery-opened session nameless, and a ``derived``
